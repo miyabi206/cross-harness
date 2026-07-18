@@ -1,0 +1,46 @@
+from pathlib import Path
+import re
+import unittest
+
+from cross_harness.paths import source_root
+
+
+class AssetTests(unittest.TestCase):
+    def test_claude_agent_models_effort_and_retrieval_bounds(self):
+        assets = source_root() / "assets/claude/agents"
+        explorer = (assets / "explorer.md").read_text()
+        reviewer = (assets / "reviewer.md").read_text()
+        self.assertIn("tools: Read, Glob, Grep", explorer)
+        self.assertIn("model: haiku", explorer)
+        self.assertIn("effort: low", explorer)
+        self.assertIn("at most three", explorer)
+        self.assertIn("model: sonnet", reviewer)
+        self.assertIn("effort: high", reviewer)
+        self.assertIn("Do not edit files or delegate", " ".join(reviewer.split()))
+
+    def test_codex_role_assets_cover_all_executor_roles(self):
+        expected = {
+            "explorer.toml": ("gpt-5.6-luna", "medium"),
+            "implementer.toml": ("gpt-5.6-terra", "high"),
+            "tester.toml": ("gpt-5.6-luna", "medium"),
+            "reviewer.toml": ("gpt-5.6-sol", "xhigh"),
+            "debugger.toml": ("gpt-5.6-sol", "high"),
+            "security_reviewer.toml": ("gpt-5.6-sol", "xhigh"),
+        }
+        root = source_root() / "assets/codex/agents"
+        for name, (model, effort) in expected.items():
+            content = (root / name).read_text()
+            self.assertIn(f'model = "{model}"', content)
+            self.assertIn(f'model_reasoning_effort = "{effort}"', content)
+            self.assertIn("launch Claude", content)
+            self.assertIn("delegate", content)
+
+    def test_orchestrator_uses_template_for_every_wrapper_action(self):
+        skill = (source_root() / "assets/claude/skills/cross-harness-orchestrator/SKILL.md").read_text()
+        for action in ("task create", "delegate", "retry"):
+            self.assertIn(f"{{{{CROSS_HARNESS_BIN}}}} {action}", skill)
+        self.assertIsNone(re.search(r"`cross-harness (?:task|delegate|retry)", skill))
+
+
+if __name__ == "__main__":
+    unittest.main()

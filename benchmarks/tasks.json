@@ -1,0 +1,86 @@
+[
+  {
+    "task_type": "small_fix",
+    "issue": "https://github.com/chofurenairengo/renai/issues/526",
+    "start_commit": "cfaf55d94b697f6a00ca966822f596e2221f16fc",
+    "goal": "ml-apiのONNXRuntime推論をCloud Runの1 vCPU割り当てに合わせ、過剰なCPU使用を抑える。",
+    "done_when": [
+      "InferenceSessionがintra-opとinter-opのスレッドを各1本に制限して生成される。",
+      "既存の推論結果とml-apiのテストに回帰がない。"
+    ],
+    "checks": [
+      "cd ml-api && uv run ruff check .",
+      "cd ml-api && uv run ruff format --check .",
+      "cd ml-api && uv run pytest --tb=short"
+    ]
+  },
+  {
+    "task_type": "medium_feature",
+    "issue": "https://github.com/chofurenairengo/renai/issues/579",
+    "start_commit": "96224bf562abfa295c950dd4a242d4ac3f58bc4a",
+    "goal": "全ユーザー向けのお知らせ機能を追加し、サイドバーから一覧を開け、ホーム初回表示で最新のお知らせをモーダル表示できるようにする。",
+    "done_when": [
+      "公開中のお知らせを新しい順に取得でき、一覧と詳細をwebで表示できる。",
+      "サイドバーにお知らせ導線があり、ホームでは最新のお知らせを端末ごとに1回だけモーダル表示する。",
+      "存在しない、または非公開のお知らせを公開APIから取得できない。"
+    ],
+    "checks": [
+      "pnpm typecheck",
+      "pnpm lint:check",
+      "pnpm test",
+      "pnpm build",
+      "cd server && uv run ruff check app/ tests/",
+      "cd server && uv run mypy app/ --ignore-missing-imports",
+      "cd server && uv run pytest --tb=short"
+    ]
+  },
+  {
+    "task_type": "test_addition",
+    "issue": "https://github.com/chofurenairengo/renai/issues/346",
+    "start_commit": "eb1fa0e647d2565786f6cfddf9007226d20b85f0",
+    "goal": "serverのpytestをin-memory SQLiteではなく、local/CIの実PostgreSQLとAlembic適用スキーマで実行できるようにする。",
+    "done_when": [
+      "テスト用PostgreSQLへAlembic migrationを適用し、各テストを相互に分離できる。",
+      "非テストDBを破壊しない接続先ガードがあり、localとCIの両方で接続先を指定できる。",
+      "既存serverテストが実PostgreSQLで合格する。"
+    ],
+    "checks": [
+      "cd server && uv run ruff check app/ tests/",
+      "cd server && uv run mypy app/ --ignore-missing-imports",
+      "cd server && uv run pytest --tb=short"
+    ]
+  },
+  {
+    "task_type": "bug_debug",
+    "issue": "https://github.com/chofurenairengo/renai/issues/538",
+    "start_commit": "6ae016320eecb3521615d4601b14b419433fee36",
+    "goal": "会話応答末尾の「笑」や「笑笑」をTTSが語として読み上げる原因を特定し、字幕を壊さず読み上げだけを修正する。",
+    "done_when": [
+      "単独の笑いマーカーはTTS音声へ送られず、「笑顔」「爆笑」など通常語は維持される。",
+      "表示用の会話テキストは変更されない。",
+      "原因と回帰条件を固定するserverテストが合格する。"
+    ],
+    "checks": [
+      "cd server && uv run ruff check app/ tests/",
+      "cd server && uv run mypy app/ --ignore-missing-imports",
+      "cd server && uv run pytest --tb=short"
+    ]
+  },
+  {
+    "task_type": "cross_refactor",
+    "issue": "https://github.com/chofurenairengo/renai/issues/531",
+    "start_commit": "afa62b56dc3242d52e43c66d56da4360b45b9111",
+    "goal": "simulationの共通セッションロジックを抽出し、VRMと動画アバターの表示責務を別コンポーネントへ分割する。",
+    "done_when": [
+      "会話・録画・コントロールの共通ロジックと、VRM/動画固有の描画・準備責務が分離される。",
+      "視覚背景キーと動画シナリオキーが型で区別され、動画ステージは静止背景を要求しない。",
+      "freeモードとstageの既存経路に型・テスト・buildの回帰がない。"
+    ],
+    "checks": [
+      "pnpm typecheck",
+      "pnpm lint:check",
+      "pnpm test",
+      "pnpm build"
+    ]
+  }
+]

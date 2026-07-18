@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "work_completed", "changed_files", "tests", "error", "next_decision"],
+  "properties": {
+    "status": {"type": "string", "enum": ["success", "failed", "blocked", "partial"]},
+    "work_completed": {"type": "string"},
+    "changed_files": {"type": "array", "items": {"type": "string"}},
+    "tests": {"type": "array", "items": {"type": "string"}},
+    "error": {"type": ["string", "null"]},
+    "next_decision": {"type": ["string", "null"]}
+  }
+}

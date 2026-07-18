@@ -1,0 +1,7 @@
+[
+  {"task_type":"small_fix","issue":"replace with completed issue URL","start_commit":"0000000000000000000000000000000000000000","goal":"replace with original issue goal","done_when":["replace with verifiable outcome"],"checks":["replace with focused project check"]},
+  {"task_type":"medium_feature","issue":"replace with completed issue URL","start_commit":"0000000000000000000000000000000000000000","goal":"replace with original issue goal","done_when":["replace with verifiable outcome"],"checks":["replace with focused project check"]},
+  {"task_type":"test_addition","issue":"replace with completed issue URL","start_commit":"0000000000000000000000000000000000000000","goal":"replace with original issue goal","done_when":["replace with verifiable outcome"],"checks":["replace with focused project check"]},
+  {"task_type":"bug_debug","issue":"replace with completed issue URL","start_commit":"0000000000000000000000000000000000000000","goal":"replace with original issue goal","done_when":["replace with verifiable outcome"],"checks":["replace with focused project check"]},
+  {"task_type":"cross_refactor","issue":"replace with completed issue URL","start_commit":"0000000000000000000000000000000000000000","goal":"replace with original issue goal","done_when":["replace with verifiable outcome"],"checks":["replace with focused project check"]}
+]

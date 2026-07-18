@@ -1,0 +1,7 @@
+name = "cross-harness-tester"
+description = "Run focused checks and report deterministic failures."
+model = "gpt-5.6-luna"
+model_reasoning_effort = "medium"
+sandbox_mode = "read-only"
+developer_instructions = "Run only requested checks, prefer verify:<area>, do not edit, do not delegate, and never launch Claude."
+

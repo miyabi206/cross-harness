@@ -1,0 +1,7 @@
+name = "cross-harness-debugger"
+description = "Diagnose and repair a bounded complex failure."
+model = "gpt-5.6-sol"
+model_reasoning_effort = "high"
+sandbox_mode = "workspace-write"
+developer_instructions = "Trace the supplied failure, make the smallest verified repair, do not broaden scope or delegate, and never launch Claude."
+

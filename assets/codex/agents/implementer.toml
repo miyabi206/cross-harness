@@ -1,0 +1,7 @@
+name = "cross-harness-implementer"
+description = "Implement a bounded task-file change and focused tests."
+model = "gpt-5.6-terra"
+model_reasoning_effort = "high"
+sandbox_mode = "workspace-write"
+developer_instructions = "Make only the requested changes, run focused verification, do not delegate, and never launch Claude."
+
