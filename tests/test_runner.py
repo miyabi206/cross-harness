@@ -477,6 +477,40 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(124, code)
         self.assertEqual("timeout\n", (run / "INTERRUPTED").read_text())
 
+    def test_timeout_preserves_claude_session_for_resume(self):
+        run = self.root / "claude-timeout-run"
+        run.mkdir()
+        (run / "events.jsonl").write_text(
+            '{"type":"assistant","session_id":"session-timeout","message":{"content":[]}}\n'
+        )
+        (run / "stderr.log").write_text("")
+        role = {"harness": "claude", "model": "sonnet", "effort": "high", "output_limit_chars": 8000, "write": False}
+
+        summary = finalize_run(run, "reviewer", role, "review", self.repo, 124, 1)
+
+        self.assertEqual("session-timeout", summary["thread_id"])
+        state = json.loads((run / "state.json").read_text())
+        self.assertEqual("session-timeout", state["thread_id"])
+
+    def test_failed_claude_non_bash_tool_result_does_not_override_success_report(self):
+        run = self.root / "claude-tool-failure-run"
+        run.mkdir()
+        (run / "events.jsonl").write_text(
+            '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"read-1","name":"Read","input":{"file_path":"missing.txt"}}]}}\n'
+            '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"read-1","is_error":true,"content":"not found"}]}}\n'
+        )
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "reviewed", "changed_files": [],
+            "tests": ["uv run pytest -q"], "error": None, "next_decision": None,
+        }))
+        role = {"harness": "claude", "model": "sonnet", "effort": "high", "output_limit_chars": 8000, "write": False}
+
+        summary = finalize_run(run, "reviewer", role, "review", self.repo, 0, 1)
+
+        self.assertEqual("success", summary["status"])
+        self.assertIsNone(summary["error"])
+
     def test_detached_supervisor_receives_package_path_for_clean_interpreter(self):
         fake_bin = self.root / "bin"
         fake_bin.mkdir()

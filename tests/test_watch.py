@@ -61,6 +61,26 @@ class WatchTests(unittest.TestCase):
         })
         self.assertEqual("[run] item.completed file_change: modified src/a.py", change)
 
+    def test_formats_claude_tool_use_and_result_details(self):
+        command = "uv run pytest " + "x" * 200
+        tool_use = format_event(Path("run"), {
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": command}},
+                {"type": "tool_use", "name": "Edit", "input": {"file_path": "src/a.py"}},
+                {"type": "tool_use", "name": "Write", "input": {"file_path": "tests/test_a.py"}},
+            ]},
+        })
+        self.assertEqual(
+            "[run] assistant tool_use: Bash uv run pytest " + "x" * 105 + "…, Edit src/a.py, Write tests/test_a.py",
+            tool_use,
+        )
+        tool_result = format_event(Path("run"), {
+            "type": "user",
+            "message": {"content": [{"type": "tool_result", "is_error": True, "content": "secret"}]},
+        })
+        self.assertEqual("[run] user tool_result: failed=1", tool_result)
+
     def test_renders_final_verdict_once(self):
         watcher = RunWatcher(self.runs)
         self.assertEqual([], watcher.poll())

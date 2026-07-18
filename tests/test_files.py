@@ -38,6 +38,20 @@ class FileTests(unittest.TestCase):
         self.assertEqual({"input_tokens": 3, "output_tokens": 1}, parsed["usage"])
         self.assertEqual(["permission denied"], parsed["errors"])
 
+    def test_parse_events_records_failed_claude_bash_tool_result(self):
+        with tempfile.TemporaryDirectory() as folder:
+            events = Path(folder) / "events.jsonl"
+            events.write_text(
+                '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"bash-1","name":"Bash","input":{"command":"uv run pytest -q"}}]}}\n'
+                '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"bash-1","is_error":true,"content":"2 tests failed"}]}}\n'
+            )
+            parsed = parse_events(events)
+        self.assertEqual([], parsed["errors"])
+        self.assertEqual([{
+            "command": "uv run pytest -q", "exit_code": 1, "output": "2 tests failed",
+        }], parsed["commands"])
+        self.assertIsNotNone(failure_signature(0, parsed))
+
     def test_parse_events_extracts_structured_claude_terminal_categories(self):
         with tempfile.TemporaryDirectory() as folder:
             events = Path(folder) / "events.jsonl"

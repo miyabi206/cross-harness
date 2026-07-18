@@ -29,6 +29,7 @@ _CLAUDE_AUTHENTICATION_CODES = frozenset({
 
 def parse_events(path: Path) -> dict:
     result = {"thread_id": None, "usage": {}, "errors": [], "commands": [], "blocked_category": None}
+    claude_commands: dict[str, str] = {}
     if not path.exists():
         return result
     with path.open(encoding="utf-8", errors="replace") as handle:
@@ -39,6 +40,9 @@ def parse_events(path: Path) -> dict:
                 if FAILURE_WORDS.search(line):
                     result["errors"].append(line.strip())
                 continue
+            session_id = event.get("session_id")
+            if isinstance(session_id, str) and session_id:
+                result["thread_id"] = session_id
             kind = event.get("type")
             claude_blocked_category = _claude_blocked_category(event)
             if claude_blocked_category == "rate_limit":
@@ -51,7 +55,6 @@ def parse_events(path: Path) -> dict:
             elif kind == "turn.completed":
                 result["usage"] = event.get("usage", {})
             elif kind == "result":
-                result["thread_id"] = event.get("session_id", result["thread_id"])
                 usage = event.get("usage")
                 if isinstance(usage, dict):
                     result["usage"] = usage
@@ -59,6 +62,7 @@ def parse_events(path: Path) -> dict:
                     result["errors"].append(_event_text(event))
             elif kind in {"turn.failed", "error"}:
                 result["errors"].append(_event_text(event))
+            _parse_claude_tool_events(event, claude_commands, result)
             item = event.get("item")
             if isinstance(item, dict) and item.get("type") == "command_execution":
                 if item.get("status") not in {None, "completed", "success"} or item.get("exit_code") not in {None, 0}:
@@ -69,6 +73,49 @@ def parse_events(path: Path) -> dict:
                     })
     result["errors"] = [text for text in result["errors"] if text]
     return result
+
+
+def _parse_claude_tool_events(event: dict, commands: dict[str, str], result: dict) -> None:
+    """Record failed Claude Bash tool results as command failures."""
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return
+    content = message.get("content")
+    if not isinstance(content, list):
+        return
+    if event.get("type") == "assistant":
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            if block.get("name") != "Bash" or not isinstance(block.get("id"), str):
+                continue
+            inputs = block.get("input")
+            if isinstance(inputs, dict) and isinstance(inputs.get("command"), str):
+                commands[block["id"]] = inputs["command"]
+        return
+    if event.get("type") != "user":
+        return
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_result" or block.get("is_error") is not True:
+            continue
+        text = _tool_result_text(block)
+        tool_id = block.get("tool_use_id")
+        command = commands.get(tool_id) if isinstance(tool_id, str) else None
+        if command is None:
+            continue
+        result["commands"].append({"command": command, "exit_code": 1, "output": text[-4000:]})
+
+
+def _tool_result_text(block: dict) -> str:
+    content = block.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        values = [item.get("text", "") for item in content if isinstance(item, dict)]
+        text = "\n".join(value for value in values if isinstance(value, str))
+        if text:
+            return text
+    return ""
 
 
 def _claude_blocked_category(event: dict) -> str | None:

@@ -26,6 +26,14 @@ def format_event(run_dir: Path, event: dict) -> str:
     prefix = f"[{run_dir.name}]"
     if not isinstance(event_type, str):
         return f"{prefix} event"
+    if event_type == "assistant":
+        details = _claude_tool_use_details(event)
+        suffix = f": {', '.join(details)}" if details else ""
+        return f"{prefix} assistant tool_use{suffix}"
+    if event_type == "user":
+        details = _claude_tool_result_details(event)
+        suffix = f": {', '.join(details)}" if details else ""
+        return f"{prefix} user tool_result{suffix}"
     if not event_type.startswith("item."):
         return f"{prefix} {event_type}"
 
@@ -50,6 +58,56 @@ def format_event(run_dir: Path, event: dict) -> str:
                 details.append(f"{kind} {change['path']}" if isinstance(kind, str) else change["path"])
     suffix = f": {', '.join(details)}" if details else ""
     return f"{prefix} {event_type} {item_type}{suffix}"
+
+
+def _claude_tool_use_details(event: dict) -> list[str]:
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    details: list[str] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        name = block.get("name")
+        inputs = block.get("input")
+        if not isinstance(name, str) or not isinstance(inputs, dict):
+            continue
+        if name == "Bash":
+            command = _short_command(inputs.get("command"))
+            if command:
+                details.append(f"Bash {command}")
+        elif name in {"Edit", "Write"}:
+            file_path = inputs.get("file_path")
+            if isinstance(file_path, str) and file_path:
+                details.append(f"{name} {file_path}")
+    return details
+
+
+def _claude_tool_result_details(event: dict) -> list[str]:
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    count = sum(
+        1
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "tool_result"
+    )
+    if count == 0:
+        return []
+    failures = sum(
+        1
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "tool_result"
+        and block.get("is_error") is True
+    )
+    return [f"failed={failures}" if failures else f"completed={count}"]
 
 
 def newest_run(runs_root: Path) -> Path | None:
