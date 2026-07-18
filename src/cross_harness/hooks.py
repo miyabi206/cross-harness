@@ -14,6 +14,7 @@ from .config import load_config
 from .files import atomic_write, dump_json
 from .maintenance import cleanup
 from .paths import user_paths
+from .installer import synchronize_claude_agent_roles
 
 
 SHELL_BOUNDARY = r"[;&|()\s'\"`]"
@@ -73,6 +74,13 @@ def claude_session_start(home: Path | None = None) -> int:
     if os.environ.get("CROSS_HARNESS_ACTIVE") == "1":
         return _deny("cross-harness: nested Claude launch from a delegated Codex run is blocked")
     warnings: list[str] = []
+    config = None
+    try:
+        config = load_config(home=paths.home)
+        if (paths.claude / "agents").exists():
+            synchronize_claude_agent_roles(paths, config)
+    except Exception as exc:  # hooks must not hide the session for synchronization failure
+        warnings.append(f"Claude agent configuration sync warning: {exc}")
     keys = detected_api_keys()
     if keys:
         warnings.append("API-key environment detected; Codex delegation is disabled until removed: " + ", ".join(keys))
@@ -92,7 +100,8 @@ def claude_session_start(home: Path | None = None) -> int:
         warnings.append("Claude authentication status is unavailable")
     if not keys:
         try:
-            config = load_config(home=paths.home)
+            if config is None:
+                config = load_config(home=paths.home)
             verify_codex_chatgpt(
                 Path(config["runtime_root"]),
                 paths.home,

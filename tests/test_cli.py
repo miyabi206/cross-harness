@@ -7,10 +7,23 @@ import tempfile
 import unittest
 
 from cross_harness.cli import main
+from cross_harness.paths import source_root
 from cross_harness.errors import SupervisorDiedError
 
 
 class CliWaitTests(unittest.TestCase):
+    def test_validate_reports_unknown_effort_as_warning_without_failure(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config = Path(folder) / "config.toml"
+            contents = (source_root() / "config/default.toml").read_text(encoding="utf-8")
+            config.write_text(contents.replace('effort = "low"', 'effort = "future-effort"'), encoding="utf-8")
+            stdout = StringIO()
+            stderr = StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                self.assertEqual(0, main(["validate", "--config", str(config)]))
+            self.assertEqual("configuration valid\n", stdout.getvalue())
+            self.assertIn("warning: roles.explorer.effort", stderr.getvalue())
+
     def test_wait_exit_codes_and_summary_output(self):
         with tempfile.TemporaryDirectory() as folder:
             run = Path(folder) / "run"

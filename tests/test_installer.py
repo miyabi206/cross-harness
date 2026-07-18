@@ -40,11 +40,45 @@ class InstallerTests(unittest.TestCase):
             installed_skill = (home / ".claude/skills/cross-harness-orchestrator/SKILL.md").read_text()
             self.assertIn(str(home.resolve() / ".local/bin/cross-harness"), installed_skill)
             self.assertNotIn("{{CROSS_HARNESS_BIN}}", installed_skill)
+            explorer = (home / ".claude/agents/cross-harness-explorer.md").read_text()
+            reviewer = (home / ".claude/agents/cross-harness-reviewer.md").read_text()
+            self.assertIn("model: haiku", explorer)
+            self.assertIn("effort: low", explorer)
+            self.assertIn("model: sonnet", reviewer)
+            self.assertIn("effort: high", reviewer)
 
             uninstall(home)
             for path, content in originals.items():
                 self.assertEqual(content, path.read_text(encoding="utf-8"))
             self.assertFalse((home / ".local/bin/cross-harness").exists())
+
+    def test_install_materializes_claude_agent_role_models_and_efforts_from_config(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            config = home / ".config/cross-harness/config.toml"
+            config.parent.mkdir(parents=True)
+            contents = (repo / "config/default.toml").read_text(encoding="utf-8")
+            contents = contents.replace('model = "haiku"', 'model = "custom explorer"')
+            contents = contents.replace('effort = "low"', 'effort = "future-effort"')
+            contents = contents.replace('model = "sonnet"', 'model = "custom-reviewer"')
+            contents = contents.replace(
+                'model = "custom-reviewer"\neffort = "high"',
+                'model = "custom-reviewer"\neffort = "review-effort"',
+            )
+            config.write_text(contents, encoding="utf-8")
+
+            install(home, repo)
+
+            explorer = (home / ".claude/agents/cross-harness-explorer.md").read_text()
+            reviewer = (home / ".claude/agents/cross-harness-reviewer.md").read_text()
+            self.assertIn('model: "custom explorer"', explorer)
+            self.assertIn("effort: future-effort", explorer)
+            self.assertIn("model: custom-reviewer", reviewer)
+            self.assertIn("effort: review-effort", reviewer)
 
     def test_dry_run_does_not_touch_home(self):
         with tempfile.TemporaryDirectory() as folder:

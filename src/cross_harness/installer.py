@@ -82,6 +82,57 @@ def _materialize_templates(path: Path, executable: Path) -> None:
             atomic_write(candidate, rendered, candidate.stat().st_mode & 0o777)
 
 
+CLAUDE_AGENT_ROLES = {
+    "cross-harness-explorer.md": "explorer",
+    "cross-harness-reviewer.md": "reviewer",
+}
+
+
+def _frontmatter_scalar(value: str) -> str:
+    """Return a single-line YAML scalar while preserving simple existing output."""
+    if re.fullmatch(r"[A-Za-z0-9_.\-\[\]]+", value):
+        return value
+    return json.dumps(value)
+
+
+def _render_claude_agent_role(text: str, role: dict) -> str:
+    if not text.startswith("---\n"):
+        raise HarnessError("Claude agent template is missing YAML frontmatter")
+    closing = text.find("\n---\n", 4)
+    if closing < 0:
+        raise HarnessError("Claude agent template has unterminated YAML frontmatter")
+    frontmatter = text[4:closing]
+    for key in ("model", "effort"):
+        value = role.get(key)
+        if not isinstance(value, str) or not value:
+            raise HarnessError(f"Claude agent role has invalid {key}")
+        rendered, count = re.subn(
+            rf"(?m)^{key}:.*$",
+            f"{key}: {_frontmatter_scalar(value)}",
+            frontmatter,
+        )
+        if count != 1:
+            raise HarnessError(f"Claude agent template is missing {key} frontmatter")
+        frontmatter = rendered
+    return "---\n" + frontmatter + text[closing:]
+
+
+def synchronize_claude_agent_roles(paths: UserPaths, config: dict) -> None:
+    """Apply the configured Claude explorer/reviewer model settings to installed agents."""
+    roles = config.get("roles")
+    if not isinstance(roles, dict):
+        raise HarnessError("configuration roles are unavailable for Claude agent synchronization")
+    for filename, role_name in CLAUDE_AGENT_ROLES.items():
+        role = roles.get(role_name)
+        if not isinstance(role, dict):
+            raise HarnessError(f"configuration role {role_name!r} is unavailable for Claude agent synchronization")
+        path = paths.claude / "agents" / filename
+        text = path.read_text(encoding="utf-8")
+        rendered = _render_claude_agent_role(text, role)
+        if rendered != text:
+            atomic_write(path, rendered, path.stat().st_mode & 0o777)
+
+
 def _merge_markdown(
     path: Path,
     sources: list[Path],
@@ -231,7 +282,7 @@ def install(home: Path | None = None, repo: Path | None = None, dry_run: bool = 
 
     if not paths.config.exists():
         _write_text(paths.config, (repo / "config/default.toml").read_text(encoding="utf-8"), paths, backup_root, records, management="owned")
-    load_config(paths.config, paths.home)
+    config = load_config(paths.config, paths.home)
 
     shared = repo / "assets/shared/safety.md"
     _merge_markdown(paths.claude / "CLAUDE.md", [repo / "assets/claude/CLAUDE.md", shared], paths, backup_root, records, paths.executable)
@@ -265,6 +316,7 @@ def install(home: Path | None = None, repo: Path | None = None, dry_run: bool = 
         _materialize_templates(destination, paths.executable)
         _finish_record(record, destination)
         records.append(record)
+    synchronize_claude_agent_roles(paths, config)
     for source in sorted((repo / "assets/codex/agents").glob("*.toml")):
         destination = paths.codex / "agents" / f"cross-harness-{source.name}"
         record = _record(destination, paths, backup_root)

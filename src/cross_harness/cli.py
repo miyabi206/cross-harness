@@ -6,7 +6,7 @@ import json
 import sys
 
 from .benchmark import load_records, load_task_plan, render as render_benchmark, verify_task_commits
-from .config import load_config, validate, load_toml
+from .config import load_config, validate, load_toml, warnings as config_warnings
 from .doctor import doctor, render as render_doctor
 from .errors import HarnessError, SupervisorDiedError
 from .files import atomic_write
@@ -117,6 +117,8 @@ def main(argv: list[str] | None = None) -> int:
             if errors:
                 print("\n".join(errors), file=sys.stderr)
                 return 2
+            for warning in config_warnings(config):
+                print(f"warning: {warning}", file=sys.stderr)
             print("configuration valid")
         elif args.command == "inventory":
             report = inventory(user_paths(home))

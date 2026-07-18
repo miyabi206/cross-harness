@@ -2,7 +2,7 @@ from pathlib import Path
 import copy
 import unittest
 
-from cross_harness.config import default_config, project_config, validate
+from cross_harness.config import default_config, project_config, validate, warnings
 
 
 class ConfigTests(unittest.TestCase):
@@ -40,6 +40,16 @@ class ConfigTests(unittest.TestCase):
         config = default_config()
         config["projects"] = {"relative/repo": {"checks": ["test"]}}
         self.assertIn("absolute path", "\n".join(validate(config)))
+
+    def test_unknown_efforts_are_warnings_but_empty_efforts_are_errors(self):
+        config = copy.deepcopy(default_config())
+        config["roles"]["explorer"]["effort"] = "future-effort"
+        config["roles"]["reviewer"]["model"] = "any-model-string"
+        self.assertEqual([], validate(config))
+        self.assertIn("roles.explorer.effort", "\n".join(warnings(config)))
+
+        config["roles"]["explorer"]["effort"] = ""
+        self.assertIn("expected non-empty string", "\n".join(validate(config)))
 
 
 if __name__ == "__main__":

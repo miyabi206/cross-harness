@@ -3,9 +3,12 @@ from unittest.mock import patch
 from pathlib import Path
 import json
 import subprocess
+import tempfile
 import unittest
 
 from cross_harness.hooks import claude_pre_tool_use, claude_session_start, codex_pre_tool_use
+from cross_harness.installer import install
+from cross_harness.paths import source_root
 
 
 class HookTests(unittest.TestCase):
@@ -70,6 +73,28 @@ class HookTests(unittest.TestCase):
             self.assertEqual(0, claude_session_start(Path("/tmp/cross-harness-hook-home")))
         verify.assert_called_once()
         self.assertIn("Subscription checks passed", stdout.getvalue())
+
+    @patch("cross_harness.hooks.cleanup")
+    @patch("cross_harness.hooks.verify_codex_chatgpt")
+    @patch("cross_harness.hooks.detected_api_keys", return_value=[])
+    @patch("cross_harness.hooks.subprocess.run")
+    def test_session_start_synchronizes_claude_agents_from_updated_config(self, run, keys, verify, cleanup):
+        run.return_value = subprocess.CompletedProcess([], 0, '{"loggedIn": true}', "")
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder) / "home"
+            home.mkdir()
+            install(home, source_root())
+            config = home / ".config/cross-harness/config.toml"
+            contents = config.read_text(encoding="utf-8").replace('model = "haiku"', 'model = "next-explorer"')
+            contents = contents.replace('effort = "low"', 'effort = "next-effort"')
+            config.write_text(contents, encoding="utf-8")
+
+            with patch.dict("os.environ", {}, clear=True):
+                self.assertEqual(0, claude_session_start(home))
+
+            explorer = (home / ".claude/agents/cross-harness-explorer.md").read_text()
+            self.assertIn("model: next-explorer", explorer)
+            self.assertIn("effort: next-effort", explorer)
 
 
 if __name__ == "__main__":

@@ -130,9 +130,8 @@ def validate(config: dict) -> list[str]:
                 errors.append(f"{location}.harness: expected 'claude' or 'codex'")
             if not isinstance(role.get("model"), str) or not role.get("model"):
                 errors.append(f"{location}.model: expected non-empty string")
-            efforts = CLAUDE_EFFORTS if harness == "claude" else CODEX_EFFORTS
-            if role.get("effort") not in efforts:
-                errors.append(f"{location}.effort: unsupported for {harness}")
+            if not isinstance(role.get("effort"), str) or not role.get("effort"):
+                errors.append(f"{location}.effort: expected non-empty string")
             for key, low, high in (
                 ("max_parallel", 1, 2),
                 ("retries", 0, 2),
@@ -170,6 +169,25 @@ def validate(config: dict) -> list[str]:
             if "dirty_worktree_policy" in project and project["dirty_worktree_policy"] not in {"stop", "isolate"}:
                 errors.append(f"{location}.dirty_worktree_policy: expected 'stop' or 'isolate'")
     return errors
+
+
+def warnings(config: dict) -> list[str]:
+    """Return compatibility warnings that do not make a configuration invalid."""
+    messages: list[str] = []
+    roles = config.get("roles")
+    if not isinstance(roles, dict):
+        return messages
+    for name, role in roles.items():
+        if not isinstance(role, dict):
+            continue
+        harness = role.get("harness")
+        efforts = CLAUDE_EFFORTS if harness == "claude" else CODEX_EFFORTS if harness == "codex" else None
+        effort = role.get("effort")
+        if efforts is not None and isinstance(effort, str) and effort and effort not in efforts:
+            messages.append(
+                f"roles.{name}.effort: {effort!r} is not a known {harness} effort value; passing through unchanged"
+            )
+    return messages
 
 
 def _string_list(value: object, allow_empty: bool = False) -> bool:
