@@ -8,12 +8,31 @@ max_parallel = 2
 dirty_worktree_policy = "stop"
 delegate_kinds = ["exploration", "implementation", "test", "debug", "review", "security_review"]
 
-# Known effort values are codex: minimal/low/medium/high/xhigh and claude:
-# low/medium/high/xhigh/max. They are compatibility guidance only: validation
-# passes through new effort values unchanged.
-# Routing is determined by each role's harness field; changing model alone does
-# not switch harnesses. Change a role's harness to assign it to either Codex or
-# Claude; any role with delegate_kinds can be delegated through its harness.
+# Role settings: each role has harness, model, and effort.
+#
+# harness  Execution target. Only "claude" or "codex" are accepted. This is the
+#          switch that decides where a role runs; changing model alone does not
+#          move a role to another harness. Any role can be assigned to either.
+#
+# model    Not validated. Any non-empty string is accepted, so a new model can
+#          be used the day it ships -- and a typo is only caught at run time.
+#          Known values at the time of writing:
+#            codex   gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna
+#            claude  fable, sonnet, haiku, opus
+#          The [fallback] chains below are used for escalation on retry, so a
+#          model listed there can be escalated one step up.
+#
+# effort   Not rejected either; `validate` only warns outside the known values:
+#            codex   minimal, low, medium, high, xhigh
+#            claude  low, medium, high, xhigh, max
+#
+# When changes take effect:
+#   codex roles   the next delegate
+#   claude roles  the next Claude session (the session-start hook syncs
+#                 ~/.claude/agents/cross-harness-*.md)
+#
+# orchestrator is the running session itself and planner has no agent
+# definition or delegation path, so their model and effort have no effect.
 
 [fallback]
 codex = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
