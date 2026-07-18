@@ -18,6 +18,7 @@ from .paths import source_root, user_paths
 from .runner import delegate, retry, start_detached_delegate, wait_for_run
 from .taskfile import create_task_file
 from .trust import confirm_codex_hook
+from .watch import watch
 
 
 def parser() -> argparse.ArgumentParser:
@@ -56,6 +57,9 @@ def parser() -> argparse.ArgumentParser:
     wait_parser = commands.add_parser("wait", help="wait for a delegated run to finalize")
     wait_parser.add_argument("--run", required=True, type=Path)
     wait_parser.add_argument("--timeout-seconds", required=True, type=float)
+
+    watch_parser = commands.add_parser("watch", help="follow the newest delegated run")
+    watch_parser.add_argument("--config", type=Path)
 
     retry_parser = commands.add_parser("retry", help="resume a failed task with a delta instruction")
     retry_parser.add_argument("--run-dir", required=True, type=Path)
@@ -165,6 +169,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 4
             print((args.run.resolve() / "summary.txt").read_text(encoding="utf-8"), end="")
             return 0 if summary["status"] == "success" else 3
+        elif args.command == "watch":
+            return watch(args.config, home)
         elif args.command == "retry":
             summary = retry(args.run_dir.resolve(), args.task_file.resolve(), args.config, home)
             print((Path(summary["run_dir"]) / "summary.txt").read_text(encoding="utf-8"), end="")
