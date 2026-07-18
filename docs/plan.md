@@ -584,64 +584,84 @@ sessionをresumeできることをrun記録で確認する。writeロールはwo
 ### フェーズAの実施結果(2026-07-19)
 
 フェーズAの実装後に実runと単体テストを確認した。以下で「実測確認済み」は実際の
-run記録で確認した挙動、「読解確認」はコード読解または単体テストから導いたものであり、
-実条件では未検証の挙動を指す。
+run記録で確認した挙動、「単体テストのみ」は実条件で未発火の実装、「実条件未検証」は
+コードと単体テストがあっても現実の失敗・中断条件で確認していない挙動を指す。
 
-1. **read-only Claudeの検査実行: 達成(実測確認済み)。** read-onlyのClaude
-   testerが実際に`uv run pytest`を実行し、失敗時は`failed`、成功時は`success`として
-   記録されることを確認した。
-2. **watchのClaude作業詳細表示: 達成(実測確認済み)。** ClaudeのBashコマンドと
-   tool失敗が、watchにそれぞれ1行で表示されることを確認した。
-3. **Claudeのtool失敗を要約・終端判定へ反映: 達成(読解確認)。** Claudeのtool結果を
-   失敗として取り込み、成功扱いを防ぐ実装を入れた。実runでは実行役が正直に`failed`を
-   申告したため、read-onlyロールの上書き機構は発火していない。当該機構自体の検証は
-   単体テストのみである。
-4. **Claudeのrate limit・認証失敗の終端: 実装済み(読解確認)。** Claude形式の通知を
-   `blocked`へ終端する実装と単体テストはあるが、rate limitおよび認証失敗の実条件では
-   未検証である。
-5. **Claude設定の課金・接続先検査: 実装済み(読解確認)。** Claude側の設定所有権を
-   検査する実装と単体テストはあるが、実際の設定条件では未検証である。
-6. **timeout後のClaude resume情報保持: 達成(実測確認済み)。** timeout用の
-   `thread_id`が`state.json`に残ることを確認した。
-7. **Claude writeロールの作業ディレクトリ拘束: 達成(実測確認済み)。** darwinで
-   write=trueのClaudeロールを`sandbox-exec`配下で起動し、実行ルート外への書き込みが
-   拒否されることを実runで確認した。脱出を試みたrunは`blocked`となり、対象ファイルは
-   作成されなかった。残る制約として、書き込みを許可しているのは実行ルートに加えて
-   `~/.claude`、`~/.cache`、`~/Library/Caches`、`/private/tmp`、`/private/var/tmp`、
-   `/private/var/folders`である。したがって実行ルート外への書き込みが完全に不可能なの
-   ではなく、実行に必要な基盤パスは書き込み可能である。またread-onlyロールにはこの
-   封じ込めを適用していない。適用するとpytestが`__pycache__`を書けず、検査が壊れるため
-   である。
-8. **Claudeの役割定義: 達成(実測確認済み)。** 再インストール後の実runで
-   `--agent cross-harness-tester`と`--agent cross-harness-implementer`が実際に渡され、
-   testerによる検査実行とimplementerによる編集がそれぞれ成功したことを確認した。
-9. **委譲先Claudeへの実行役憲章: 達成(実測確認済み)。** 実行役憲章が実際のargvに
-   含まれることを確認した。
-10. **Codex resume時のsandbox維持: 達成(実測確認済み)。** resume経路に`--sandbox`と
-    `-C`を渡す実装は誤りだった。Codex CLIの`resume`サブコマンドはこの2つを受け付けず、
-    実runでは`unexpected argument --sandbox`となって全てのCodex再試行が失敗していた。
-    sandboxは`-c sandbox_mode`による設定上書きとして渡す形に修正し、
-    `20260719T005918-dbce5e11`でretryがresumeして成功することを確認した
-    (`20260719T005530-26f95e4b`は修正前の失敗記録)。単体テストはargv構築のみを検証して
-    いたため、このCLI実行条件の不整合を検出できなかった。
+#### 完了条件1: tester・security_reviewerの検査と終端状態
 
-実装過程では、次の2件の誤成功欠陥も判明し、修正した。(1) 実行役がスキーマ外の
-`status=completed`を返すと、exit code 0であるため`success`として記録されていた。
-スキーマ外statusを`failed`として扱うよう修正した。(2) 実行役が正規の
-`status=success`を返しつつ`tests`に「14 failed」と報告した場合も、`success`として
-記録されていた。write=falseのロールでは検査コマンドの失敗が`success`を上書きするよう
-修正した。さらに、次の2件の欠陥も判明し、修正した。(3) 実行役が`tests`に辞書の配列を
-返すと、`render_summary`の`join`が`TypeError`で落ち、runがサマリ無しで異常終了した。
-要約のリスト項目を決定的な文字列表現へ正規化して解消した。(4) インストール済みの個人
-設定にのみ存在し、リポジトリにないロール設定ドキュメントがあり、再インストールで失われる
-状態だった。`config/default.toml`へ取り込んで解消した。
+- **項目1、実測確認済み:** read-onlyのClaude testerが実際に`uv run pytest`を実行し、成功時は
+  `success`、失敗時は`failed`として記録されることを確認した。
+- **項目4、未検証:** Claude形式のrate limitと認証失敗を`blocked`へ終端する実装・単体テストは
+  あるが、いずれも実条件では未検証である。security_reviewerはClaude・Codexのいずれでも一度も
+  実行しておらず、項目1のsecurity_reviewer部分も未検証である。
 
-したがって、フェーズAの完了条件で残るのは、項目4・5の実条件での確認である。
-項目3のread-onlyロールの上書き機構も単体テストのみであり、実runでの発火は未確認である。
-項目10のように実条件未検証の実装が実際に壊れていた例があるため、項目4・5にも同種の
-リスクが残る。
-なお、`CROSS_HARNESS_ACTIVE=1`による14件の失敗は`tests/conftest.py`のautouse fixtureで
-解消した。委譲実行役による実runで全件通過を確認している。
+#### 完了条件2: watch・summary・timeout後のresume
+
+- **項目2・6、実測確認済み:** watchがClaudeとCodexの両形式のコマンド、およびtool失敗を表示
+  すること、timeout用の`thread_id`が`state.json`に残ることを確認した。
+- **項目3、単体テストのみ:** read-onlyロールで検査コマンドの失敗を検出した際に`success`を
+  `failed`へ上書きする機構は、実runでは実行役が自ら`failed`を返したため発火していない。
+- **項目6、未検証:** 実際にtimeoutを発生させ、その`thread_id`からresumeする経路は未検証で
+  ある。
+
+#### 完了条件3: write拘束・実行役憲章・Codex再試行のsandbox
+
+- **項目7、達成(実測確認済み):** darwinでwrite=trueのClaudeロールを`sandbox-exec`配下で
+  起動し、実行ルート外への書き込みが拒否されることを実runで確認した。脱出を試みたrunは
+  `blocked`となり、対象ファイルは作成されなかった。Editツールを拒否された直後にBash経由の
+  `sed -i`で同じ編集を成立させた記録はsandbox導入前のものであり、ツール単位のscopeだけでは
+  シェルを封じ込められない根拠として残すが、導入後には成立しない。書き込みを許可しているのは
+  実行ルートに加えて`~/.claude`、`~/.cache`、`~/Library/Caches`、`/private/tmp`、
+  `/private/var/tmp`、`/private/var/folders`である。したがって実行ルート外への書き込みが完全に
+  不可能なのではない。read-onlyロールにはpytestが`__pycache__`を書けなくなるため適用していない。
+- **項目8・9、実測確認済み:** 再インストール後の実runで`--agent cross-harness-tester`と
+  `--agent cross-harness-implementer`が実際に渡され、testerによる検査実行とimplementer
+  による編集が成功した。対応するClaudeロールには実行役憲章も適用された。
+- **項目10、実測確認済み:** Codex再試行が初回と同じsandboxで動作することを確認した。
+  Codexのresumeには`--sandbox`と`-C`を渡せないため、sandboxは`-c sandbox_mode`で再適用
+  するよう修正し、retryがresumeして成功する実runで確認した。
+
+#### 実装過程で判明し修正した欠陥
+
+1. 実行役がスキーマ外の`status=completed`を返すと、exit code 0のため`success`として記録
+   されていた。スキーマ外statusを`failed`として扱うよう修正した。
+2. 実行役が正規の`status=success`を返しつつ`tests`に「14 failed」と報告した場合も、
+   `success`として記録されていた。write=falseのロールでは検査コマンドの失敗が`success`を
+   上書きするよう修正した。
+3. 実行役が`tests`に辞書の配列を返すと、`render_summary`の`join`が`TypeError`で落ち、runが
+   サマリ無しで異常終了した。要約のリスト項目を決定的な文字列表現へ正規化して解消した。
+4. インストール済みの個人設定にのみ存在しリポジトリに無いロール設定ドキュメントがあり、
+   再インストールで失われる状態だった。`config/default.toml`へ取り込んで解消した。
+
+また、`CROSS_HARNESS_ACTIVE=1`により委譲実行役がこのリポジトリ自身のテストを実行できず
+14件が失敗していた件は、`tests/conftest.py`のautouse fixtureで解消した。委譲実行役による
+実runで全件通過を確認している。
+
+#### フェーズ外で発見した個人設定の所有権欠陥と是正
+
+これはフェーズA・フェーズBのいずれの項目にも属さない、導入・撤去時の個人設定の所有権に
+関する構造的欠陥である。個人設定`config.toml`はinstall時に`existed=false`として記録される
+ため`_record`がバックアップを取らず、`setting_files`にも含まれないため`create_backup`の対象
+外だった。この結果、uninstallの`_restore_record`がバックアップなしで当該設定を削除し、再
+インストールのたびに既定値へ戻していた。モデルやeffortをユーザーが決める層が唯一の更新
+経路であるにもかかわらず毎回リセットされる状態だった。
+
+是正として、個人設定には専用のmanagement値を与えてハーネス所有物と区別し、uninstallでは
+退避したうえで保持する。旧マニフェストについてもパス一致で救済し、`setting_files`へ追加
+する。installは既存設定を何も変更する前に検証し、無効なら即座に中断する。設定の自動書き
+換えは行わない。TOMLを再生成するとコメントで記したドキュメントが失われるためである。
+
+一時HOMEでカスタマイズした設定がuninstallと再インストールを跨いで保持されること、無効な
+設定ではinstallが即座に中断して実行ファイルすら作られないこと、実環境でも設定がバイト
+単位で保持されたことを実測確認した。ただし、**項目5**であるフェーズA完了条件のClaude
+設定所有権検査を実条件で確認したこととは別であり、同項目の実条件確認はなお未了である。
+
+#### 結論
+
+フェーズAは未完了である。残る確認は、security_reviewerの実行確認、rate limitと認証失敗の
+`blocked`終端確認、timeoutからのresume確認、項目3のread-onlyロール上書き機構の実runでの
+発火確認、項目5の設定所有権検査の実条件確認である。実条件未検証の実装はCodex resumeの
+argv不整合のように実runで初めて壊れ方が判明した例があるため、これらを完了扱いにしない。
 
 #### フェーズB: 指示役の対称化
 
