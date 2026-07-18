@@ -589,20 +589,27 @@ run記録で確認した挙動、「単体テストのみ」は実条件で未�
 
 #### 完了条件1: tester・security_reviewerの検査と終端状態
 
-- **項目1、実測確認済み:** read-onlyのClaude testerが実際に`uv run pytest`を実行し、成功時は
-  `success`、失敗時は`failed`として記録されることを確認した。
+- **項目1、追加検証で一部実測確認済み:** `security_reviewer`をClaudeとCodexの両harnessで
+  実行し、いずれも実際に検査を実行して`success`を返すことを確認した。Claude testerについても
+  `uv run pytest`の実行と、成功時`success`・失敗時`failed`の記録を確認している。後述のとおり
+  Codex testerはread-only sandbox下で`uv`のキャッシュを書き込めず検査を開始できないため、
+  完了条件1はCodex側では未達である。
 - **項目4、未検証:** Claude形式のrate limitと認証失敗を`blocked`へ終端する実装・単体テストは
-  あるが、いずれも実条件では未検証である。security_reviewerはClaude・Codexのいずれでも一度も
-  実行しておらず、項目1のsecurity_reviewer部分も未検証である。
+  あるが、いずれも実条件では未検証である。
+- **項目5、追加検証で実測確認済み:** `apiKeyHelper`が`ANTHROPIC_API_KEY`を供給する
+  リポジトリ設定を置くとClaude委譲は`blocked`かつ`blocked_category=authentication`となり、
+  理由にはキー名だけが現れ値は出力されないことを確認した。設定を除去すると実行役が起動して
+  作業することも対照として確認した。
 
 #### 完了条件2: watch・summary・timeout後のresume
 
-- **項目2・6、実測確認済み:** watchがClaudeとCodexの両形式のコマンド、およびtool失敗を表示
-  すること、timeout用の`thread_id`が`state.json`に残ることを確認した。
-- **項目3、単体テストのみ:** read-onlyロールで検査コマンドの失敗を検出した際に`success`を
-  `failed`へ上書きする機構は、実runでは実行役が自ら`failed`を返したため発火していない。
-- **項目6、未検証:** 実際にtimeoutを発生させ、その`thread_id`からresumeする経路は未検証で
-  ある。
+- **項目2、実測確認済み:** watchとsummaryがClaudeとCodexの両形式のコマンド、変更ファイル、
+  tool失敗を残すことを確認した。
+- **項目3、実runで是正確認済み:** read-onlyロールの検査結果を終端イベントで評価するようにし、
+  成功した検査が途中イベントによって`failed`へ上書きされないことを確認した。
+- **項目6、追加検証で実測確認済み:** `timeout_seconds=30`で120秒の処理を投入してexit code 124と
+  `INTERRUPTED=timeout`を発生させた。`state.json`に`thread_id`が残り、retryが`--resume`で復帰し、
+  実行役が中断前に実行していたコマンドを保持することを確認した。項目6の完了条件は実条件で満たした。
 
 #### 完了条件3: write拘束・実行役憲章・Codex再試行のsandbox
 
@@ -632,10 +639,28 @@ run記録で確認した挙動、「単体テストのみ」は実条件で未�
    サマリ無しで異常終了した。要約のリスト項目を決定的な文字列表現へ正規化して解消した。
 4. インストール済みの個人設定にのみ存在しリポジトリに無いロール設定ドキュメントがあり、
    再インストールで失われる状態だった。`config/default.toml`へ取り込んで解消した。
+5. Codexは同一コマンドについて`item.started` (`status=in_progress`)と`item.completed`の二つの
+   イベントを出す。`parse_events`が`in_progress`を失敗として記録していたため、read-onlyロールの
+   上書き機構と組み合わさり、tester・explorer・reviewer・security_reviewerが成功時にも`failed`に
+   なっていた。終端イベントだけを評価するよう修正した。
+6. Claude実行役が`status=completed`を返すと、成功した作業まで`failed`として記録されていた。
+   haikuとopusの双方で発生した。6フィールドの形は正しかったが、指示文に`status`の許可値と型を
+   明示していなかったことが原因である。Codexは`--output-schema`で構造的に強制されるため表面化
+   しなかった。指示文を修正し、両harnessのtesterとsecurity_reviewerで成功時`success`・失敗時
+   `failed`となることを確認した。
 
 また、`CROSS_HARNESS_ACTIVE=1`により委譲実行役がこのリポジトリ自身のテストを実行できず
 14件が失敗していた件は、`tests/conftest.py`のautouse fixtureで解消した。委譲実行役による
 実runで全件通過を確認している。
+
+#### 未解決: Codex read-onlyロールの検査実行
+
+write=falseのロールはCodexを`--sandbox read-only`で起動するため、Codex testerは`uv`の
+キャッシュへ書き込めず、`uv run pytest`そのものを実行できない。実run
+`20260719T020708-76b75516`で`uv failed to initialize its cache because filesystem writes are not permitted`
+となることを確認した。テスト実行は本質的に一時領域への書き込みを要するため、read-onlyの定義を
+「リポジトリを変更しない」へ改めるか、書き込み可能な一時領域を与える必要がある。この問題は今回の
+変更に起因せず、従来から存在していた構造的な制約である。
 
 #### フェーズ外で発見した個人設定の所有権欠陥と是正
 
@@ -658,10 +683,14 @@ run記録で確認した挙動、「単体テストのみ」は実条件で未�
 
 #### 結論
 
-フェーズAは未完了である。残る確認は、security_reviewerの実行確認、rate limitと認証失敗の
-`blocked`終端確認、timeoutからのresume確認、項目3のread-onlyロール上書き機構の実runでの
-発火確認、項目5の設定所有権検査の実条件確認である。実条件未検証の実装はCodex resumeの
-argv不整合のように実runで初めて壊れ方が判明した例があるため、これらを完了扱いにしない。
+フェーズAは未完了である。残作業は次の2点である。
+
+1. rate limitと認証失敗を`blocked`へ終端することの実条件確認。
+2. Codex read-onlyロールが検査を実行できない構造的問題の解消（read-onlyを「リポジトリを変更
+   しない」と再定義するか、書き込み可能な一時領域を与える）。
+
+実条件未検証の実装はCodex resumeのargv不整合のように実runで初めて壊れ方が判明した例があるため、
+前者を完了扱いにしない。後者は完了条件1をCodex側で満たせない直接の原因である。
 
 #### フェーズB: 指示役の対称化
 
