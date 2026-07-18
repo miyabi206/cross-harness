@@ -80,6 +80,7 @@ def inventory(paths: UserPaths | None = None) -> str:
 
 def setting_files(paths: UserPaths):
     roots = [
+        paths.config,
         paths.claude / "CLAUDE.md",
         paths.claude / "settings.json",
         paths.claude / "settings.local.json",

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 from cross_harness.files import MARKER_START
+from cross_harness.errors import ConfigError
 from cross_harness.installer import install, uninstall
 from cross_harness.paths import source_root
 
@@ -139,6 +140,57 @@ class InstallerTests(unittest.TestCase):
             actions = install(home, source_root(), dry_run=True)
             self.assertEqual(5, len(actions))
             self.assertEqual([], list(home.iterdir()))
+
+    def test_uninstall_preserves_and_backs_up_generated_personal_config_with_force_or_surgical_mode(self):
+        for options in ({"force": True}, {"preserve_user_changes": True}):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                home = root / "home"
+                repo = root / "repo"
+                home.mkdir()
+                shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+
+                install(home, repo)
+                config = home / ".config/cross-harness/config.toml"
+                current = "# My documented preferences\n" + config.read_text(encoding="utf-8")
+                config.write_text(current, encoding="utf-8")
+                manifest = json.loads((home / ".local/state/cross-harness/install-manifest.json").read_text())
+                config_record = next(record for record in manifest["records"] if record["path"] == str(config.resolve()))
+                self.assertEqual("personal_config", config_record["management"])
+
+                restored = uninstall(home, **options)
+
+                backup = Path(manifest["backup_root"]) / ".config/cross-harness/config.toml"
+                self.assertEqual(current, config.read_text(encoding="utf-8"))
+                self.assertEqual(current, backup.read_text(encoding="utf-8"))
+                self.assertIn(f"preserved personal config {config.resolve()} (backup: {backup})", restored)
+
+    def test_install_rejects_invalid_existing_personal_config_before_changes_including_dry_run(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            config = home / ".config/cross-harness/config.toml"
+            config.parent.mkdir(parents=True)
+            invalid = (repo / "config/default.toml").read_text(encoding="utf-8") + "\n[roles.planner]\nharness = \"codex\"\n"
+            config.write_text(invalid, encoding="utf-8")
+
+            for dry_run in (False, True):
+                with self.subTest(dry_run=dry_run), self.assertRaises(ConfigError) as raised:
+                    install(home, repo, dry_run=dry_run)
+                message = str(raised.exception)
+                self.assertIn(f"existing personal configuration is invalid: {config.resolve()}", message)
+                self.assertIn("roles: unknown key 'planner'", message)
+                self.assertIn("No files were changed.", message)
+                self.assertIn("Fix the configuration and run install again.", message)
+                self.assertNotIn("Backup destination:", message)
+                self.assertNotIn(str(repo / ".local/backups"), message)
+                self.assertEqual(invalid, config.read_text(encoding="utf-8"))
+                self.assertFalse((home / ".local/share/cross-harness/current").exists())
+                self.assertFalse((home / ".local/bin/cross-harness").exists())
+                self.assertFalse((home / ".local/state/cross-harness/install-manifest.json").exists())
 
     def test_surgical_uninstall_preserves_post_install_user_changes(self):
         with tempfile.TemporaryDirectory() as folder:

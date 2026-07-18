@@ -10,7 +10,7 @@ import shutil
 import tomllib
 
 from .config import load_config
-from .errors import HarnessError
+from .errors import ConfigError, HarnessError
 from .files import append_marker, atomic_write, dump_json, load_json, marker_block, remove_marker, sha256
 from .inventory import create_backup
 from .paths import UserPaths, source_root, user_paths
@@ -264,6 +264,15 @@ def install(home: Path | None = None, repo: Path | None = None, dry_run: bool = 
         f"install personal config {paths.config}",
         "merge Claude and Codex user assets",
     ]
+    config: dict | None = None
+    if paths.config.exists() or paths.config.is_symlink():
+        try:
+            config = load_config(paths.config, paths.home)
+        except ConfigError as exc:
+            raise ConfigError(
+                f"existing personal configuration is invalid: {paths.config}. "
+                f"No files were changed. Fix the configuration and run install again.\n{exc}"
+            ) from exc
     if dry_run:
         return actions
 
@@ -293,9 +302,20 @@ def install(home: Path | None = None, repo: Path | None = None, dry_run: bool = 
     _finish_record(executable_record, paths.executable)
     records.append(executable_record)
 
-    if not paths.config.exists():
-        _write_text(paths.config, (repo / "config/default.toml").read_text(encoding="utf-8"), paths, backup_root, records, management="owned")
-    config = load_config(paths.config, paths.home)
+    if config is None:
+        _write_text(
+            paths.config,
+            (repo / "config/default.toml").read_text(encoding="utf-8"),
+            paths,
+            backup_root,
+            records,
+            management="personal_config",
+        )
+        config = load_config(paths.config, paths.home)
+    else:
+        config_record = _record(paths.config, paths, backup_root)
+        config_record["management"] = "personal_config"
+        records.append(config_record)
 
     shared = repo / "assets/shared/safety.md"
     _merge_markdown(paths.claude / "CLAUDE.md", [repo / "assets/claude/CLAUDE.md", shared], paths, backup_root, records, paths.executable)
@@ -436,6 +456,22 @@ def _restore_record(record: dict) -> str:
     return str(path)
 
 
+def _preserve_personal_config(record: dict, paths: UserPaths, backup_root: Path) -> str:
+    """Back up, but never restore or remove, user-owned personal configuration."""
+    path = Path(record["path"])
+    if path.is_file():
+        backup = backup_root / path.relative_to(paths.home)
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, backup)
+        return f"preserved personal config {path} (backup: {backup})"
+    return f"preserved personal config {path} (no readable file to back up)"
+
+
+def _is_personal_config_record(record: dict, paths: UserPaths) -> bool:
+    """Recognize both current records and manifests written before personal config ownership."""
+    return record.get("management") == "personal_config" or Path(record["path"]) == paths.config
+
+
 def uninstall(
     home: Path | None = None,
     force: bool = False,
@@ -471,7 +507,9 @@ def uninstall(
         for record in reversed(records):
             path = Path(record["path"])
             management = record.get("management", "owned")
-            if (
+            if _is_personal_config_record(record, paths):
+                restored.append(_preserve_personal_config(record, paths, Path(manifest["backup_root"])))
+            elif (
                 management == "codex_config"
                 or (management == "marker" and path == paths.codex / "config.toml")
             ) and path.is_file():
@@ -499,7 +537,11 @@ def uninstall(
             else:
                 restored.append(_restore_record(record))
     else:
-        restored.extend(_restore_record(record) for record in reversed(records))
+        for record in reversed(records):
+            if _is_personal_config_record(record, paths):
+                restored.append(_preserve_personal_config(record, paths, Path(manifest["backup_root"])))
+            else:
+                restored.append(_restore_record(record))
     manifest_path.unlink()
     if purge_runtime:
         assert runtime_root is not None

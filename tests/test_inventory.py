@@ -25,6 +25,9 @@ class InventoryTests(unittest.TestCase):
             (home / ".claude/settings.json").write_text("{}\n")
             (home / ".claude/agents/reviewer.md").write_text("safe\n")
             (home / ".claude/projects/example/transcript.jsonl").write_text("secret\n")
+            personal_config = home / ".config/cross-harness/config.toml"
+            personal_config.parent.mkdir(parents=True)
+            personal_config.write_text("max_parallel = 2\n")
             (home / ".codex/config.toml").write_text("model = 'safe'\n")
             (home / ".codex/auth.json").write_text("credential\n")
             (home / ".codex/private.pem").write_text("key\n")
@@ -33,6 +36,7 @@ class InventoryTests(unittest.TestCase):
             manifest = (destination / "MANIFEST.txt").read_text()
             self.assertIn(".claude/settings.json", manifest)
             self.assertIn(".claude/agents/reviewer.md", manifest)
+            self.assertIn(".config/cross-harness/config.toml", manifest)
             self.assertIn(".codex/config.toml", manifest)
             self.assertNotIn("auth.json", manifest)
             self.assertNotIn("transcript", manifest)
