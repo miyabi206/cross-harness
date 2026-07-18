@@ -8,7 +8,9 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import threading
+import time
 import uuid
 
 from .auth import sanitized_environment, verify_codex_chatgpt, verify_codex_config_ownership
@@ -228,6 +230,7 @@ def delegate(
     config_path: Path | None = None,
     home: Path | None = None,
     confirm_high_risk: bool = False,
+    run_dir: Path | None = None,
 ) -> dict:
     if os.environ.get("CROSS_HARNESS_ACTIVE") == "1":
         raise HarnessError("nested cross-harness delegation from an active executor is blocked")
@@ -253,8 +256,12 @@ def delegate(
         raise HarnessError("task file appears to contain credential material; refusing delegation")
     root = _git_root(cwd)
     runtime_root = Path(config["runtime_root"])
-    run_dir = _new_run_dir(runtime_root)
-    shutil.copy2(task_file, run_dir / "task.md")
+    run_dir = run_dir or _new_run_dir(runtime_root)
+    if not run_dir.is_dir():
+        raise HarnessError(f"run directory not found: {run_dir}")
+    run_task = run_dir / "task.md"
+    if task_file.resolve() != run_task.resolve():
+        shutil.copy2(task_file, run_task)
     project = project_config(config, root)
     policy = project.get("dirty_worktree_policy", config["dirty_worktree_policy"])
     dirty = _dirty(root)
@@ -280,6 +287,98 @@ def delegate(
     atomic_write(run_dir / "command.json", dump_json({"argv": command, "auth_cached": cached, "cwd": str(execution_root)}))
     exit_code = _invoke_safe(command, task, environment, execution_root, run_dir, role["timeout_seconds"])
     return finalize_run(run_dir, role_name, role, kind, execution_root, exit_code, attempt=1)
+
+
+def start_detached_delegate(
+    role_name: str,
+    kind: str,
+    task_file: Path,
+    cwd: Path,
+    config_path: Path | None = None,
+    home: Path | None = None,
+    confirm_high_risk: bool = False,
+) -> Path:
+    """Create a run and start a detached CLI supervisor for it."""
+    if os.environ.get("CROSS_HARNESS_ACTIVE") == "1":
+        raise HarnessError("nested cross-harness delegation from an active executor is blocked")
+    paths = user_paths(home)
+    config = load_config(config_path, paths.home)
+    if role_name not in config["roles"]:
+        raise ConfigError(f"unknown role: {role_name}")
+    role = config["roles"][role_name]
+    if role["harness"] != "codex":
+        raise ConfigError(f"role {role_name} is assigned to Claude, not Codex")
+    if kind not in config["delegate_kinds"] or kind not in role["delegate_kinds"]:
+        raise ConfigError(f"delegation kind {kind!r} is not allowed for {role_name}")
+    if role_name == "security_reviewer" and not confirm_high_risk:
+        raise HarnessError("security review requires --confirm-high-risk after explicit human confirmation")
+    if not task_file.is_file():
+        raise HarnessError(f"task file not found: {task_file}")
+    if task_file.name.lower() in {"auth.json", ".env", "credentials.json"}:
+        raise HarnessError("credential or environment files cannot be used as task files")
+    task = task_file.read_text(encoding="utf-8")
+    if not task.strip():
+        raise HarnessError("task file is empty")
+    if contains_secret(task):
+        raise HarnessError("task file appears to contain credential material; refusing delegation")
+    _git_root(cwd)
+    run_dir = _new_run_dir(Path(config["runtime_root"]))
+    run_task = run_dir / "task.md"
+    shutil.copy2(task_file, run_task)
+    command = [sys.executable, "-m", "cross_harness.cli"]
+    if home is not None:
+        command.extend(["--home", str(home)])
+    command.extend([
+        "delegate",
+        "--role", role_name,
+        "--kind", kind,
+        "--task-file", str(run_task),
+        "--cwd", str(cwd),
+        "--run-dir", str(run_dir),
+        "--supervisor",
+    ])
+    if config_path is not None:
+        command.extend(["--config", str(config_path)])
+    if confirm_high_risk:
+        command.append("--confirm-high-risk")
+    environment = os.environ.copy()
+    environment.pop("CROSS_HARNESS_ACTIVE", None)
+    with (
+        (run_dir / "supervisor.stdin").open("w+b") as stdin,
+        (run_dir / "supervisor.stdout.log").open("wb") as stdout,
+        (run_dir / "supervisor.stderr.log").open("wb") as stderr,
+    ):
+        process = subprocess.Popen(
+            command,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            cwd=cwd,
+            env=environment,
+            start_new_session=True,
+            close_fds=True,
+        )
+    atomic_write(run_dir / "supervisor.pid", f"{process.pid}\n")
+    return run_dir
+
+
+def wait_for_run(run_dir: Path, timeout_seconds: float, poll_seconds: float = 0.1) -> dict | None:
+    """Return a completed run summary, or None after the wait deadline."""
+    if timeout_seconds < 0:
+        raise HarnessError("timeout seconds must be non-negative")
+    summary_path = run_dir / "summary.json"
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if summary_path.is_file() and (run_dir / "summary.txt").is_file():
+            try:
+                return json.loads(summary_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                # Atomic writes make this unlikely, but a concurrent finalizer is harmless.
+                pass
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(poll_seconds, remaining))
 
 
 def finalize_blocked_run(

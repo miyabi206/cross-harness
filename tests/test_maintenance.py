@@ -51,6 +51,19 @@ class MaintenanceTests(unittest.TestCase):
             self.assertNotIn(str(worktree), listing)
             self.assertFalse(run.exists())
 
+    def test_live_supervisor_is_not_marked_orphaned(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            run = home / ".local/state/cross-harness/runs/live"
+            run.mkdir(parents=True)
+            (run / "supervisor.pid").write_text(f"{os.getpid()}\n")
+            now = datetime.now(timezone.utc)
+            old_time = (now - timedelta(hours=2)).timestamp()
+            os.utime(run, (old_time, old_time))
+            result = cleanup(home=home, now=now)
+            self.assertFalse((run / "ORPHANED").exists())
+            self.assertEqual([], result["orphaned"])
+
 
 if __name__ == "__main__":
     unittest.main()

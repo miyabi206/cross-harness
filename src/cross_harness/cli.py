@@ -15,7 +15,7 @@ from .installer import install, uninstall
 from .inventory import create_backup, inventory
 from .maintenance import cleanup
 from .paths import source_root, user_paths
-from .runner import delegate, retry
+from .runner import delegate, retry, start_detached_delegate, wait_for_run
 from .taskfile import create_task_file
 from .trust import confirm_codex_hook
 
@@ -48,6 +48,14 @@ def parser() -> argparse.ArgumentParser:
     delegate_parser.add_argument("--cwd", required=True, type=Path)
     delegate_parser.add_argument("--config", type=Path)
     delegate_parser.add_argument("--confirm-high-risk", action="store_true")
+    delegate_parser.add_argument("--no-detach", action="store_true", help="run in this process")
+    delegate_parser.add_argument("--timeout-seconds", type=float, default=86400, help="foreground wait limit")
+    delegate_parser.add_argument("--run-dir", type=Path, help=argparse.SUPPRESS)
+    delegate_parser.add_argument("--supervisor", action="store_true", help=argparse.SUPPRESS)
+
+    wait_parser = commands.add_parser("wait", help="wait for a delegated run to finalize")
+    wait_parser.add_argument("--run", required=True, type=Path)
+    wait_parser.add_argument("--timeout-seconds", required=True, type=float)
 
     retry_parser = commands.add_parser("retry", help="resume a failed task with a delta instruction")
     retry_parser.add_argument("--run-dir", required=True, type=Path)
@@ -123,9 +131,40 @@ def main(argv: list[str] | None = None) -> int:
             restored = uninstall(home, args.force, args.preserve_user_changes, args.purge_runtime)
             print(f"restored {len(restored)} paths")
         elif args.command == "delegate":
-            summary = delegate(args.role, args.kind, args.task_file.resolve(), args.cwd.resolve(), args.config, home, args.confirm_high_risk)
-            print((Path(summary["run_dir"]) / "summary.txt").read_text(encoding="utf-8"), end="")
-            return 0 if summary["status"] == "success" else 1
+            if args.supervisor or args.no_detach:
+                summary = delegate(
+                    args.role,
+                    args.kind,
+                    args.task_file.resolve(),
+                    args.cwd.resolve(),
+                    args.config,
+                    home,
+                    args.confirm_high_risk,
+                    args.run_dir.resolve() if args.run_dir else None,
+                )
+                print((Path(summary["run_dir"]) / "summary.txt").read_text(encoding="utf-8"), end="")
+                return 0 if summary["status"] == "success" else 1
+            run_dir = start_detached_delegate(
+                args.role,
+                args.kind,
+                args.task_file.resolve(),
+                args.cwd.resolve(),
+                args.config,
+                home,
+                args.confirm_high_risk,
+            )
+            print(run_dir, flush=True)
+            summary = wait_for_run(run_dir, args.timeout_seconds)
+            if summary is None:
+                return 4
+            print((run_dir / "summary.txt").read_text(encoding="utf-8"), end="")
+            return 0 if summary["status"] == "success" else 3
+        elif args.command == "wait":
+            summary = wait_for_run(args.run.resolve(), args.timeout_seconds)
+            if summary is None:
+                return 4
+            print((args.run.resolve() / "summary.txt").read_text(encoding="utf-8"), end="")
+            return 0 if summary["status"] == "success" else 3
         elif args.command == "retry":
             summary = retry(args.run_dir.resolve(), args.task_file.resolve(), args.config, home)
             print((Path(summary["run_dir"]) / "summary.txt").read_text(encoding="utf-8"), end="")

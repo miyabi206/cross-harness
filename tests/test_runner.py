@@ -5,10 +5,11 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 from cross_harness.errors import AuthError, DirtyWorktreeError, HarnessError
-from cross_harness.runner import _invoke_safe, delegate, retry
+from cross_harness.runner import _invoke_safe, delegate, retry, wait_for_run
 from cross_harness.runner import finalize_run
 
 
@@ -225,6 +226,67 @@ class RunnerTests(unittest.TestCase):
         )
         self.assertEqual(124, code)
         self.assertEqual("timeout\n", (run / "INTERRUPTED").read_text())
+
+    def test_detached_supervisor_finalizes_after_foreground_is_killed(self):
+        fake_bin = self.root / "bin"
+        fake_bin.mkdir()
+        fake_codex = fake_bin / "codex"
+        fake_codex.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = login ]; then echo 'Logged in using ChatGPT'; exit 0; fi\n"
+            "touch \"$CROSS_HARNESS_RUN_DIR/fake-running\"\n"
+            "output=''\n"
+            "while [ \"$#\" -gt 0 ]; do\n"
+            "  if [ \"$1\" = -o ]; then shift; output=$1; fi\n"
+            "  shift\n"
+            "done\n"
+            "sleep 1\n"
+            "printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"00000000-0000-0000-0000-000000000001\"}' '{\"type\":\"turn.completed\",\"usage\":{}}'\n"
+            "printf '%s\\n' '{\"status\":\"success\",\"work_completed\":\"finished after detach\",\"changed_files\":[],\"tests\":[],\"error\":null,\"next_decision\":null}' > \"$output\"\n"
+        )
+        fake_codex.chmod(0o755)
+        injector = self.root / "injector"
+        injector.mkdir()
+        (injector / "sitecustomize.py").write_text(
+            "import os\n"
+            "from pathlib import Path\n"
+            "import cross_harness.runner\n"
+            "cross_harness.runner.verify_codex_chatgpt = lambda *args: (Path(os.environ['TEST_FAKE_CODEX']), False)\n"
+            "cross_harness.runner.verify_codex_config_ownership = lambda *args: None\n"
+        )
+        environment = os.environ.copy()
+        environment.pop("CROSS_HARNESS_ACTIVE", None)
+        environment.update({
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+            "PYTHONPATH": os.pathsep.join([str(injector), str(Path(__file__).resolve().parents[1] / "src")]),
+            "TEST_FAKE_CODEX": str(fake_codex),
+        })
+        command = [
+            sys.executable, "-m", "cross_harness.cli", "--home", str(self.home),
+            "delegate", "--role", "tester", "--kind", "test", "--task-file", str(self.task),
+            "--cwd", str(self.repo), "--timeout-seconds", "10",
+        ]
+        foreground = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment)
+        assert foreground.stdout is not None
+        run_dir = Path(foreground.stdout.readline().strip())
+        self.assertTrue((run_dir / "supervisor.pid").is_file())
+        deadline = time.monotonic() + 5
+        while not (run_dir / "fake-running").exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(
+            (run_dir / "fake-running").exists(),
+            "files=" + repr([path.name for path in run_dir.iterdir()]) + " stderr=" + (run_dir / "stderr.log").read_text(errors="replace"),
+        )
+        foreground.kill()
+        foreground.wait(timeout=5)
+        foreground.stdout.close()
+        assert foreground.stderr is not None
+        foreground.stderr.close()
+        summary = wait_for_run(run_dir, 5)
+        self.assertIsNotNone(summary)
+        assert summary is not None
+        self.assertEqual("success", summary["status"])
+        self.assertTrue((run_dir / "final.json").is_file())
 
     @patch("cross_harness.runner.failure_signature", return_value="same-signature")
     @patch("cross_harness.runner.verify_codex_chatgpt")

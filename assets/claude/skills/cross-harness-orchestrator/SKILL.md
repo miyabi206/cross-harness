@@ -70,6 +70,15 @@ Use implementer for code, tester for checks, debugger for complex failures,
 and security_reviewer only after explicit human confirmation. Never shorten the
 absolute wrapper path to a bare `cross-harness` command.
 
+Invoke `delegate` only in a foreground Bash call; never use `run_in_background`.
+It prints the run directory first and then waits for the detached supervisor.
+If the foreground call is interrupted or times out, do not delegate again. Re-attach
+to that printed run with:
+
+```text
+{{CROSS_HARNESS_BIN}} wait --run <run_dir> --timeout-seconds <seconds>
+```
+
 ## Verify
 
 Read the returned summary and paths, inspect `git diff --stat` and the relevant
@@ -78,6 +87,8 @@ only around an unresolved failure. If correction is needed, write a short delta
 instruction and use `{{CROSS_HARNESS_BIN}} retry` with the recorded run directory.
 Never exceed two normal retries. Two identical failure signatures permit one
 explicit escalation; authentication or rate-limit failures stop immediately.
+Runtime cleanup marks incomplete runs as ORPHANED only when their
+`supervisor.pid` is not alive.
 
 ## Report
 
