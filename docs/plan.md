@@ -530,10 +530,11 @@ Codex前提であることが調査で判明した。本節はリポジトリ読
 8. **Claudeの役割定義が不足する(読解確認)。**
    `.claude/agents/`にはimplementer、tester、debugger、security_reviewerに対応する
    Claudeエージェント定義がない。ロール別の実行契約がClaude側では具体化されない。
-9. **委譲先Claudeが指示役の憲章を読んでしまう(読解確認)。**
-   `AGENTS.md`とClaude向けのブリッジ設定により、委譲されたClaudeもorchestratorの
-   憲章を読む。実行役に必要な役割と指示役の規則が矛盾し、委譲時の指示が不安定に
-   なる。
+9. **委譲先Claudeに実行役憲章がない(読解確認)。**
+   委譲されたClaudeはClaude側の`CLAUDE.md`を読み、そこにある「自分は
+   orchestratorである」「EditとWriteでプロジェクトコードを編集しない」という
+   指示役の規則に従う。これは実行役として与えられる役割と編集権限に矛盾する。
+   Claude側に実行役向け憲章がないことが問題の本質である。
 10. **Codex resumeがsandbox指定を落とす(読解確認)。**
     `src/cross_harness/runner.py`のresume用Codex起動経路では初回起動時のsandbox
     指定を再適用しない。再試行後だけ権限制約が初回と異なり、実行条件の一貫性を
@@ -546,7 +547,7 @@ Codex前提であることが調査で判明した。本節はリポジトリ読
   検出強度が異なる。
 - doctor、inventory、trustはCodexのみを手厚く扱う。該当する運用診断がClaudeには
   なく、障害時の自己診断範囲が非対称である。
-- `src/cross_harness/config/default.toml`のClaudeロールは全てretries=0である。retryと
+- `config/default.toml`のClaudeロールは全てretries=0である。retryと
   escalationに到達せず、設定上の復旧経路を検証できない。
 - `README.md`冒頭は一方向の記述のままであり、利用者が双方向設定の範囲と制限を
   誤認しうる。
