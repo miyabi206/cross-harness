@@ -280,7 +280,10 @@ def _claude_command(
         CLAUDE_EXECUTOR_CHARTER
         + "\n\n"
         "When the task is complete, respond with only a JSON object conforming to "
-        f"{schema}. Your entire final message must be that JSON object: do not include "
+        f"{schema}. It must contain exactly: status (one of success, failed, blocked, "
+        "partial), work_completed (string), changed_files (array of strings), tests "
+        "(array of strings), error (string or null), and next_decision (string or null). "
+        "Your entire final message must be that JSON object: do not include "
         "explanatory prose or Markdown code fences before or after it. Do not write the "
         "result to a file. "
         "Do not include credentials or authentication material."
