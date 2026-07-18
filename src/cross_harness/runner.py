@@ -247,10 +247,11 @@ def _codex_command(codex: Path, role: dict, cwd: Path, run_dir: Path, resume: st
 def _claude_command(claude: Path, role: dict, run_dir: Path, resume: str | None = None) -> list[str]:
     schema = _delegation_schema()
     permission_mode = "acceptEdits" if role["write"] else "manual"
-    final_path = run_dir / "final.json"
     result_instruction = (
-        "When the task is complete, write a JSON object conforming to "
-        f"{schema} to {final_path}. This file must contain only the result object. "
+        "When the task is complete, respond with only a JSON object conforming to "
+        f"{schema}. Your entire final message must be that JSON object: do not include "
+        "explanatory prose or Markdown code fences before or after it. Do not write the "
+        "result to a file. "
         "Do not include credentials or authentication material."
     )
     return [
@@ -272,6 +273,36 @@ def _command(executor: Path, role: dict, cwd: Path, run_dir: Path, resume: str |
     if role["harness"] == "claude":
         return _claude_command(executor, role, run_dir, resume)
     raise ConfigError(f"unsupported harness: {role['harness']}")
+
+
+def _write_claude_final_from_events(run_dir: Path) -> None:
+    """Persist Claude's final result event when it contains a JSON object."""
+    final_path = run_dir / "final.json"
+    events_path = run_dir / "events.jsonl"
+    if final_path.exists() or not events_path.exists():
+        return
+    result_text: str | None = None
+    with events_path.open(encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "result":
+                value = event.get("result")
+                result_text = value if isinstance(value, str) else None
+    if result_text is None:
+        return
+    result_text = result_text.strip()
+    fenced = re.fullmatch(r"```[^\r\n]*\r?\n(.*?)\r?\n?```", result_text, flags=re.DOTALL)
+    if fenced:
+        result_text = fenced.group(1).strip()
+    try:
+        final = json.loads(result_text)
+    except json.JSONDecodeError:
+        return
+    if isinstance(final, dict):
+        atomic_write(final_path, dump_json(final))
 
 
 def delegate(
@@ -347,6 +378,8 @@ def delegate(
     _write_execution_record(run_dir, role_name, role, kind, execution_root)
     atomic_write(run_dir / "command.json", dump_json({"argv": command, "auth_cached": cached, "cwd": str(execution_root)}))
     exit_code = _invoke_safe(command, task, environment, execution_root, run_dir, role["timeout_seconds"])
+    if role["harness"] == "claude":
+        _write_claude_final_from_events(run_dir)
     return finalize_run(run_dir, role_name, role, kind, execution_root, exit_code, attempt=1)
 
 
@@ -764,6 +797,8 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
     _write_execution_record(retry_root, state["role"], role, state["kind"], Path(state["cwd"]))
     atomic_write(retry_root / "command.json", dump_json({"argv": command, "auth_cached": cached, "resume": state["thread_id"]}))
     exit_code = _invoke_safe(command, task_file.read_text(encoding="utf-8"), environment, Path(state["cwd"]), retry_root, role["timeout_seconds"])
+    if role["harness"] == "claude":
+        _write_claude_final_from_events(retry_root)
     summary = finalize_run(retry_root, state["role"], role, state["kind"], Path(state["cwd"]), exit_code, state["attempts"] + 1)
     new_state = json.loads((retry_root / "state.json").read_text(encoding="utf-8"))
     new_state["signatures"] = [*state.get("signatures", []), *new_state.get("signatures", [])]
@@ -779,6 +814,8 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         _write_execution_record(escalation_root, state["role"], escalation, state["kind"], Path(state["cwd"]))
         atomic_write(escalation_root / "command.json", dump_json({"argv": command, "escalation": True, "previous_run": str(retry_root)}))
         code = _invoke_safe(command, task_file.read_text(encoding="utf-8"), environment | {"CROSS_HARNESS_RUN_DIR": str(escalation_root)}, Path(state["cwd"]), escalation_root, escalation["timeout_seconds"])
+        if escalation["harness"] == "claude":
+            _write_claude_final_from_events(escalation_root)
         escalated_summary = finalize_run(escalation_root, state["role"], escalation, state["kind"], Path(state["cwd"]), code, new_state["attempts"] + 1)
         escalated_state = json.loads((escalation_root / "state.json").read_text(encoding="utf-8"))
         escalated_state["escalated"] = True

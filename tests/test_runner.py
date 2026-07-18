@@ -10,7 +10,7 @@ import unittest
 
 from cross_harness.errors import AuthError, DirtyWorktreeError, HarnessError, SupervisorDiedError
 from cross_harness.config import default_config
-from cross_harness.runner import _claude_command, _escalated_role, _invoke_safe, _write_baseline, delegate, retry, start_detached_delegate, wait_for_run
+from cross_harness.runner import _claude_command, _escalated_role, _invoke_safe, _write_baseline, _write_claude_final_from_events, delegate, retry, start_detached_delegate, wait_for_run
 from cross_harness.runner import finalize_run
 
 
@@ -214,7 +214,10 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("sonnet", command[command.index("--model") + 1])
         self.assertNotIn("-C", command)
         self.assertNotIn("bypassPermissions", command)
-        self.assertIn(str(run / "final.json"), command[command.index("--append-system-prompt") + 1])
+        instruction = command[command.index("--append-system-prompt") + 1]
+        self.assertIn("only a JSON object", instruction)
+        self.assertIn("Do not write the result to a file", instruction)
+        self.assertNotIn(str(run / "final.json"), instruction)
 
         resumed = _claude_command(Path("/usr/local/bin/claude"), read_only, run, "session-1")
         self.assertEqual("session-1", resumed[resumed.index("--resume") + 1])
@@ -235,13 +238,9 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual("claude", env["CROSS_HARNESS_EXECUTOR"])
             self.assertEqual("manual", command[command.index("--permission-mode") + 1])
             (run_dir / "events.jsonl").write_text(
-                '{"type":"result","session_id":"session-1","is_error":false,"usage":{"input_tokens":10,"output_tokens":2}}\n'
+                '{"type":"result","session_id":"session-1","is_error":false,"usage":{"input_tokens":10,"output_tokens":2},"result":"{\\"status\\": \\"success\\", \\"work_completed\\": \\"reviewed\\", \\"changed_files\\": [\\"README.md\\"], \\"tests\\": [\\"review\\"], \\"error\\": null, \\"next_decision\\": \\"ship it\\"}"}\n'
             )
             (run_dir / "stderr.log").write_text("")
-            (run_dir / "final.json").write_text(json.dumps({
-                "status": "success", "work_completed": "reviewed", "changed_files": [],
-                "tests": ["review"], "error": None, "next_decision": None,
-            }))
             return 0
 
         invoke.side_effect = complete
@@ -249,11 +248,47 @@ class RunnerTests(unittest.TestCase):
         run = Path(summary["run_dir"])
         self.assertEqual("success", summary["status"])
         self.assertEqual("session-1", summary["thread_id"])
+        self.assertEqual("reviewed", summary["work_completed"])
+        self.assertEqual(["README.md"], summary["changed_files"])
+        self.assertEqual(["review"], summary["tests"])
+        self.assertEqual("ship it", summary["next_decision"])
+        self.assertTrue((run / "final.json").exists())
         self.assertEqual("claude", json.loads((run / "execution.json").read_text())["harness"])
         self.assertFalse(json.loads((run / "execution.json").read_text())["write"])
         verify_claude.assert_called_once()
         verify_codex.assert_not_called()
         ownership.assert_not_called()
+
+    def test_claude_result_code_fence_creates_final_json(self):
+        run = self.root / "claude-fenced-result"
+        run.mkdir()
+        result = {
+            "status": "partial", "work_completed": "reviewed", "changed_files": [],
+            "tests": [], "error": None, "next_decision": "follow up",
+        }
+        (run / "events.jsonl").write_text(json.dumps({
+            "type": "result", "result": f"```json\n{json.dumps(result)}\n```",
+        }) + "\n")
+
+        _write_claude_final_from_events(run)
+
+        self.assertEqual(result, json.loads((run / "final.json").read_text()))
+
+    def test_unparseable_claude_result_does_not_create_final_json(self):
+        run = self.root / "claude-invalid-result"
+        run.mkdir()
+        (run / "events.jsonl").write_text(
+            '{"type":"result","is_error":false,"result":"not JSON"}\n'
+        )
+        (run / "stderr.log").write_text("")
+
+        _write_claude_final_from_events(run)
+
+        self.assertFalse((run / "final.json").exists())
+        role = {"model": "sonnet", "effort": "high", "output_limit_chars": 8000, "write": False}
+        summary = finalize_run(run, "reviewer", role, "review", self.repo, 0, 1)
+        self.assertEqual("success", summary["status"])
+        self.assertEqual("", summary["work_completed"])
 
     @patch("cross_harness.runner.verify_claude_subscription")
     @patch("cross_harness.runner._invoke_safe")
