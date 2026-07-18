@@ -9,7 +9,7 @@ import time
 import unittest
 
 from cross_harness.errors import AuthError, DirtyWorktreeError, HarnessError, SupervisorDiedError
-from cross_harness.runner import _claude_command, _invoke_safe, delegate, retry, start_detached_delegate, wait_for_run
+from cross_harness.runner import _claude_command, _invoke_safe, _write_baseline, delegate, retry, start_detached_delegate, wait_for_run
 from cross_harness.runner import finalize_run
 
 
@@ -169,6 +169,25 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(by_file["new.txt"]["untracked"])
         self.assertIn("diff_stat", (run / "summary.txt").read_text())
 
+    def test_read_only_role_changes_fail_after_execution(self):
+        run = self.root / "read-only-change-run"
+        run.mkdir()
+        _write_baseline(run, self.repo)
+        (self.repo / "README.md").write_text("after\n")
+        (run / "events.jsonl").write_text('{"type":"turn.completed","usage":{}}\n')
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "inspected", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+
+        role = {"model": "gpt-5.6-luna", "effort": "low", "output_limit_chars": 8000, "write": False}
+        summary = finalize_run(run, "tester", role, "test", self.repo, 0, 1)
+
+        self.assertEqual("failed", summary["status"])
+        self.assertIn("read-only role modified the worktree", summary["error"])
+        self.assertEqual(["README.md"], summary["changed_files"])
+
     def test_task_file_with_credential_material_is_rejected(self):
         self.task.write_text("OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz123456\n")
         with self.assertRaises(HarnessError):
@@ -187,7 +206,10 @@ class RunnerTests(unittest.TestCase):
         command = _claude_command(Path("/usr/local/bin/claude"), read_only, run)
         self.assertEqual("-p", command[1])
         self.assertEqual("stream-json", command[command.index("--output-format") + 1])
-        self.assertEqual("plan", command[command.index("--permission-mode") + 1])
+        self.assertIn("--verbose", command)
+        self.assertEqual("manual", command[command.index("--permission-mode") + 1])
+        disallowed_index = command.index("--disallowed-tools")
+        self.assertEqual(["Edit", "Write", "NotebookEdit"], command[disallowed_index + 1:disallowed_index + 4])
         self.assertEqual("sonnet", command[command.index("--model") + 1])
         self.assertNotIn("-C", command)
         self.assertNotIn("bypassPermissions", command)
@@ -206,7 +228,7 @@ class RunnerTests(unittest.TestCase):
 
         def complete(command, task, env, cwd, run_dir, timeout):
             self.assertEqual("claude", env["CROSS_HARNESS_EXECUTOR"])
-            self.assertEqual("plan", command[command.index("--permission-mode") + 1])
+            self.assertEqual("manual", command[command.index("--permission-mode") + 1])
             (run_dir / "events.jsonl").write_text(
                 '{"type":"result","session_id":"session-1","is_error":false,"usage":{"input_tokens":10,"output_tokens":2}}\n'
             )

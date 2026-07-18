@@ -246,7 +246,7 @@ def _codex_command(codex: Path, role: dict, cwd: Path, run_dir: Path, resume: st
 
 def _claude_command(claude: Path, role: dict, run_dir: Path) -> list[str]:
     schema = _delegation_schema()
-    permission_mode = "acceptEdits" if role["write"] else "plan"
+    permission_mode = "acceptEdits" if role["write"] else "manual"
     final_path = run_dir / "final.json"
     result_instruction = (
         "When the task is complete, write a JSON object conforming to "
@@ -258,7 +258,9 @@ def _claude_command(claude: Path, role: dict, run_dir: Path) -> list[str]:
         "--model", role["model"],
         "--effort", role["effort"],
         "--output-format", "stream-json",
+        "--verbose",
         "--permission-mode", permission_mode,
+        "--disallowed-tools", "Edit", "Write", "NotebookEdit",
         "--append-system-prompt", result_instruction,
     ]
 
@@ -621,6 +623,11 @@ def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path
     detected_changed = [item["file"] for item in diff_summary]
     if not diff_summary:
         diff_stat = ""
+    if role.get("write") is False and diff_summary:
+        status = "failed"
+        blocked_category = None
+        readonly_error = "read-only role modified the worktree"
+        combined_error = f"{combined_error}\n{readonly_error}".strip()
     atomic_write(run_dir / "diff-stat.txt", diff_stat)
     reported_changed = final.get("changed_files") if isinstance(final.get("changed_files"), list) else []
     filtered_reported = [name for name in reported_changed if name not in baseline_names or name in detected_changed]
