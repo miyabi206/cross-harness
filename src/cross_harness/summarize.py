@@ -8,10 +8,27 @@ import re
 
 FAILURE_WORDS = re.compile(r"\b(error|failed|failure|exception|panic|traceback)\b", re.IGNORECASE)
 VOLATILE = re.compile(r"\b(?:0x[0-9a-f]+|\d+(?:\.\d+)?(?:ms|s)?|[0-9a-f]{8,})\b", re.IGNORECASE)
+_CLAUDE_RATE_LIMIT_CODES = frozenset({
+    "rate_limit",
+    "rate_limit_error",
+    "rate_limit_exceeded",
+    "usage_limit",
+    "quota_exceeded",
+})
+_CLAUDE_AUTHENTICATION_CODES = frozenset({
+    "authentication_error",
+    "authentication_failed",
+    "auth_error",
+    "auth_failure",
+    "unauthorized",
+    "not_authenticated",
+    "login_required",
+    "oauth_org_not_allowed",
+})
 
 
 def parse_events(path: Path) -> dict:
-    result = {"thread_id": None, "usage": {}, "errors": [], "commands": []}
+    result = {"thread_id": None, "usage": {}, "errors": [], "commands": [], "blocked_category": None}
     if not path.exists():
         return result
     with path.open(encoding="utf-8", errors="replace") as handle:
@@ -23,6 +40,12 @@ def parse_events(path: Path) -> dict:
                     result["errors"].append(line.strip())
                 continue
             kind = event.get("type")
+            claude_blocked_category = _claude_blocked_category(event)
+            if claude_blocked_category == "rate_limit":
+                # A rate limit always wins if an event stream contains multiple errors.
+                result["blocked_category"] = claude_blocked_category
+            elif claude_blocked_category and result["blocked_category"] is None:
+                result["blocked_category"] = claude_blocked_category
             if kind == "thread.started":
                 result["thread_id"] = event.get("thread_id")
             elif kind == "turn.completed":
@@ -46,6 +69,56 @@ def parse_events(path: Path) -> dict:
                     })
     result["errors"] = [text for text in result["errors"] if text]
     return result
+
+
+def _claude_blocked_category(event: dict) -> str | None:
+    """Extract terminal Claude failures from stream-json's structured fields.
+
+    Claude emits rate limits as a dedicated event and reports error categories
+    on ``result`` and ``system/api_retry`` events. Deliberately do not inspect
+    free-form messages here: the runner's legacy text patterns are retained for
+    Codex event streams only.
+    """
+    event_type = event.get("type")
+    if event_type == "rate_limit_event":
+        info = event.get("rate_limit_info")
+        return "rate_limit" if isinstance(info, dict) and info.get("status") == "rejected" else None
+    if event_type == "system" and event.get("subtype") == "api_retry":
+        return _claude_error_category(event.get("error"))
+    if event_type != "result":
+        return None
+    for code in _claude_result_codes(event):
+        category = _claude_error_category(code)
+        if category:
+            return category
+    return None
+
+
+def _claude_result_codes(event: dict) -> list[str]:
+    """Return only structured Claude result error identifiers, never text."""
+    codes: list[str] = []
+    values: list[dict] = [event]
+    for key in ("error", "error_info"):
+        value = event.get(key)
+        if isinstance(value, dict):
+            values.append(value)
+    for value in values:
+        for key in ("subtype", "error_type", "error_code", "code", "error"):
+            code = value.get(key)
+            if isinstance(code, str):
+                codes.append(code.lower().replace("-", "_").replace(" ", "_"))
+    return codes
+
+
+def _claude_error_category(code: object) -> str | None:
+    if not isinstance(code, str):
+        return None
+    normalized = code.lower().replace("-", "_").replace(" ", "_")
+    if normalized in _CLAUDE_RATE_LIMIT_CODES:
+        return "rate_limit"
+    if normalized in _CLAUDE_AUTHENTICATION_CODES:
+        return "authentication"
+    return None
 
 
 def _event_text(event: dict) -> str:

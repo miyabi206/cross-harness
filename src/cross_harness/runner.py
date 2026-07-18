@@ -29,6 +29,7 @@ from .taskfile import contains_secret
 
 RATE_LIMIT = re.compile(r"rate.?limit|usage.?limit|quota|too many requests", re.IGNORECASE)
 AUTH_FAILURE = re.compile(r"unauthorized|authentication|not logged in|login required", re.IGNORECASE)
+CLAUDE_INSPECTION_TOOLS = "Bash,Read,Grep,Glob"
 _DETACHED_SUPERVISORS: dict[int, subprocess.Popen] = {}
 
 
@@ -262,6 +263,7 @@ def _claude_command(claude: Path, role: dict, run_dir: Path, resume: str | None 
         "--output-format", "stream-json",
         "--verbose",
         "--permission-mode", permission_mode,
+        "--allowedTools", CLAUDE_INSPECTION_TOOLS,
         *([] if role["write"] else ["--disallowed-tools", "Edit", "Write", "NotebookEdit"]),
         "--append-system-prompt", result_instruction,
     ]
@@ -639,8 +641,14 @@ def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path
     if event_failed and status == "success":
         status = "failed"
     combined_error = str(final.get("error") or "\n".join(parsed.get("errors", [])[-3:]) or stderr[-2000:] or "")
-    blocked_category: str | None = None
-    if RATE_LIMIT.search(combined_error):
+    blocked_category = parsed.get("blocked_category")
+    if blocked_category == "rate_limit":
+        status = "blocked"
+        combined_error = "rate limit detected; no fallback or automatic waiting was attempted"
+    elif blocked_category == "authentication":
+        status = "blocked"
+        combined_error = "authentication failure detected; no billing fallback was attempted"
+    elif RATE_LIMIT.search(combined_error):
         status = "blocked"
         blocked_category = "rate_limit"
         combined_error = "rate limit detected; no fallback or automatic waiting was attempted"

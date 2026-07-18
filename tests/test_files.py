@@ -38,6 +38,16 @@ class FileTests(unittest.TestCase):
         self.assertEqual({"input_tokens": 3, "output_tokens": 1}, parsed["usage"])
         self.assertEqual(["permission denied"], parsed["errors"])
 
+    def test_parse_events_extracts_structured_claude_terminal_categories(self):
+        with tempfile.TemporaryDirectory() as folder:
+            events = Path(folder) / "events.jsonl"
+            events.write_text(
+                '{"type":"system","subtype":"api_retry","error":"authentication_failed"}\n'
+                '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}\n'
+            )
+            parsed = parse_events(events)
+        self.assertEqual("rate_limit", parsed["blocked_category"])
+
     def test_summary_is_bounded_and_points_to_raw_artifacts(self):
         summary = {
             "status": "failed", "run_dir": "/tmp/run", "exit_code": 1,

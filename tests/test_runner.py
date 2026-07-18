@@ -209,6 +209,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("stream-json", command[command.index("--output-format") + 1])
         self.assertIn("--verbose", command)
         self.assertEqual("manual", command[command.index("--permission-mode") + 1])
+        self.assertEqual("Bash,Read,Grep,Glob", command[command.index("--allowedTools") + 1])
         disallowed_index = command.index("--disallowed-tools")
         self.assertEqual(["Edit", "Write", "NotebookEdit"], command[disallowed_index + 1:disallowed_index + 4])
         self.assertEqual("sonnet", command[command.index("--model") + 1])
@@ -225,6 +226,7 @@ class RunnerTests(unittest.TestCase):
         writable = dict(read_only, write=True)
         write_command = _claude_command(Path("/usr/local/bin/claude"), writable, run)
         self.assertEqual("acceptEdits", write_command[write_command.index("--permission-mode") + 1])
+        self.assertEqual("Bash,Read,Grep,Glob", write_command[write_command.index("--allowedTools") + 1])
         self.assertNotIn("--disallowed-tools", write_command)
 
     @patch("cross_harness.runner.verify_codex_chatgpt")
@@ -391,6 +393,40 @@ class RunnerTests(unittest.TestCase):
         state = json.loads((run / "state.json").read_text())
         self.assertEqual("rate_limit", state["blocked_category"])
         self.assertTrue((run / "BLOCKED").exists())
+
+    def test_claude_stderr_rate_limit_fails_closed(self):
+        run = self.root / "claude-stderr-rate-limit-run"
+        run.mkdir()
+        (run / "events.jsonl").write_text("")
+        (run / "stderr.log").write_text("Claude AI usage limit reached\n")
+        role = {"harness": "claude", "model": "sonnet", "effort": "high", "output_limit_chars": 8000}
+
+        summary = finalize_run(run, "reviewer", role, "review", self.repo, 1, 1)
+
+        self.assertEqual("blocked", summary["status"])
+        state = json.loads((run / "state.json").read_text())
+        self.assertEqual("rate_limit", state["blocked_category"])
+
+    def test_claude_structured_rate_limit_and_authentication_events_block_without_retry(self):
+        cases = (
+            ("rate_limit", '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}\n'),
+            ("authentication", '{"type":"result","is_error":true,"subtype":"error_during_execution","error":"authentication_failed","result":"redacted"}\n'),
+        )
+        role = {"harness": "claude", "model": "sonnet", "effort": "high", "output_limit_chars": 8000, "write": False}
+        for category, events in cases:
+            with self.subTest(category=category):
+                run = self.root / f"claude-{category}-run"
+                run.mkdir()
+                (run / "events.jsonl").write_text(events)
+                (run / "stderr.log").write_text("")
+
+                summary = finalize_run(run, "reviewer", role, "review", self.repo, 1, 1)
+
+                self.assertEqual("blocked", summary["status"])
+                state = json.loads((run / "state.json").read_text())
+                self.assertEqual(category, state["blocked_category"])
+                with self.assertRaisesRegex(HarnessError, "blocked runs cannot be retried"):
+                    retry(run, self.task, home=self.home)
 
     def test_read_only_change_does_not_override_rate_limit_block(self):
         run = self.root / "read-only-rate-limit-run"
