@@ -304,6 +304,69 @@ def _claude_command(
     return command
 
 
+def _sandbox_profile_string(value: str | Path) -> str:
+    """Return a safely quoted Sandbox Profile Language string literal."""
+    # SBPL uses backslash escaping in string literals.  Escape it before quotes
+    # so a path cannot terminate a literal or add a new profile form.
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    escaped = escaped.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+    return f'"{escaped}"'
+
+
+def _claude_sandbox_profile(execution_root: Path, home: Path) -> str:
+    """Build the write confinement profile for a Claude executor."""
+    writable_subpaths = (
+        execution_root.resolve(),
+        (home / ".claude").resolve(),
+        (home / ".cache").resolve(),
+        (home / "Library/Caches").resolve(),
+        Path("/private/tmp"),
+        Path("/private/var/tmp"),
+        Path("/private/var/folders"),
+    )
+    writable_devices = (
+        "/dev/null",
+        "/dev/stdout",
+        "/dev/stderr",
+        "/dev/dtracehelper",
+        "/dev/tty",
+    )
+    rules = [
+        "(version 1)",
+        "(allow default)",
+        "(deny file-write*)",
+    ]
+    rules.extend(
+        f"(allow file-write* (subpath {_sandbox_profile_string(path)}))"
+        for path in writable_subpaths
+    )
+    rules.extend(
+        f"(allow file-write-data (literal {_sandbox_profile_string(path)}))"
+        for path in writable_devices
+    )
+    return "\n".join(rules) + "\n"
+
+
+def _contain_claude_write_command(
+    command: list[str], role: dict, execution_root: Path, run_dir: Path, home: Path
+) -> tuple[list[str], dict[str, object]]:
+    """Wrap a writable Claude executor in sandbox-exec when it is available."""
+    disabled = {"enabled": False, "profile": None}
+    if role["harness"] != "claude" or not role["write"]:
+        return command, disabled | {"reason": "not_writable_claude"}
+    if sys.platform != "darwin":
+        return command, disabled | {"reason": "platform_not_darwin"}
+    sandbox_exec = shutil.which("sandbox-exec")
+    if not sandbox_exec:
+        return command, disabled | {"reason": "sandbox_exec_unavailable"}
+    profile_path = run_dir / "sandbox-exec.sb"
+    atomic_write(profile_path, _claude_sandbox_profile(execution_root, home))
+    return (
+        [sandbox_exec, "-f", str(profile_path), *command],
+        {"enabled": True, "profile": str(profile_path), "tool": sandbox_exec},
+    )
+
+
 def _command(
     executor: Path,
     role_name: str,
@@ -421,8 +484,16 @@ def delegate(
     else:
         environment.pop("CROSS_HARNESS_WRITE", None)
     command = _command(executor, role_name, role, execution_root, run_dir, paths.claude / "agents")
+    command, sandbox_exec = _contain_claude_write_command(
+        command, role, execution_root, run_dir, paths.home
+    )
     _write_execution_record(run_dir, role_name, role, kind, execution_root)
-    atomic_write(run_dir / "command.json", dump_json({"argv": command, "auth_cached": cached, "cwd": str(execution_root)}))
+    atomic_write(run_dir / "command.json", dump_json({
+        "argv": command,
+        "auth_cached": cached,
+        "cwd": str(execution_root),
+        "sandbox_exec": sandbox_exec,
+    }))
     exit_code = _invoke_safe(command, task, environment, execution_root, run_dir, role["timeout_seconds"])
     if role["harness"] == "claude":
         _write_claude_final_from_events(run_dir)
@@ -875,8 +946,16 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
     command = _command(
         executor, role_name, role, Path(state["cwd"]), retry_root, paths.claude / "agents", state["thread_id"]
     )
+    command, sandbox_exec = _contain_claude_write_command(
+        command, role, Path(state["cwd"]), retry_root, paths.home
+    )
     _write_execution_record(retry_root, state["role"], role, state["kind"], Path(state["cwd"]))
-    atomic_write(retry_root / "command.json", dump_json({"argv": command, "auth_cached": cached, "resume": state["thread_id"]}))
+    atomic_write(retry_root / "command.json", dump_json({
+        "argv": command,
+        "auth_cached": cached,
+        "resume": state["thread_id"],
+        "sandbox_exec": sandbox_exec,
+    }))
     exit_code = _invoke_safe(command, task_file.read_text(encoding="utf-8"), environment, Path(state["cwd"]), retry_root, role["timeout_seconds"])
     if role["harness"] == "claude":
         _write_claude_final_from_events(retry_root)
@@ -900,8 +979,16 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
             paths.claude / "agents",
             summary.get("thread_id") or state["thread_id"],
         )
+        command, sandbox_exec = _contain_claude_write_command(
+            command, escalation, Path(state["cwd"]), escalation_root, paths.home
+        )
         _write_execution_record(escalation_root, state["role"], escalation, state["kind"], Path(state["cwd"]))
-        atomic_write(escalation_root / "command.json", dump_json({"argv": command, "escalation": True, "previous_run": str(retry_root)}))
+        atomic_write(escalation_root / "command.json", dump_json({
+            "argv": command,
+            "escalation": True,
+            "previous_run": str(retry_root),
+            "sandbox_exec": sandbox_exec,
+        }))
         code = _invoke_safe(command, task_file.read_text(encoding="utf-8"), environment | {"CROSS_HARNESS_RUN_DIR": str(escalation_root)}, Path(state["cwd"]), escalation_root, escalation["timeout_seconds"])
         if escalation["harness"] == "claude":
             _write_claude_final_from_events(escalation_root)

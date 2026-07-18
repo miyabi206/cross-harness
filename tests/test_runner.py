@@ -10,7 +10,7 @@ import unittest
 
 from cross_harness.errors import AuthError, DirtyWorktreeError, HarnessError, SupervisorDiedError
 from cross_harness.config import default_config
-from cross_harness.runner import _claude_command, _codex_command, _escalated_role, _invoke_safe, _write_baseline, _write_claude_final_from_events, delegate, retry, start_detached_delegate, wait_for_run
+from cross_harness.runner import _claude_command, _claude_sandbox_profile, _codex_command, _contain_claude_write_command, _escalated_role, _invoke_safe, _write_baseline, _write_claude_final_from_events, delegate, retry, start_detached_delegate, wait_for_run
 from cross_harness.runner import finalize_run
 
 
@@ -467,6 +467,112 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("1", environment["CROSS_HARNESS_WRITE"])
         self.assertTrue(json.loads((run / "execution.json").read_text())["write"])
         claude_ownership.assert_called_once_with(self.home.resolve(), self.repo.resolve())
+
+    @patch("cross_harness.runner.shutil.which", return_value="/usr/bin/sandbox-exec")
+    @patch("cross_harness.runner.sys.platform", "darwin")
+    @patch("cross_harness.runner.verify_claude_config_ownership")
+    @patch("cross_harness.runner.verify_claude_subscription")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_darwin_claude_write_role_is_contained_and_audited(
+        self, invoke, verify_claude, claude_ownership, which
+    ):
+        config = self.root / "claude-darwin-implementer.toml"
+        contents = (Path(__file__).resolve().parents[1] / "config/default.toml").read_text()
+        config.write_text(contents.replace(
+            '[roles.implementer]\nharness = "codex"',
+            '[roles.implementer]\nharness = "claude"',
+            1,
+        ))
+        verify_claude.return_value = (Path("/usr/local/bin/claude"), False)
+
+        def complete(command, task, env, cwd, run_dir, timeout):
+            self.assertEqual(["/usr/bin/sandbox-exec", "-f"], command[:2])
+            self.assertEqual(str(run_dir / "sandbox-exec.sb"), command[2])
+            self.assertEqual("/usr/local/bin/claude", command[3])
+            (run_dir / "events.jsonl").write_text('{"type":"result","is_error":false,"usage":{}}\n')
+            (run_dir / "stderr.log").write_text("")
+            (run_dir / "final.json").write_text(json.dumps({
+                "status": "success", "work_completed": "implemented", "changed_files": [],
+                "tests": [], "error": None, "next_decision": None,
+            }))
+            return 0
+
+        invoke.side_effect = complete
+        summary = delegate("implementer", "implementation", self.task, self.repo, config_path=config, home=self.home)
+        run = Path(summary["run_dir"])
+        profile = (run / "sandbox-exec.sb").read_text()
+        record = json.loads((run / "command.json").read_text())
+        self.assertIn("(deny file-write*)", profile)
+        self.assertIn(f'(allow file-write* (subpath "{self.repo.resolve()}"))', profile)
+        self.assertIn(f'(allow file-write* (subpath "{(self.home / ".claude").resolve()}"))', profile)
+        self.assertIn('(allow file-write-data (literal "/dev/null"))', profile)
+        self.assertTrue(record["sandbox_exec"]["enabled"])
+        self.assertEqual(str(run / "sandbox-exec.sb"), record["sandbox_exec"]["profile"])
+        which.assert_called_once_with("sandbox-exec")
+
+    @patch("cross_harness.runner.sys.platform", "linux")
+    @patch("cross_harness.runner.verify_claude_config_ownership")
+    @patch("cross_harness.runner.verify_claude_subscription")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_non_darwin_claude_write_role_records_disabled_containment(
+        self, invoke, verify_claude, claude_ownership
+    ):
+        config = self.root / "claude-linux-implementer.toml"
+        contents = (Path(__file__).resolve().parents[1] / "config/default.toml").read_text()
+        config.write_text(contents.replace(
+            '[roles.implementer]\nharness = "codex"',
+            '[roles.implementer]\nharness = "claude"',
+            1,
+        ))
+        verify_claude.return_value = (Path("/usr/local/bin/claude"), False)
+
+        def complete(command, task, env, cwd, run_dir, timeout):
+            self.assertEqual("/usr/local/bin/claude", command[0])
+            (run_dir / "events.jsonl").write_text('{"type":"result","is_error":false,"usage":{}}\n')
+            (run_dir / "stderr.log").write_text("")
+            (run_dir / "final.json").write_text(json.dumps({
+                "status": "success", "work_completed": "implemented", "changed_files": [],
+                "tests": [], "error": None, "next_decision": None,
+            }))
+            return 0
+
+        invoke.side_effect = complete
+        summary = delegate("implementer", "implementation", self.task, self.repo, config_path=config, home=self.home)
+        run = Path(summary["run_dir"])
+        record = json.loads((run / "command.json").read_text())
+        self.assertFalse(record["sandbox_exec"]["enabled"])
+        self.assertEqual("platform_not_darwin", record["sandbox_exec"]["reason"])
+        self.assertFalse((run / "sandbox-exec.sb").exists())
+
+    @patch("cross_harness.runner.shutil.which", return_value=None)
+    @patch("cross_harness.runner.sys.platform", "darwin")
+    def test_missing_sandbox_exec_does_not_claim_containment(self, which):
+        run = self.root / "sandbox-unavailable-run"
+        run.mkdir()
+        command, record = _contain_claude_write_command(
+            ["/usr/local/bin/claude", "-p"],
+            {"harness": "claude", "write": True},
+            self.repo,
+            run,
+            self.home,
+        )
+
+        self.assertEqual(["/usr/local/bin/claude", "-p"], command)
+        self.assertFalse(record["enabled"])
+        self.assertEqual("sandbox_exec_unavailable", record["reason"])
+        self.assertIsNone(record["profile"])
+        self.assertFalse((run / "sandbox-exec.sb").exists())
+        which.assert_called_once_with("sandbox-exec")
+
+    def test_sandbox_profile_escapes_quote_and_backslash_in_paths(self):
+        execution_root = self.root / 'root "quoted" \\ slash'
+        home = self.root / 'home "quoted" \\ slash'
+
+        profile = _claude_sandbox_profile(execution_root, home)
+
+        escaped = str(execution_root.resolve()).replace('\\', '\\\\').replace('"', '\\"')
+        self.assertIn('subpath "' + escaped + '"', profile)
+        self.assertNotIn('subpath "' + str(execution_root) + '") (allow', profile)
 
     def test_retry_budget_exhaustion_stops_before_auth_or_executor(self):
         previous = self.root / "retry-exhausted"
