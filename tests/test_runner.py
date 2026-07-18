@@ -201,14 +201,18 @@ class RunnerTests(unittest.TestCase):
 
     def test_claude_command_uses_headless_streaming_and_minimal_permissions(self):
         run = self.root / "claude-run"
+        agents = self.home / ".claude/agents"
+        agents.mkdir(parents=True)
+        (agents / "cross-harness-reviewer.md").write_text("---\nname: cross-harness-reviewer\n---\n")
         read_only = {
             "harness": "claude", "model": "sonnet", "effort": "high", "write": False,
         }
-        command = _claude_command(Path("/usr/local/bin/claude"), read_only, self.repo, run)
+        command = _claude_command(Path("/usr/local/bin/claude"), "reviewer", read_only, self.repo, run, agents)
         self.assertEqual("-p", command[1])
         self.assertEqual("stream-json", command[command.index("--output-format") + 1])
         self.assertIn("--verbose", command)
         self.assertEqual("manual", command[command.index("--permission-mode") + 1])
+        self.assertEqual("cross-harness-reviewer", command[command.index("--agent") + 1])
         self.assertEqual("Bash,Read,Grep,Glob", command[command.index("--allowedTools") + 1])
         disallowed_index = command.index("--disallowed-tools")
         self.assertEqual(["Edit", "Write", "NotebookEdit"], command[disallowed_index + 1:disallowed_index + 4])
@@ -216,15 +220,19 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("-C", command)
         self.assertNotIn("bypassPermissions", command)
         instruction = command[command.index("--append-system-prompt") + 1]
+        self.assertIn("Cross-harness executor", instruction)
+        self.assertIn("Do not follow the orchestrator charter", instruction)
+        self.assertIn("exactly these six fields", instruction)
         self.assertIn("only a JSON object", instruction)
         self.assertIn("Do not write the result to a file", instruction)
         self.assertNotIn(str(run / "final.json"), instruction)
 
-        resumed = _claude_command(Path("/usr/local/bin/claude"), read_only, self.repo, run, "session-1")
+        resumed = _claude_command(Path("/usr/local/bin/claude"), "reviewer", read_only, self.repo, run, agents, "session-1")
         self.assertEqual("session-1", resumed[resumed.index("--resume") + 1])
 
         writable = dict(read_only, write=True)
-        write_command = _claude_command(Path("/usr/local/bin/claude"), writable, self.repo, run)
+        write_command = _claude_command(Path("/usr/local/bin/claude"), "implementer", writable, self.repo, run, agents)
+        self.assertNotIn("--agent", write_command)
         self.assertEqual("manual", write_command[write_command.index("--permission-mode") + 1])
         allowed = write_command[write_command.index("--allowedTools") + 1]
         self.assertEqual(
@@ -234,6 +242,29 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("--disallowed-tools", write_command)
         self.assertNotIn("--settings", write_command)
         self.assertNotIn(str((self.root / "outside").resolve()), allowed)
+
+        (agents / "cross-harness-security_reviewer.md").write_text(
+            "---\nname: cross-harness-security_reviewer\n---\n"
+        )
+        security_command = _claude_command(
+            Path("/usr/local/bin/claude"), "security_reviewer", read_only, self.repo, run, agents
+        )
+        self.assertEqual(
+            "cross-harness-security_reviewer", security_command[security_command.index("--agent") + 1]
+        )
+
+    def test_claude_command_without_installed_agent_uses_executor_charter(self):
+        run = self.root / "claude-uninstalled-agent-run"
+        agents = self.home / ".claude/agents"
+        role = {"harness": "claude", "model": "sonnet", "effort": "high", "write": False}
+
+        command = _claude_command(Path("/usr/local/bin/claude"), "reviewer", role, self.repo, run, agents)
+
+        self.assertNotIn("--agent", command)
+        instruction = command[command.index("--append-system-prompt") + 1]
+        self.assertIn("Cross-harness executor", instruction)
+        self.assertIn("Do not ask the user questions", instruction)
+        self.assertIn("exactly these six fields", instruction)
 
     def test_codex_resume_reapplies_initial_sandbox_and_execution_directory(self):
         run = self.root / "codex-resume"
@@ -253,6 +284,7 @@ class RunnerTests(unittest.TestCase):
         def complete(command, task, env, cwd, run_dir, timeout):
             self.assertEqual("claude", env["CROSS_HARNESS_EXECUTOR"])
             self.assertEqual("manual", command[command.index("--permission-mode") + 1])
+            self.assertNotIn("--agent", command)
             (run_dir / "events.jsonl").write_text(
                 '{"type":"result","session_id":"session-1","is_error":false,"usage":{"input_tokens":10,"output_tokens":2},"result":"{\\"status\\": \\"success\\", \\"work_completed\\": \\"reviewed\\", \\"changed_files\\": [\\"README.md\\"], \\"tests\\": [\\"review\\"], \\"error\\": null, \\"next_decision\\": \\"ship it\\"}"}\n'
             )
@@ -323,6 +355,7 @@ class RunnerTests(unittest.TestCase):
         def complete(command, task, env, cwd, run_dir, timeout):
             self.assertEqual("claude", env["CROSS_HARNESS_EXECUTOR"])
             self.assertEqual("manual", command[command.index("--permission-mode") + 1])
+            self.assertNotIn("--agent", command)
             self.assertIn(f"Edit(//{cwd.resolve().as_posix().lstrip('/')}/**)", command[command.index("--allowedTools") + 1])
             self.assertIn(f"Write(//{cwd.resolve().as_posix().lstrip('/')}/**)", command[command.index("--allowedTools") + 1])
             (run_dir / "events.jsonl").write_text('{"type":"result","is_error":false,"usage":{}}\n')

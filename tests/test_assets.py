@@ -2,6 +2,7 @@ from pathlib import Path
 import re
 import unittest
 
+from cross_harness.installer import CLAUDE_AGENT_ROLES
 from cross_harness.paths import source_root
 
 
@@ -17,6 +18,34 @@ class AssetTests(unittest.TestCase):
         self.assertIn("model: sonnet", reviewer)
         self.assertIn("effort: high", reviewer)
         self.assertIn("Do not edit files or delegate", " ".join(reviewer.split()))
+
+    def test_claude_executor_agents_use_executor_charter_and_permissions(self):
+        assets = source_root() / "assets/claude/agents"
+        expected = {
+            "implementer.md": ("sonnet", "high", "Read, Glob, Grep, Bash, Edit, Write"),
+            "tester.md": ("haiku", "medium", "Read, Glob, Grep, Bash"),
+            "debugger.md": ("sonnet", "high", "Read, Glob, Grep, Bash, Edit, Write"),
+            "security_reviewer.md": ("fable", "xhigh", "Read, Glob, Grep, Bash"),
+        }
+        for name, (model, effort, tools) in expected.items():
+            content = (assets / name).read_text()
+            self.assertIn(f"model: {model}", content)
+            self.assertIn(f"effort: {effort}", content)
+            self.assertIn(f"tools: {tools}", content)
+            self.assertIn("Cross-harness executor", content)
+            self.assertIn("Do not ask the user questions", content)
+            self.assertIn("Do not follow the orchestrator charter", content)
+            self.assertIn("exactly these six fields", content)
+            self.assertNotIn("gpt-", content)
+            installed_name = f"cross-harness-{Path(name).stem}"
+            self.assertIn(f"name: {installed_name}", content)
+            self.assertIn(f"{installed_name}.md", CLAUDE_AGENT_ROLES)
+
+    def test_claude_agent_assets_never_use_codex_model_identifiers(self):
+        assets = source_root() / "assets/claude/agents"
+        for definition in assets.glob("*.md"):
+            with self.subTest(definition=definition.name):
+                self.assertNotRegex(definition.read_text(), r"(?m)^model: gpt-")
 
     def test_codex_role_assets_cover_all_executor_roles(self):
         expected = {

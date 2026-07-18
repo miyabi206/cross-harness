@@ -31,6 +31,18 @@ from .taskfile import contains_secret
 RATE_LIMIT = re.compile(r"rate.?limit|usage.?limit|quota|too many requests", re.IGNORECASE)
 AUTH_FAILURE = re.compile(r"unauthorized|authentication|not logged in|login required", re.IGNORECASE)
 CLAUDE_INSPECTION_TOOLS = "Bash,Read,Grep,Glob"
+CLAUDE_EXECUTOR_CHARTER = """# Cross-harness executor
+
+You are the bounded execution worker for a task file supplied by Claude.
+Do not follow the orchestrator charter from CLAUDE.md: this is an execution-role
+charter. Make the smallest change that satisfies its completion conditions.
+Do not ask the user questions, broaden scope, delegate to another agent, or launch Codex.
+If a blocking unknown prevents safe work, return `blocked` with the single decision needed.
+
+Your final response must contain exactly these six fields through the supplied
+JSON schema: status, work_completed, changed_files, tests, error, and
+next_decision. On failure, include exit code, cause, file, line, expected value,
+and actual value whenever those facts exist. Do not narrate intermediate work."""
 _DETACHED_SUPERVISORS: dict[int, subprocess.Popen] = {}
 
 
@@ -248,7 +260,15 @@ def _codex_command(codex: Path, role: dict, cwd: Path, run_dir: Path, resume: st
     ]
 
 
-def _claude_command(claude: Path, role: dict, cwd: Path, run_dir: Path, resume: str | None = None) -> list[str]:
+def _claude_command(
+    claude: Path,
+    role_name: str,
+    role: dict,
+    cwd: Path,
+    run_dir: Path,
+    claude_agents: Path,
+    resume: str | None = None,
+) -> list[str]:
     schema = _delegation_schema()
     allowed_tools = CLAUDE_INSPECTION_TOOLS
     if role["write"]:
@@ -256,6 +276,8 @@ def _claude_command(claude: Path, role: dict, cwd: Path, run_dir: Path, resume: 
         scope = f"//{execution_root.as_posix().lstrip('/')}/**"
         allowed_tools = f"{allowed_tools},Edit({scope}),Write({scope})"
     result_instruction = (
+        CLAUDE_EXECUTOR_CHARTER
+        + "\n\n"
         "When the task is complete, respond with only a JSON object conforming to "
         f"{schema}. Your entire final message must be that JSON object: do not include "
         "explanatory prose or Markdown code fences before or after it. Do not write the "
@@ -265,6 +287,11 @@ def _claude_command(claude: Path, role: dict, cwd: Path, run_dir: Path, resume: 
     command = [
         str(claude), "-p",
         *(["--resume", resume] if resume else []),
+        *(
+            ["--agent", f"cross-harness-{role_name}"]
+            if (claude_agents / f"cross-harness-{role_name}.md").is_file()
+            else []
+        ),
         "--model", role["model"],
         "--effort", role["effort"],
         "--output-format", "stream-json",
@@ -277,11 +304,19 @@ def _claude_command(claude: Path, role: dict, cwd: Path, run_dir: Path, resume: 
     return command
 
 
-def _command(executor: Path, role: dict, cwd: Path, run_dir: Path, resume: str | None = None) -> list[str]:
+def _command(
+    executor: Path,
+    role_name: str,
+    role: dict,
+    cwd: Path,
+    run_dir: Path,
+    claude_agents: Path,
+    resume: str | None = None,
+) -> list[str]:
     if role["harness"] == "codex":
         return _codex_command(executor, role, cwd, run_dir, resume)
     if role["harness"] == "claude":
-        return _claude_command(executor, role, cwd, run_dir, resume)
+        return _claude_command(executor, role_name, role, cwd, run_dir, claude_agents, resume)
     raise ConfigError(f"unsupported harness: {role['harness']}")
 
 
@@ -385,7 +420,7 @@ def delegate(
         environment["CROSS_HARNESS_WRITE"] = "1"
     else:
         environment.pop("CROSS_HARNESS_WRITE", None)
-    command = _command(executor, role, execution_root, run_dir)
+    command = _command(executor, role_name, role, execution_root, run_dir, paths.claude / "agents")
     _write_execution_record(run_dir, role_name, role, kind, execution_root)
     atomic_write(run_dir / "command.json", dump_json({"argv": command, "auth_cached": cached, "cwd": str(execution_root)}))
     exit_code = _invoke_safe(command, task, environment, execution_root, run_dir, role["timeout_seconds"])
@@ -769,7 +804,8 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
     if not state_path.exists():
         raise HarnessError(f"run state not found: {state_path}")
     state = json.loads(state_path.read_text(encoding="utf-8"))
-    role = dict(config["roles"][state["role"]])
+    role_name = state["role"]
+    role = dict(config["roles"][role_name])
     if state["status"] == "blocked":
         raise HarnessError("blocked runs cannot be retried automatically")
     if state["attempts"] > role["retries"]:
@@ -811,7 +847,9 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         environment["CROSS_HARNESS_WRITE"] = "1"
     else:
         environment.pop("CROSS_HARNESS_WRITE", None)
-    command = _command(executor, role, Path(state["cwd"]), retry_root, state["thread_id"])
+    command = _command(
+        executor, role_name, role, Path(state["cwd"]), retry_root, paths.claude / "agents", state["thread_id"]
+    )
     _write_execution_record(retry_root, state["role"], role, state["kind"], Path(state["cwd"]))
     atomic_write(retry_root / "command.json", dump_json({"argv": command, "auth_cached": cached, "resume": state["thread_id"]}))
     exit_code = _invoke_safe(command, task_file.read_text(encoding="utf-8"), environment, Path(state["cwd"]), retry_root, role["timeout_seconds"])
@@ -828,7 +866,15 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         escalation_root = _new_run_dir(Path(config["runtime_root"]))
         shutil.copy2(task_file, escalation_root / "task.md")
         _write_baseline(escalation_root, Path(state["cwd"]))
-        command = _command(executor, escalation, Path(state["cwd"]), escalation_root, summary.get("thread_id") or state["thread_id"])
+        command = _command(
+            executor,
+            role_name,
+            escalation,
+            Path(state["cwd"]),
+            escalation_root,
+            paths.claude / "agents",
+            summary.get("thread_id") or state["thread_id"],
+        )
         _write_execution_record(escalation_root, state["role"], escalation, state["kind"], Path(state["cwd"]))
         atomic_write(escalation_root / "command.json", dump_json({"argv": command, "escalation": True, "previous_run": str(retry_root)}))
         code = _invoke_safe(command, task_file.read_text(encoding="utf-8"), environment | {"CROSS_HARNESS_RUN_DIR": str(escalation_root)}, Path(state["cwd"]), escalation_root, escalation["timeout_seconds"])

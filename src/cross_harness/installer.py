@@ -84,7 +84,11 @@ def _materialize_templates(path: Path, executable: Path) -> None:
 
 CLAUDE_AGENT_ROLES = {
     "cross-harness-explorer.md": "explorer",
+    "cross-harness-implementer.md": "implementer",
+    "cross-harness-tester.md": "tester",
     "cross-harness-reviewer.md": "reviewer",
+    "cross-harness-debugger.md": "debugger",
+    "cross-harness-security_reviewer.md": "security_reviewer",
 }
 
 
@@ -309,7 +313,11 @@ def install(home: Path | None = None, repo: Path | None = None, dry_run: bool = 
     copies = (
         (repo / "assets/claude/skills/cross-harness-orchestrator", paths.claude / "skills/cross-harness-orchestrator"),
         (repo / "assets/claude/agents/explorer.md", paths.claude / "agents/cross-harness-explorer.md"),
+        (repo / "assets/claude/agents/implementer.md", paths.claude / "agents/cross-harness-implementer.md"),
+        (repo / "assets/claude/agents/tester.md", paths.claude / "agents/cross-harness-tester.md"),
         (repo / "assets/claude/agents/reviewer.md", paths.claude / "agents/cross-harness-reviewer.md"),
+        (repo / "assets/claude/agents/debugger.md", paths.claude / "agents/cross-harness-debugger.md"),
+        (repo / "assets/claude/agents/security_reviewer.md", paths.claude / "agents/cross-harness-security_reviewer.md"),
     )
     for source, destination in copies:
         record = _record(destination, paths, backup_root)

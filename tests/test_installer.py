@@ -46,6 +46,8 @@ class InstallerTests(unittest.TestCase):
             self.assertIn("effort: low", explorer)
             self.assertIn("model: sonnet", reviewer)
             self.assertIn("effort: high", reviewer)
+            for agent in ("implementer", "tester", "debugger", "security_reviewer"):
+                self.assertTrue((home / f".claude/agents/cross-harness-{agent}.md").is_file())
 
             uninstall(home)
             for path, content in originals.items():
@@ -69,16 +71,44 @@ class InstallerTests(unittest.TestCase):
                 'model = "custom-reviewer"\neffort = "high"',
                 'model = "custom-reviewer"\neffort = "review-effort"',
             )
+            contents = contents.replace(
+                '[roles.implementer]\nharness = "codex"\nmodel = "gpt-5.6-terra"\neffort = "high"',
+                '[roles.implementer]\nharness = "claude"\nmodel = "custom-implementer"\neffort = "implement-effort"',
+            )
+            contents = contents.replace(
+                '[roles.tester]\nharness = "codex"\nmodel = "gpt-5.6-luna"\neffort = "medium"',
+                '[roles.tester]\nharness = "claude"\nmodel = "custom-tester"\neffort = "test-effort"',
+            )
+            contents = contents.replace(
+                '[roles.debugger]\nharness = "codex"\nmodel = "gpt-5.6-sol"\neffort = "high"',
+                '[roles.debugger]\nharness = "claude"\nmodel = "custom-debugger"\neffort = "debug-effort"',
+            )
+            contents = contents.replace(
+                '[roles.security_reviewer]\nharness = "codex"\nmodel = "gpt-5.6-sol"\neffort = "xhigh"',
+                '[roles.security_reviewer]\nharness = "claude"\nmodel = "custom-security"\neffort = "security-effort"',
+            )
             config.write_text(contents, encoding="utf-8")
 
             install(home, repo)
 
             explorer = (home / ".claude/agents/cross-harness-explorer.md").read_text()
             reviewer = (home / ".claude/agents/cross-harness-reviewer.md").read_text()
+            implementer = (home / ".claude/agents/cross-harness-implementer.md").read_text()
+            tester = (home / ".claude/agents/cross-harness-tester.md").read_text()
+            debugger = (home / ".claude/agents/cross-harness-debugger.md").read_text()
+            security_reviewer = (home / ".claude/agents/cross-harness-security_reviewer.md").read_text()
             self.assertIn('model: "custom explorer"', explorer)
             self.assertIn("effort: future-effort", explorer)
             self.assertIn("model: custom-reviewer", reviewer)
             self.assertIn("effort: review-effort", reviewer)
+            self.assertIn("model: custom-implementer", implementer)
+            self.assertIn("effort: implement-effort", implementer)
+            self.assertIn("model: custom-tester", tester)
+            self.assertIn("effort: test-effort", tester)
+            self.assertIn("model: custom-debugger", debugger)
+            self.assertIn("effort: debug-effort", debugger)
+            self.assertIn("model: custom-security", security_reviewer)
+            self.assertIn("effort: security-effort", security_reviewer)
 
     def test_install_does_not_write_codex_role_settings_to_claude_agents(self):
         with tempfile.TemporaryDirectory() as folder:
