@@ -359,12 +359,13 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("Do not ask the user questions", instruction)
         self.assertIn("exactly these six fields", instruction)
 
-    def test_codex_resume_reapplies_initial_sandbox_and_execution_directory(self):
+    def test_codex_resume_reapplies_sandbox_through_config_override(self):
         run = self.root / "codex-resume"
         read_only = {"harness": "codex", "model": "gpt-5.6-luna", "effort": "low", "write": False}
         command = _codex_command(Path("/usr/local/bin/codex"), read_only, self.repo, run, "thread-1")
-        self.assertEqual("read-only", command[command.index("--sandbox") + 1])
-        self.assertEqual(str(self.repo), command[command.index("-C") + 1])
+        self.assertNotIn("--sandbox", command)
+        self.assertNotIn("-C", command)
+        self.assertIn('sandbox_mode="read-only"', command)
 
     @patch("cross_harness.runner.verify_codex_chatgpt")
     @patch("cross_harness.runner.verify_codex_config_ownership")
@@ -631,7 +632,7 @@ class RunnerTests(unittest.TestCase):
     def test_escalation_uses_claude_fallback_and_effort_order(self):
         role = {"harness": "claude", "model": "sonnet", "effort": "xhigh"}
         escalated = _escalated_role(role, default_config())
-        self.assertEqual("fable", escalated["model"])
+        self.assertEqual("opus", escalated["model"])
         self.assertEqual("max", escalated["effort"])
 
     def test_rate_limit_event_fails_closed(self):

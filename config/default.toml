@@ -18,7 +18,7 @@ delegate_kinds = ["exploration", "implementation", "test", "debug", "review", "s
 #          be used the day it ships -- and a typo is only caught at run time.
 #          Known values at the time of writing:
 #            codex   gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna
-#            claude  fable, sonnet, haiku, opus
+#            claude  fable, opus, sonnet, haiku
 #          The [fallback] chains below are used for escalation on retry, so a
 #          model listed there can be escalated one step up.
 #
@@ -36,7 +36,7 @@ delegate_kinds = ["exploration", "implementation", "test", "debug", "review", "s
 
 [fallback]
 codex = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
-claude = ["fable", "sonnet", "haiku"]
+claude = ["fable", "opus", "sonnet", "haiku"]
 
 [roles.orchestrator]
 harness = "claude"

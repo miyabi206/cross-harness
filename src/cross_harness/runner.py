@@ -239,8 +239,9 @@ def _codex_command(codex: Path, role: dict, cwd: Path, run_dir: Path, resume: st
     if resume:
         return [
             *base, "resume", resume,
-            "--json", "--sandbox", sandbox, "-C", str(cwd),
+            "--json",
             "-m", role["model"],
+            "-c", f'sandbox_mode="{sandbox}"',
             "-c", f'model_reasoning_effort="{role["effort"]}"',
             "-c", 'model_provider="openai"',
             "-c", 'forced_login_method="chatgpt"',
