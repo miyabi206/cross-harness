@@ -695,8 +695,13 @@ def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path
         status = "failed"
     if event_failed and status == "success":
         status = "failed"
+    read_only_command_failed = role.get("write") is False and bool(parsed.get("commands"))
+    command_error = ""
+    if read_only_command_failed and status == "success":
+        status = "failed"
+        command_error = "read-only inspection command failed"
     executor_error = str(final.get("error") or "\n".join(parsed.get("errors", [])[-3:]) or stderr[-2000:] or "")
-    combined_error = "\n".join(error for error in (status_error, executor_error) if error)
+    combined_error = "\n".join(error for error in (status_error, command_error, executor_error) if error)
     blocked_category = parsed.get("blocked_category")
     if blocked_category == "rate_limit":
         status = "blocked"
@@ -728,6 +733,11 @@ def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path
     filtered_reported = [name for name in reported_changed if name not in baseline_names or name in detected_changed]
     changed = list(dict.fromkeys([*detected_changed, *filtered_reported]))
     signature = failure_signature(exit_code, parsed, stderr)
+    reported_tests = final.get("tests", [])
+    if isinstance(reported_tests, str):
+        reported_tests = [reported_tests]
+    elif not isinstance(reported_tests, list):
+        reported_tests = []
     summary = {
         "status": status,
         "run_dir": str(run_dir),
@@ -740,7 +750,7 @@ def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path
         "thread_id": parsed.get("thread_id"),
         "changed_files": changed,
         "diff_summary": diff_summary,
-        "tests": final.get("tests", []) if isinstance(final.get("tests"), list) else [],
+        "tests": reported_tests,
         "work_completed": str(final.get("work_completed", "")),
         "error": combined_error[:4000] or None,
         "next_decision": final.get("next_decision"),

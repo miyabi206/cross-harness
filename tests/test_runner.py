@@ -207,6 +207,57 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("read-only role modified the worktree", summary["error"])
         self.assertEqual(["README.md"], summary["changed_files"])
 
+    def test_read_only_failed_command_overrides_reported_success_and_preserves_string_test(self):
+        run = self.root / "read-only-command-failure-run"
+        run.mkdir()
+        (run / "events.jsonl").write_text(json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "uv run pytest -q",
+                "status": "failed",
+                "exit_code": 1,
+                "aggregated_output": "14 failed, 100 passed",
+            },
+        }) + "\n")
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "inspected", "changed_files": [],
+            "tests": "14 failed, 100 passed", "error": None, "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-luna", "effort": "low", "output_limit_chars": 8000, "write": False}
+
+        summary = finalize_run(run, "tester", role, "test", self.repo, 0, 1)
+
+        self.assertEqual("failed", summary["status"])
+        self.assertIn("read-only inspection command failed", summary["error"])
+        self.assertEqual(["14 failed, 100 passed"], summary["tests"])
+        self.assertIn("tests: 14 failed, 100 passed", (run / "summary.txt").read_text())
+
+    def test_write_role_failed_command_does_not_override_reported_success(self):
+        run = self.root / "write-command-failure-run"
+        run.mkdir()
+        (run / "events.jsonl").write_text(json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "uv run pytest -q",
+                "status": "failed",
+                "exit_code": 1,
+                "aggregated_output": "failure before fix",
+            },
+        }) + "\n")
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "implemented", "changed_files": [],
+            "tests": ["uv run pytest -q: passed after fix"], "error": None, "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-terra", "effort": "medium", "output_limit_chars": 8000, "write": True}
+
+        summary = finalize_run(run, "implementer", role, "implementation", self.repo, 0, 1)
+
+        self.assertEqual("success", summary["status"])
+
     def test_task_file_with_credential_material_is_rejected(self):
         self.task.write_text("OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz123456\n")
         with self.assertRaises(HarnessError):
