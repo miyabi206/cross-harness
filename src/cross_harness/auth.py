@@ -185,3 +185,90 @@ def verify_codex_config_ownership(home: Path, repo_root: Path, cwd: Path) -> Non
             raise AuthError(f"non-OpenAI model_provider in {path}")
         if data.get("openai_base_url"):
             raise AuthError(f"OpenAI base URL override is not allowed in {path}")
+
+
+_CLAUDE_ROUTER_ENV = {
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+    "ANTHROPIC_FOUNDRY_RESOURCE",
+    "ANTHROPIC_FOUNDRY_MODEL",
+}
+_CLAUDE_BILLING_ENV = {"ANTHROPIC_API_KEY"}
+_CLAUDE_PROVIDER_ENV = {
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_DEFAULT_REGION",
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "ANTHROPIC_VERTEX_REGION",
+    "CLOUD_ML_REGION",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_PROJECT",
+    "VERTEX_REGION",
+}
+_CLAUDE_EXTERNAL_PROVIDERS = {"bedrock", "vertex", "foundry"}
+
+
+def _claude_setting_problem(data: object) -> str | None:
+    """Inspect provider declarations while deliberately ignoring credential values."""
+    if not isinstance(data, dict):
+        return None
+
+    helper = data.get("apiKeyHelper")
+    if isinstance(helper, str) and "ANTHROPIC_API_KEY" in helper:
+        return "apiKeyHelper supplies ANTHROPIC_API_KEY"
+
+    environment = data.get("env")
+    if isinstance(environment, dict):
+        for name in environment:
+            if not isinstance(name, str):
+                continue
+            if name.upper() in _CLAUDE_BILLING_ENV:
+                return f"API billing setting {name}"
+            if name.upper() in _CLAUDE_ROUTER_ENV:
+                return f"external router setting {name}"
+            if name.upper() in _CLAUDE_PROVIDER_ENV:
+                return f"non-subscription provider setting {name}"
+
+    for name, value in data.items():
+        if isinstance(name, str) and name.lower().replace("_", "") in {
+            "provider", "modelprovider", "authprovider", "anthropicprovider",
+        }:
+            if isinstance(value, str) and value.lower() in _CLAUDE_EXTERNAL_PROVIDERS:
+                return f"non-subscription provider {value}"
+        if isinstance(value, dict):
+            problem = _claude_setting_problem(value)
+            if problem:
+                return problem
+    return None
+
+
+def verify_claude_config_ownership(home: Path, repo_root: Path) -> None:
+    """Reject Claude API billing and provider-routing declarations in settings files.
+
+    Only provider-related setting names and declarative provider/helper selections are
+    considered.  Credential values are neither inspected nor included in errors.
+    """
+    candidates = [
+        home / ".claude/settings.json",
+        repo_root / ".claude/settings.json",
+        repo_root / ".claude/settings.local.json",
+    ]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            with path.open(encoding="utf-8") as handle:
+                data = json.load(handle)
+        except json.JSONDecodeError as exc:
+            raise AuthError(f"invalid Claude settings at {path}: {exc}") from exc
+        problem = _claude_setting_problem(data)
+        if problem:
+            raise AuthError(f"Claude subscription ownership violation in {path}: {problem}")

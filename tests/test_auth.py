@@ -1,5 +1,6 @@
 from pathlib import Path
 from unittest.mock import patch
+import json
 import subprocess
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ import unittest
 from cross_harness.auth import (
     detected_api_keys,
     sanitized_environment,
+    verify_claude_config_ownership,
     verify_claude_subscription,
     verify_codex_config_ownership,
 )
@@ -34,6 +36,36 @@ class AuthTests(unittest.TestCase):
             (repo / ".codex/config.toml").write_text('model_provider = "proxy"\n')
             with self.assertRaises(AuthError):
                 verify_codex_config_ownership(home, repo, repo)
+
+    def test_claude_config_rejects_api_billing_helper_without_exposing_command(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            (home / ".claude").mkdir(parents=True)
+            repo.mkdir()
+            (home / ".claude/settings.json").write_text(
+                '{"apiKeyHelper":"secret-command ANTHROPIC_API_KEY"}\n'
+            )
+            with self.assertRaisesRegex(AuthError, "apiKeyHelper supplies ANTHROPIC_API_KEY") as error:
+                verify_claude_config_ownership(home, repo)
+            self.assertNotIn("secret-command", str(error.exception))
+
+    def test_claude_config_rejects_router_and_provider_settings_in_all_scopes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            (repo / ".claude").mkdir(parents=True)
+            for filename, setting in (
+                ("settings.json", "ANTHROPIC_BASE_URL"),
+                ("settings.local.json", "CLAUDE_CODE_USE_BEDROCK"),
+            ):
+                (repo / ".claude" / filename).write_text(json.dumps({"env": {setting: "redacted"}}))
+                with self.assertRaises(AuthError):
+                    verify_claude_config_ownership(home, repo)
+                (repo / ".claude" / filename).unlink()
 
     @patch("cross_harness.auth.resolve_claude", return_value=Path("/usr/local/bin/claude"))
     @patch("cross_harness.auth.subprocess.run")

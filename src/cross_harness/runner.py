@@ -15,6 +15,7 @@ import uuid
 
 from .auth import (
     sanitized_environment,
+    verify_claude_config_ownership,
     verify_claude_subscription,
     verify_codex_chatgpt,
     verify_codex_config_ownership,
@@ -222,17 +223,19 @@ def _delegation_schema() -> Path:
 def _codex_command(codex: Path, role: dict, cwd: Path, run_dir: Path, resume: str | None = None) -> list[str]:
     schema = _delegation_schema()
     base = [str(codex), "exec"]
+    sandbox = "workspace-write" if role["write"] else "read-only"
     if resume:
         return [
             *base, "resume", resume,
-            "--json", "-m", role["model"],
+            "--json", "--sandbox", sandbox, "-C", str(cwd),
+            "-m", role["model"],
             "-c", f'model_reasoning_effort="{role["effort"]}"',
             "-c", 'model_provider="openai"',
             "-c", 'forced_login_method="chatgpt"',
+            "-c", 'shell_environment_policy.inherit="core"',
             "--output-schema", str(schema),
             "-o", str(run_dir / "final.json"), "-",
         ]
-    sandbox = "workspace-write" if role["write"] else "read-only"
     return [
         *base, "--json", "--sandbox", sandbox, "-C", str(cwd),
         "-m", role["model"],
@@ -245,9 +248,13 @@ def _codex_command(codex: Path, role: dict, cwd: Path, run_dir: Path, resume: st
     ]
 
 
-def _claude_command(claude: Path, role: dict, run_dir: Path, resume: str | None = None) -> list[str]:
+def _claude_command(claude: Path, role: dict, cwd: Path, run_dir: Path, resume: str | None = None) -> list[str]:
     schema = _delegation_schema()
-    permission_mode = "acceptEdits" if role["write"] else "manual"
+    allowed_tools = CLAUDE_INSPECTION_TOOLS
+    if role["write"]:
+        execution_root = cwd.resolve()
+        scope = f"//{execution_root.as_posix().lstrip('/')}/**"
+        allowed_tools = f"{allowed_tools},Edit({scope}),Write({scope})"
     result_instruction = (
         "When the task is complete, respond with only a JSON object conforming to "
         f"{schema}. Your entire final message must be that JSON object: do not include "
@@ -255,25 +262,26 @@ def _claude_command(claude: Path, role: dict, run_dir: Path, resume: str | None 
         "result to a file. "
         "Do not include credentials or authentication material."
     )
-    return [
+    command = [
         str(claude), "-p",
         *(["--resume", resume] if resume else []),
         "--model", role["model"],
         "--effort", role["effort"],
         "--output-format", "stream-json",
         "--verbose",
-        "--permission-mode", permission_mode,
-        "--allowedTools", CLAUDE_INSPECTION_TOOLS,
+        "--permission-mode", "manual",
+        "--allowedTools", allowed_tools,
         *([] if role["write"] else ["--disallowed-tools", "Edit", "Write", "NotebookEdit"]),
         "--append-system-prompt", result_instruction,
     ]
+    return command
 
 
 def _command(executor: Path, role: dict, cwd: Path, run_dir: Path, resume: str | None = None) -> list[str]:
     if role["harness"] == "codex":
         return _codex_command(executor, role, cwd, run_dir, resume)
     if role["harness"] == "claude":
-        return _claude_command(executor, role, run_dir, resume)
+        return _claude_command(executor, role, cwd, run_dir, resume)
     raise ConfigError(f"unsupported harness: {role['harness']}")
 
 
@@ -361,6 +369,7 @@ def delegate(
             verify_codex_config_ownership(paths.home, root, execution_root)
             executor, cached = verify_codex_chatgpt(runtime_root, paths.home, config["auth_cache_hours"])
         elif role["harness"] == "claude":
+            verify_claude_config_ownership(paths.home, root)
             executor, cached = verify_claude_subscription(runtime_root, paths.home, config["auth_cache_hours"])
         else:
             raise ConfigError(f"unsupported harness: {role['harness']}")
@@ -775,6 +784,7 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
             verify_codex_config_ownership(paths.home, _git_root(Path(state["cwd"])), Path(state["cwd"]))
             executor, cached = verify_codex_chatgpt(Path(config["runtime_root"]), paths.home, config["auth_cache_hours"])
         elif role["harness"] == "claude":
+            verify_claude_config_ownership(paths.home, _git_root(Path(state["cwd"])))
             executor, cached = verify_claude_subscription(Path(config["runtime_root"]), paths.home, config["auth_cache_hours"])
         else:
             raise ConfigError(f"unsupported harness: {role['harness']}")

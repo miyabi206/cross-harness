@@ -10,7 +10,7 @@ import unittest
 
 from cross_harness.errors import AuthError, DirtyWorktreeError, HarnessError, SupervisorDiedError
 from cross_harness.config import default_config
-from cross_harness.runner import _claude_command, _escalated_role, _invoke_safe, _write_baseline, _write_claude_final_from_events, delegate, retry, start_detached_delegate, wait_for_run
+from cross_harness.runner import _claude_command, _codex_command, _escalated_role, _invoke_safe, _write_baseline, _write_claude_final_from_events, delegate, retry, start_detached_delegate, wait_for_run
 from cross_harness.runner import finalize_run
 
 
@@ -204,7 +204,7 @@ class RunnerTests(unittest.TestCase):
         read_only = {
             "harness": "claude", "model": "sonnet", "effort": "high", "write": False,
         }
-        command = _claude_command(Path("/usr/local/bin/claude"), read_only, run)
+        command = _claude_command(Path("/usr/local/bin/claude"), read_only, self.repo, run)
         self.assertEqual("-p", command[1])
         self.assertEqual("stream-json", command[command.index("--output-format") + 1])
         self.assertIn("--verbose", command)
@@ -220,20 +220,34 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("Do not write the result to a file", instruction)
         self.assertNotIn(str(run / "final.json"), instruction)
 
-        resumed = _claude_command(Path("/usr/local/bin/claude"), read_only, run, "session-1")
+        resumed = _claude_command(Path("/usr/local/bin/claude"), read_only, self.repo, run, "session-1")
         self.assertEqual("session-1", resumed[resumed.index("--resume") + 1])
 
         writable = dict(read_only, write=True)
-        write_command = _claude_command(Path("/usr/local/bin/claude"), writable, run)
-        self.assertEqual("acceptEdits", write_command[write_command.index("--permission-mode") + 1])
-        self.assertEqual("Bash,Read,Grep,Glob", write_command[write_command.index("--allowedTools") + 1])
+        write_command = _claude_command(Path("/usr/local/bin/claude"), writable, self.repo, run)
+        self.assertEqual("manual", write_command[write_command.index("--permission-mode") + 1])
+        allowed = write_command[write_command.index("--allowedTools") + 1]
+        self.assertEqual(
+            f"Bash,Read,Grep,Glob,Edit(//{self.repo.resolve().as_posix().lstrip('/')}/**),Write(//{self.repo.resolve().as_posix().lstrip('/')}/**)",
+            allowed,
+        )
         self.assertNotIn("--disallowed-tools", write_command)
+        self.assertNotIn("--settings", write_command)
+        self.assertNotIn(str((self.root / "outside").resolve()), allowed)
+
+    def test_codex_resume_reapplies_initial_sandbox_and_execution_directory(self):
+        run = self.root / "codex-resume"
+        read_only = {"harness": "codex", "model": "gpt-5.6-luna", "effort": "low", "write": False}
+        command = _codex_command(Path("/usr/local/bin/codex"), read_only, self.repo, run, "thread-1")
+        self.assertEqual("read-only", command[command.index("--sandbox") + 1])
+        self.assertEqual(str(self.repo), command[command.index("-C") + 1])
 
     @patch("cross_harness.runner.verify_codex_chatgpt")
     @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner.verify_claude_config_ownership")
     @patch("cross_harness.runner.verify_claude_subscription")
     @patch("cross_harness.runner._invoke_safe")
-    def test_claude_delegation_selects_claude_auth_and_executor(self, invoke, verify_claude, ownership, verify_codex):
+    def test_claude_delegation_selects_claude_auth_and_executor(self, invoke, verify_claude, claude_ownership, ownership, verify_codex):
         verify_claude.return_value = (Path("/usr/local/bin/claude"), False)
 
         def complete(command, task, env, cwd, run_dir, timeout):
@@ -258,6 +272,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("claude", json.loads((run / "execution.json").read_text())["harness"])
         self.assertFalse(json.loads((run / "execution.json").read_text())["write"])
         verify_claude.assert_called_once()
+        claude_ownership.assert_called_once_with(self.home.resolve(), self.repo.resolve())
         verify_codex.assert_not_called()
         ownership.assert_not_called()
 
@@ -292,9 +307,10 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("success", summary["status"])
         self.assertEqual("", summary["work_completed"])
 
+    @patch("cross_harness.runner.verify_claude_config_ownership")
     @patch("cross_harness.runner.verify_claude_subscription")
     @patch("cross_harness.runner._invoke_safe")
-    def test_claude_write_role_records_write_authorization(self, invoke, verify_claude):
+    def test_claude_write_role_records_write_authorization(self, invoke, verify_claude, claude_ownership):
         config = self.root / "claude-implementer.toml"
         contents = (Path(__file__).resolve().parents[1] / "config/default.toml").read_text()
         config.write_text(contents.replace(
@@ -306,7 +322,9 @@ class RunnerTests(unittest.TestCase):
 
         def complete(command, task, env, cwd, run_dir, timeout):
             self.assertEqual("claude", env["CROSS_HARNESS_EXECUTOR"])
-            self.assertEqual("acceptEdits", command[command.index("--permission-mode") + 1])
+            self.assertEqual("manual", command[command.index("--permission-mode") + 1])
+            self.assertIn(f"Edit(//{cwd.resolve().as_posix().lstrip('/')}/**)", command[command.index("--allowedTools") + 1])
+            self.assertIn(f"Write(//{cwd.resolve().as_posix().lstrip('/')}/**)", command[command.index("--allowedTools") + 1])
             (run_dir / "events.jsonl").write_text('{"type":"result","is_error":false,"usage":{}}\n')
             (run_dir / "stderr.log").write_text("")
             (run_dir / "final.json").write_text(json.dumps({
@@ -322,6 +340,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("claude", environment["CROSS_HARNESS_EXECUTOR"])
         self.assertEqual("1", environment["CROSS_HARNESS_WRITE"])
         self.assertTrue(json.loads((run / "execution.json").read_text())["write"])
+        claude_ownership.assert_called_once_with(self.home.resolve(), self.repo.resolve())
 
     def test_retry_budget_exhaustion_stops_before_auth_or_executor(self):
         previous = self.root / "retry-exhausted"
@@ -339,9 +358,10 @@ class RunnerTests(unittest.TestCase):
         verify.assert_not_called()
         invoke.assert_not_called()
 
+    @patch("cross_harness.runner.verify_claude_config_ownership")
     @patch("cross_harness.runner.verify_claude_subscription")
     @patch("cross_harness.runner._invoke_safe")
-    def test_claude_retry_resumes_recorded_session(self, invoke, verify_claude):
+    def test_claude_retry_resumes_recorded_session(self, invoke, verify_claude, claude_ownership):
         config = self.root / "claude-retry.toml"
         default = (Path(__file__).resolve().parents[1] / "config/default.toml").read_text()
         config.write_text(default.replace(
@@ -374,6 +394,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("success", summary["status"])
         self.assertEqual("session-2", summary["thread_id"])
         verify_claude.assert_called_once()
+        claude_ownership.assert_called_once_with(self.home.resolve(), self.repo.resolve())
 
     def test_escalation_uses_claude_fallback_and_effort_order(self):
         role = {"harness": "claude", "model": "sonnet", "effort": "xhigh"}
