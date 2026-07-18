@@ -69,6 +69,31 @@ stderr, the structured final response, diff statistics, and retry state stay in
 `~/.local/state/cross-harness/runs/<run-id>/`. A correction uses a delta-only
 task file with `~/.local/bin/cross-harness retry --run-dir ... --task-file ...`.
 
+## Change role settings
+
+Edit `~/.config/cross-harness/config.toml`. The repository's
+`config/default.toml` is a template copied only during first installation;
+editing it does not change the running configuration.
+
+Each role has `harness`, `model`, and `effort` settings. `harness` selects
+Claude or Codex as the execution target, and any role can be assigned to either
+harness. `model` accepts any string without validation. `effort` is also passed
+through without rejection; `validate` only warns when it is outside the known
+values: Codex supports `minimal`, `low`, `medium`, `high`, and `xhigh`; Claude
+supports `low`, `medium`, `high`, `xhigh`, and `max`.
+
+Codex role changes apply to the next `delegate`. Claude role changes require a
+new Claude session, because its session-start hook synchronizes
+`~/.claude/agents/cross-harness-*.md`. `orchestrator` is the session itself,
+and `planner` has neither an agent definition nor a delegation path, so their
+`model` and `effort` settings currently have no effect.
+
+Check the configuration with:
+
+```sh
+cross-harness validate --config ~/.config/cross-harness/config.toml
+```
+
 ## Verify and remove
 
 ```sh
