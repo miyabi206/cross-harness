@@ -42,8 +42,6 @@ def create_task_file(
     if role not in config["roles"]:
         raise ConfigError(f"unknown role: {role}")
     role_config = config["roles"][role]
-    if role_config["harness"] != "codex":
-        raise ConfigError(f"task files can target Codex roles only: {role}")
     if kind not in config["delegate_kinds"] or kind not in role_config["delegate_kinds"]:
         raise ConfigError(f"delegation kind {kind!r} is not allowed for {role}")
     if not cwd.is_dir():
@@ -78,4 +76,3 @@ def create_task_file(
     path = Path(config["runtime_root"]) / "inbox" / f"{stamp}-{uuid.uuid4().hex[:8]}.md"
     atomic_write(path, content)
     return path
-

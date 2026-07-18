@@ -9,7 +9,8 @@ import time
 import unittest
 
 from cross_harness.errors import AuthError, DirtyWorktreeError, HarnessError, SupervisorDiedError
-from cross_harness.runner import _claude_command, _invoke_safe, _write_baseline, delegate, retry, start_detached_delegate, wait_for_run
+from cross_harness.config import default_config
+from cross_harness.runner import _claude_command, _escalated_role, _invoke_safe, _write_baseline, delegate, retry, start_detached_delegate, wait_for_run
 from cross_harness.runner import finalize_run
 
 
@@ -215,6 +216,9 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("bypassPermissions", command)
         self.assertIn(str(run / "final.json"), command[command.index("--append-system-prompt") + 1])
 
+        resumed = _claude_command(Path("/usr/local/bin/claude"), read_only, run, "session-1")
+        self.assertEqual("session-1", resumed[resumed.index("--resume") + 1])
+
         writable = dict(read_only, write=True)
         write_command = _claude_command(Path("/usr/local/bin/claude"), writable, run)
         self.assertEqual("acceptEdits", write_command[write_command.index("--permission-mode") + 1])
@@ -297,6 +301,48 @@ class RunnerTests(unittest.TestCase):
                 retry(previous, self.task, home=self.home)
         verify.assert_not_called()
         invoke.assert_not_called()
+
+    @patch("cross_harness.runner.verify_claude_subscription")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_claude_retry_resumes_recorded_session(self, invoke, verify_claude):
+        config = self.root / "claude-retry.toml"
+        default = (Path(__file__).resolve().parents[1] / "config/default.toml").read_text()
+        config.write_text(default.replace(
+            '[roles.reviewer]\nharness = "claude"\nmodel = "sonnet"\neffort = "high"\nmax_parallel = 1\nretries = 0',
+            '[roles.reviewer]\nharness = "claude"\nmodel = "sonnet"\neffort = "high"\nmax_parallel = 1\nretries = 2',
+            1,
+        ))
+        previous = self.root / "claude-retry-previous"
+        previous.mkdir()
+        (previous / "state.json").write_text(json.dumps({
+            "role": "reviewer", "kind": "review", "cwd": str(self.repo),
+            "thread_id": "session-1", "attempts": 1, "signatures": [],
+            "escalated": False, "status": "failed", "model": "sonnet", "effort": "high",
+        }))
+        verify_claude.return_value = (Path("/usr/local/bin/claude"), False)
+
+        def complete(command, task, env, cwd, run_dir, timeout):
+            self.assertEqual("claude", env["CROSS_HARNESS_EXECUTOR"])
+            self.assertEqual("session-1", command[command.index("--resume") + 1])
+            (run_dir / "events.jsonl").write_text('{"type":"result","session_id":"session-2","is_error":false,"usage":{}}\n')
+            (run_dir / "stderr.log").write_text("")
+            (run_dir / "final.json").write_text(json.dumps({
+                "status": "success", "work_completed": "reviewed", "changed_files": [],
+                "tests": ["review"], "error": None, "next_decision": None,
+            }))
+            return 0
+
+        invoke.side_effect = complete
+        summary = retry(previous, self.task, config_path=config, home=self.home)
+        self.assertEqual("success", summary["status"])
+        self.assertEqual("session-2", summary["thread_id"])
+        verify_claude.assert_called_once()
+
+    def test_escalation_uses_claude_fallback_and_effort_order(self):
+        role = {"harness": "claude", "model": "sonnet", "effort": "xhigh"}
+        escalated = _escalated_role(role, default_config())
+        self.assertEqual("fable", escalated["model"])
+        self.assertEqual("max", escalated["effort"])
 
     def test_rate_limit_event_fails_closed(self):
         run = self.root / "rate-run"

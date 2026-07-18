@@ -39,6 +39,16 @@ class TaskFileTests(unittest.TestCase):
                     ["done"], home=home,
                 )
 
+    def test_task_creation_accepts_delegable_claude_role(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder) / "home"
+            repo = Path(folder) / "repo"
+            home.mkdir()
+            repo.mkdir()
+            path = create_task_file("reviewer", "review", repo, "Review changes", ["Review is complete"], home=home)
+            self.assertTrue(path.is_file())
+            self.assertIn("role=reviewer", path.read_text())
+
 
 if __name__ == "__main__":
     unittest.main()

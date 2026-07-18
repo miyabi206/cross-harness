@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-import json
-import subprocess
 
-from .auth import detected_api_keys, resolve_codex, sanitized_environment, verify_codex_chatgpt
+from .auth import (
+    detected_api_keys,
+    resolve_claude,
+    resolve_codex,
+    verify_claude_subscription,
+    verify_codex_chatgpt,
+)
 from .config import load_config
 from .files import MARKER_START
 from .paths import user_paths
@@ -30,6 +34,12 @@ def doctor(home: Path | None = None, config_path: Path | None = None) -> dict:
     except Exception as exc:
         add("independent Codex CLI", False, str(exc))
         codex = None
+    try:
+        claude = resolve_claude()
+        add("independent Claude CLI", True, str(claude))
+    except Exception as exc:
+        add("independent Claude CLI", False, str(exc))
+        claude = None
     keys = detected_api_keys()
     add("API-key environment", not keys, "none" if not keys else ", ".join(keys))
     if config and codex and not keys:
@@ -38,12 +48,12 @@ def doctor(home: Path | None = None, config_path: Path | None = None) -> dict:
             add("Codex ChatGPT auth", True, f"{actual} ({'cached' if cached else 'fresh'})")
         except Exception as exc:
             add("Codex ChatGPT auth", False, str(exc))
-    try:
-        result = subprocess.run(["claude", "auth", "status"], capture_output=True, text=True, timeout=15, env=sanitized_environment(paths.home), check=False)
-        compact = f"{result.stdout}{result.stderr}".replace(" ", "").lower()
-        add("Claude auth", result.returncode == 0 and '"loggedin":true' in compact, "authenticated" if result.returncode == 0 and '"loggedin":true' in compact else "not authenticated")
-    except Exception as exc:
-        add("Claude auth", False, str(exc))
+    if config and claude and not keys:
+        try:
+            actual, cached = verify_claude_subscription(Path(config["runtime_root"]), paths.home, config["auth_cache_hours"], force=True)
+            add("Claude subscription auth", True, f"{actual} ({'cached' if cached else 'fresh'})")
+        except Exception as exc:
+            add("Claude subscription auth", False, str(exc))
     for label, path in (("Claude charter", paths.claude / "CLAUDE.md"), ("Codex charter", paths.codex / "AGENTS.md")):
         ok = path.exists() and MARKER_START in path.read_text(encoding="utf-8", errors="replace")
         add(label, ok, str(path))

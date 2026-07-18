@@ -44,8 +44,8 @@ ROLE_KEYS = {
     "delegate_kinds",
 }
 PROJECT_KEYS = {"checks", "delegate_kinds", "dirty_worktree_policy"}
-CODEX_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
-CLAUDE_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+CODEX_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DELEGATE_KINDS = {"exploration", "implementation", "test", "debug", "review", "security_review"}
 ROLE_DELEGATE_KINDS = DELEGATE_KINDS | {"planning"}
 

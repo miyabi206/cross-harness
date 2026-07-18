@@ -19,7 +19,7 @@ from .auth import (
     verify_codex_chatgpt,
     verify_codex_config_ownership,
 )
-from .config import load_config, project_config
+from .config import CLAUDE_EFFORTS, CODEX_EFFORTS, load_config, project_config
 from .errors import AuthError, ConfigError, DirtyWorktreeError, HarnessError, SupervisorDiedError
 from .files import atomic_write, dump_json, sha256
 from .paths import source_root, user_paths
@@ -244,7 +244,7 @@ def _codex_command(codex: Path, role: dict, cwd: Path, run_dir: Path, resume: st
     ]
 
 
-def _claude_command(claude: Path, role: dict, run_dir: Path) -> list[str]:
+def _claude_command(claude: Path, role: dict, run_dir: Path, resume: str | None = None) -> list[str]:
     schema = _delegation_schema()
     permission_mode = "acceptEdits" if role["write"] else "manual"
     final_path = run_dir / "final.json"
@@ -255,6 +255,7 @@ def _claude_command(claude: Path, role: dict, run_dir: Path) -> list[str]:
     )
     return [
         str(claude), "-p",
+        *(["--resume", resume] if resume else []),
         "--model", role["model"],
         "--effort", role["effort"],
         "--output-format", "stream-json",
@@ -269,9 +270,7 @@ def _command(executor: Path, role: dict, cwd: Path, run_dir: Path, resume: str |
     if role["harness"] == "codex":
         return _codex_command(executor, role, cwd, run_dir, resume)
     if role["harness"] == "claude":
-        if resume:
-            raise HarnessError("retry is not supported for Claude roles")
-        return _claude_command(executor, role, run_dir)
+        return _claude_command(executor, role, run_dir, resume)
     raise ConfigError(f"unsupported harness: {role['harness']}")
 
 
@@ -699,12 +698,13 @@ def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path
 
 def _escalated_role(role: dict, config: dict) -> dict:
     updated = dict(role)
-    chain = config["fallback"]["codex"]
+    harness = role["harness"]
+    chain = config["fallback"][harness]
     if role["model"] in chain:
         index = chain.index(role["model"])
         if index > 0:
             updated["model"] = chain[index - 1]
-    efforts = ["minimal", "low", "medium", "high", "xhigh"]
+    efforts = CODEX_EFFORTS if harness == "codex" else CLAUDE_EFFORTS
     if role["effort"] in efforts and efforts.index(role["effort"]) < len(efforts) - 1:
         updated["effort"] = efforts[efforts.index(role["effort"]) + 1]
     return updated
@@ -720,8 +720,6 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         raise HarnessError(f"run state not found: {state_path}")
     state = json.loads(state_path.read_text(encoding="utf-8"))
     role = dict(config["roles"][state["role"]])
-    if role["harness"] == "claude":
-        raise HarnessError("retry is not supported for Claude roles")
     if state["status"] == "blocked":
         raise HarnessError("blocked runs cannot be retried automatically")
     if state["attempts"] > role["retries"]:
@@ -732,8 +730,13 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
     shutil.copy2(task_file, retry_root / "task.md")
     _write_baseline(retry_root, Path(state["cwd"]))
     try:
-        verify_codex_config_ownership(paths.home, _git_root(Path(state["cwd"])), Path(state["cwd"]))
-        codex, cached = verify_codex_chatgpt(Path(config["runtime_root"]), paths.home, config["auth_cache_hours"])
+        if role["harness"] == "codex":
+            verify_codex_config_ownership(paths.home, _git_root(Path(state["cwd"])), Path(state["cwd"]))
+            executor, cached = verify_codex_chatgpt(Path(config["runtime_root"]), paths.home, config["auth_cache_hours"])
+        elif role["harness"] == "claude":
+            executor, cached = verify_claude_subscription(Path(config["runtime_root"]), paths.home, config["auth_cache_hours"])
+        else:
+            raise ConfigError(f"unsupported harness: {role['harness']}")
     except AuthError as exc:
         return finalize_blocked_run(
             retry_root,
@@ -749,7 +752,7 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         )
     environment = sanitized_environment(paths.home, {
         "CROSS_HARNESS_ACTIVE": "1",
-        "CROSS_HARNESS_EXECUTOR": "codex",
+        "CROSS_HARNESS_EXECUTOR": role["harness"],
         "CROSS_HARNESS_PARENT": "claude",
         "CROSS_HARNESS_RUN_DIR": str(retry_root),
     })
@@ -757,7 +760,7 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         environment["CROSS_HARNESS_WRITE"] = "1"
     else:
         environment.pop("CROSS_HARNESS_WRITE", None)
-    command = _command(codex, role, Path(state["cwd"]), retry_root, state["thread_id"])
+    command = _command(executor, role, Path(state["cwd"]), retry_root, state["thread_id"])
     _write_execution_record(retry_root, state["role"], role, state["kind"], Path(state["cwd"]))
     atomic_write(retry_root / "command.json", dump_json({"argv": command, "auth_cached": cached, "resume": state["thread_id"]}))
     exit_code = _invoke_safe(command, task_file.read_text(encoding="utf-8"), environment, Path(state["cwd"]), retry_root, role["timeout_seconds"])
@@ -772,7 +775,7 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         escalation_root = _new_run_dir(Path(config["runtime_root"]))
         shutil.copy2(task_file, escalation_root / "task.md")
         _write_baseline(escalation_root, Path(state["cwd"]))
-        command = _command(codex, escalation, Path(state["cwd"]), escalation_root, summary.get("thread_id") or state["thread_id"])
+        command = _command(executor, escalation, Path(state["cwd"]), escalation_root, summary.get("thread_id") or state["thread_id"])
         _write_execution_record(escalation_root, state["role"], escalation, state["kind"], Path(state["cwd"]))
         atomic_write(escalation_root / "command.json", dump_json({"argv": command, "escalation": True, "previous_run": str(retry_root)}))
         code = _invoke_safe(command, task_file.read_text(encoding="utf-8"), environment | {"CROSS_HARNESS_RUN_DIR": str(escalation_root)}, Path(state["cwd"]), escalation_root, escalation["timeout_seconds"])

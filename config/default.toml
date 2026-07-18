@@ -12,7 +12,8 @@ delegate_kinds = ["exploration", "implementation", "test", "debug", "review", "s
 # low/medium/high/xhigh/max. They are compatibility guidance only: validation
 # passes through new effort values unchanged.
 # Routing is determined by each role's harness field; changing model alone does
-# not switch harnesses.
+# not switch harnesses. Change a role's harness to assign it to either Codex or
+# Claude; any role with delegate_kinds can be delegated through its harness.
 
 [fallback]
 codex = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
