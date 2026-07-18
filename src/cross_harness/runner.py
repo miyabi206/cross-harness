@@ -281,9 +281,14 @@ def delegate(
         return finalize_blocked_run(run_dir, role_name, role, kind, execution_root, str(exc), "authentication")
     environment = sanitized_environment(paths.home, {
         "CROSS_HARNESS_ACTIVE": "1",
+        "CROSS_HARNESS_EXECUTOR": "codex",
         "CROSS_HARNESS_PARENT": "claude",
         "CROSS_HARNESS_RUN_DIR": str(run_dir),
     })
+    if role["write"]:
+        environment["CROSS_HARNESS_WRITE"] = "1"
+    else:
+        environment.pop("CROSS_HARNESS_WRITE", None)
     command = _command(codex, role, execution_root, run_dir)
     atomic_write(run_dir / "command.json", dump_json({"argv": command, "auth_cached": cached, "cwd": str(execution_root)}))
     exit_code = _invoke_safe(command, task, environment, execution_root, run_dir, role["timeout_seconds"])
@@ -684,9 +689,14 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         )
     environment = sanitized_environment(paths.home, {
         "CROSS_HARNESS_ACTIVE": "1",
+        "CROSS_HARNESS_EXECUTOR": "codex",
         "CROSS_HARNESS_PARENT": "claude",
         "CROSS_HARNESS_RUN_DIR": str(retry_root),
     })
+    if role["write"]:
+        environment["CROSS_HARNESS_WRITE"] = "1"
+    else:
+        environment.pop("CROSS_HARNESS_WRITE", None)
     command = _command(codex, role, Path(state["cwd"]), retry_root, state["thread_id"])
     atomic_write(retry_root / "command.json", dump_json({"argv": command, "auth_cached": cached, "resume": state["thread_id"]}))
     exit_code = _invoke_safe(command, task_file.read_text(encoding="utf-8"), environment, Path(state["cwd"]), retry_root, role["timeout_seconds"])

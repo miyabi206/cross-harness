@@ -39,6 +39,7 @@ class RunnerTests(unittest.TestCase):
 
     def fake_invoke(self, command, task, env, cwd, run_dir, timeout):
         self.assertEqual("1", env["CROSS_HARNESS_ACTIVE"])
+        self.assertEqual("codex", env["CROSS_HARNESS_EXECUTOR"])
         (run_dir / "events.jsonl").write_text(
             '{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000001"}\n'
             '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}\n'
@@ -64,6 +65,17 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue((run / "summary.txt").exists())
         self.assertTrue((run / "baseline.json").exists())
         self.assertEqual(1, invoke.call_count)
+
+    @patch("cross_harness.runner.verify_codex_chatgpt")
+    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_write_delegation_sets_write_executor_marker(self, invoke, ownership, verify):
+        verify.return_value = (Path("/usr/bin/true"), False)
+        invoke.side_effect = self.fake_invoke
+        summary = delegate("implementer", "implementation", self.task, self.repo, home=self.home)
+        environment = invoke.call_args.args[2]
+        self.assertEqual("1", environment["CROSS_HARNESS_WRITE"])
+        self.assertEqual("success", summary["status"])
 
     @patch("cross_harness.runner.verify_codex_chatgpt")
     @patch("cross_harness.runner.verify_codex_config_ownership")
@@ -379,6 +391,9 @@ class RunnerTests(unittest.TestCase):
         verify.return_value = (Path("/usr/bin/true"), False)
 
         def fail(command, task, env, cwd, run_dir, timeout):
+            self.assertEqual("1", env["CROSS_HARNESS_ACTIVE"])
+            self.assertEqual("codex", env["CROSS_HARNESS_EXECUTOR"])
+            self.assertNotIn("CROSS_HARNESS_WRITE", env)
             (run_dir / "events.jsonl").write_text(
                 '{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000002"}\n'
                 '{"type":"turn.failed","error":{"message":"same test failed"}}\n'

@@ -24,6 +24,9 @@ BARE_WRAPPER = re.compile(rf"(?:^|{SHELL_BOUNDARY})cross-harness\s+(?:task|deleg
 HARNESS_DELEGATION = re.compile(
     rf"(?:^|{SHELL_BOUNDARY})(?:[^\s;&|()'\"`]*/)?cross-harness\s+(?:delegate|retry)(?=$|{SHELL_BOUNDARY})"
 )
+HARNESS_REDELEGATION = re.compile(
+    rf"(?:^|{SHELL_BOUNDARY})(?:[^\s;&|()'\"`]*/)?cross-harness\s+(?:delegate|retry|task\s+create)(?=$|{SHELL_BOUNDARY})"
+)
 
 
 def _input() -> dict:
@@ -48,6 +51,16 @@ def _deny(message: str) -> int:
 
 def claude_pre_tool_use() -> int:
     name, command = _tool(_input())
+    if os.environ.get("CROSS_HARNESS_EXECUTOR") == "claude":
+        if name in {"Edit", "Write"} and os.environ.get("CROSS_HARNESS_WRITE") != "1":
+            return _deny("cross-harness: delegated Claude has read-only access")
+        if name == "Bash" and (
+            CODEX_EXEC.search(command)
+            or CLAUDE_EXEC.search(command)
+            or HARNESS_REDELEGATION.search(command)
+        ):
+            return _deny("cross-harness: nested executor launch from delegated Claude is blocked")
+        return 0
     if name in {"Edit", "Write"}:
         return _deny("cross-harness: Claude is the orchestrator; delegate project edits through cross-harness")
     if name == "Bash" and CODEX_EXEC.search(command):
@@ -71,6 +84,11 @@ def codex_pre_tool_use() -> int:
 
 def claude_session_start(home: Path | None = None) -> int:
     paths = user_paths(home)
+    executor = os.environ.get("CROSS_HARNESS_EXECUTOR")
+    if executor == "codex" and os.environ.get("CROSS_HARNESS_ACTIVE") == "1":
+        return _deny("cross-harness: nested Claude launch from a delegated Codex run is blocked")
+    if executor == "claude":
+        return 0
     if os.environ.get("CROSS_HARNESS_ACTIVE") == "1":
         return _deny("cross-harness: nested Claude launch from a delegated Codex run is blocked")
     warnings: list[str] = []

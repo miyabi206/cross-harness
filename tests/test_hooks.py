@@ -25,6 +25,38 @@ class HookTests(unittest.TestCase):
         code, _ = self._run(claude_pre_tool_use, '{"tool_name":"Bash","tool_input":{"command":"/opt/bin/codex exec task"}}')
         self.assertEqual(2, code)
 
+    def test_delegated_claude_read_only_blocks_edits_and_nested_executors(self):
+        environment = {"CROSS_HARNESS_ACTIVE": "1", "CROSS_HARNESS_EXECUTOR": "claude"}
+        with patch.dict("os.environ", environment, clear=True):
+            code, message = self._run(claude_pre_tool_use, '{"tool_name":"Edit","tool_input":{}}')
+            self.assertEqual(2, code)
+            self.assertIn("read-only", message)
+            for command in (
+                "cross-harness task create --role tester",
+                "/Users/example/.local/bin/cross-harness delegate --role tester",
+                "codex exec nested",
+                "claude -p nested",
+            ):
+                payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
+                code, message = self._run(claude_pre_tool_use, payload)
+                self.assertEqual(2, code)
+                self.assertIn("nested executor", message)
+
+    def test_delegated_claude_write_access_allows_edits_but_not_nested_executors(self):
+        environment = {
+            "CROSS_HARNESS_ACTIVE": "1",
+            "CROSS_HARNESS_EXECUTOR": "claude",
+            "CROSS_HARNESS_WRITE": "1",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            self.assertEqual(0, self._run(claude_pre_tool_use, '{"tool_name":"Edit","tool_input":{}}')[0])
+            self.assertEqual(0, self._run(claude_pre_tool_use, '{"tool_name":"Write","tool_input":{}}')[0])
+            code, _ = self._run(
+                claude_pre_tool_use,
+                '{"tool_name":"Bash","tool_input":{"command":"claude -p nested"}}',
+            )
+            self.assertEqual(2, code)
+
     def test_codex_nested_claude_is_blocked(self):
         code, message = self._run(codex_pre_tool_use, '{"tool_name":"Bash","tool_input":{"command":"env /opt/homebrew/bin/claude -p hi"}}')
         self.assertEqual(2, code)
@@ -63,6 +95,28 @@ class HookTests(unittest.TestCase):
         with patch.dict("os.environ", {"CROSS_HARNESS_ACTIVE": "1"}, clear=True), patch("sys.stderr", new_callable=StringIO) as stderr:
             self.assertEqual(2, claude_session_start(Path("/tmp/nonexistent-home")))
             self.assertIn("nested Claude", stderr.getvalue())
+
+    def test_codex_executor_blocks_nested_claude_session(self):
+        environment = {"CROSS_HARNESS_ACTIVE": "1", "CROSS_HARNESS_EXECUTOR": "codex"}
+        with patch.dict("os.environ", environment, clear=True), patch("sys.stderr", new_callable=StringIO) as stderr:
+            self.assertEqual(2, claude_session_start(Path("/tmp/nonexistent-home")))
+            self.assertIn("nested Claude", stderr.getvalue())
+
+    @patch("cross_harness.hooks.cleanup")
+    @patch("cross_harness.hooks.verify_codex_chatgpt")
+    @patch("cross_harness.hooks.detected_api_keys")
+    @patch("cross_harness.hooks.subprocess.run")
+    @patch("cross_harness.hooks.synchronize_claude_agent_roles")
+    def test_delegated_claude_session_skips_orchestrator_maintenance(self, sync, run, keys, verify, cleanup):
+        environment = {"CROSS_HARNESS_ACTIVE": "1", "CROSS_HARNESS_EXECUTOR": "claude"}
+        with patch.dict("os.environ", environment, clear=True), patch("sys.stdout", new_callable=StringIO) as stdout:
+            self.assertEqual(0, claude_session_start(Path("/tmp/cross-harness-hook-home")))
+        sync.assert_not_called()
+        run.assert_not_called()
+        keys.assert_not_called()
+        verify.assert_not_called()
+        cleanup.assert_not_called()
+        self.assertEqual("", stdout.getvalue())
 
     @patch("cross_harness.hooks.cleanup")
     @patch("cross_harness.hooks.verify_codex_chatgpt")
