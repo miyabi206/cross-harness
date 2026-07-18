@@ -64,7 +64,10 @@ def parse_events(path: Path) -> dict:
                 result["errors"].append(_event_text(event))
             _parse_claude_tool_events(event, claude_commands, result)
             item = event.get("item")
-            if isinstance(item, dict) and item.get("type") == "command_execution":
+            # Codex emits an ``item.started`` event before the terminal
+            # ``item.completed`` event.  The former has status=in_progress
+            # and no exit code, so it must not be treated as a failure.
+            if kind == "item.completed" and isinstance(item, dict) and item.get("type") == "command_execution":
                 if item.get("status") not in {None, "completed", "success"} or item.get("exit_code") not in {None, 0}:
                     result["commands"].append({
                         "command": item.get("command", ""),

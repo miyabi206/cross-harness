@@ -12,6 +12,7 @@ from cross_harness.errors import AuthError, DirtyWorktreeError, HarnessError, Su
 from cross_harness.config import default_config
 from cross_harness.runner import _claude_command, _claude_sandbox_profile, _codex_command, _contain_claude_write_command, _escalated_role, _invoke_safe, _write_baseline, _write_claude_final_from_events, delegate, retry, start_detached_delegate, wait_for_run
 from cross_harness.runner import finalize_run
+from cross_harness.summarize import parse_events
 
 
 def git(cwd: Path, *args: str):
@@ -257,6 +258,42 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("read-only inspection command failed", summary["error"])
         self.assertEqual(["14 failed, 100 passed"], summary["tests"])
         self.assertIn("tests: 14 failed, 100 passed", (run / "summary.txt").read_text())
+
+    def test_read_only_successful_command_does_not_override_reported_success(self):
+        run = self.root / "read-only-command-success-run"
+        run.mkdir()
+        command = "sed -n '1,20p' README.md"
+        (run / "events.jsonl").write_text(
+            json.dumps({
+                "type": "item.started",
+                "item": {
+                    "type": "command_execution",
+                    "command": command,
+                    "status": "in_progress",
+                    "exit_code": None,
+                },
+            }) + "\n" + json.dumps({
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": command,
+                    "status": "completed",
+                    "exit_code": 0,
+                    "aggregated_output": "read successfully",
+                },
+            }) + "\n"
+        )
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "inspected", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-luna", "effort": "low", "output_limit_chars": 8000, "write": False}
+
+        summary = finalize_run(run, "security_reviewer", role, "review", self.repo, 0, 1)
+
+        self.assertEqual("success", summary["status"])
+        self.assertEqual([], parse_events(run / "events.jsonl")["commands"])
 
     def test_write_role_failed_command_does_not_override_reported_success(self):
         run = self.root / "write-command-failure-run"
