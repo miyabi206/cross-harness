@@ -2,6 +2,7 @@ from io import StringIO
 from unittest.mock import patch
 from pathlib import Path
 import json
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -81,9 +82,12 @@ class HookTests(unittest.TestCase):
     def test_session_start_synchronizes_claude_agents_from_updated_config(self, run, keys, verify, cleanup):
         run.return_value = subprocess.CompletedProcess([], 0, '{"loggedIn": true}', "")
         with tempfile.TemporaryDirectory() as folder:
-            home = Path(folder) / "home"
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
             home.mkdir()
-            install(home, source_root())
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            install(home, repo)
             config = home / ".config/cross-harness/config.toml"
             contents = config.read_text(encoding="utf-8").replace('model = "haiku"', 'model = "next-explorer"')
             contents = contents.replace('effort = "low"', 'effort = "next-effort"')
@@ -95,6 +99,33 @@ class HookTests(unittest.TestCase):
             explorer = (home / ".claude/agents/cross-harness-explorer.md").read_text()
             self.assertIn("model: next-explorer", explorer)
             self.assertIn("effort: next-effort", explorer)
+
+    @patch("cross_harness.hooks.cleanup")
+    @patch("cross_harness.hooks.verify_codex_chatgpt")
+    @patch("cross_harness.hooks.detected_api_keys", return_value=[])
+    @patch("cross_harness.hooks.subprocess.run")
+    def test_session_start_warns_when_claude_agent_role_uses_codex_harness(self, run, keys, verify, cleanup):
+        run.return_value = subprocess.CompletedProcess([], 0, '{"loggedIn": true}', "")
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            install(home, repo)
+            config = home / ".config/cross-harness/config.toml"
+            contents = config.read_text(encoding="utf-8").replace(
+                'harness = "claude"\nmodel = "haiku"\neffort = "low"',
+                'harness = "codex"\nmodel = "gpt-5.6-terra"\neffort = "high"',
+            )
+            config.write_text(contents, encoding="utf-8")
+
+            with patch.dict("os.environ", {}, clear=True), patch("sys.stdout", new_callable=StringIO) as stdout:
+                self.assertEqual(0, claude_session_start(home))
+
+            explorer = (home / ".claude/agents/cross-harness-explorer.md").read_text()
+            self.assertIn("model: haiku", explorer)
+            self.assertIn("harness is 'codex', not 'claude'", stdout.getvalue())
 
 
 if __name__ == "__main__":

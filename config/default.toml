@@ -8,6 +8,13 @@ max_parallel = 2
 dirty_worktree_policy = "stop"
 delegate_kinds = ["exploration", "implementation", "test", "debug", "review", "security_review"]
 
+# Known effort values are codex: minimal/low/medium/high/xhigh and claude:
+# low/medium/high/xhigh/max. They are compatibility guidance only: validation
+# passes through new effort values unchanged.
+# Routing is determined by each role's harness field; changing model alone does
+# not switch harnesses. implementer, tester, debugger, and security_reviewer
+# have no execution path when configured with harness = "claude".
+
 [fallback]
 codex = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
 claude = ["fable", "sonnet", "haiku"]

@@ -78,7 +78,7 @@ def claude_session_start(home: Path | None = None) -> int:
     try:
         config = load_config(home=paths.home)
         if (paths.claude / "agents").exists():
-            synchronize_claude_agent_roles(paths, config)
+            warnings.extend(synchronize_claude_agent_roles(paths, config))
     except Exception as exc:  # hooks must not hide the session for synchronization failure
         warnings.append(f"Claude agent configuration sync warning: {exc}")
     keys = detected_api_keys()

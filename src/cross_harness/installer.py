@@ -117,20 +117,29 @@ def _render_claude_agent_role(text: str, role: dict) -> str:
     return "---\n" + frontmatter + text[closing:]
 
 
-def synchronize_claude_agent_roles(paths: UserPaths, config: dict) -> None:
-    """Apply the configured Claude explorer/reviewer model settings to installed agents."""
+def synchronize_claude_agent_roles(paths: UserPaths, config: dict) -> list[str]:
+    """Apply Claude role settings to installed agents and return skipped-role warnings."""
     roles = config.get("roles")
     if not isinstance(roles, dict):
         raise HarnessError("configuration roles are unavailable for Claude agent synchronization")
+    warnings: list[str] = []
     for filename, role_name in CLAUDE_AGENT_ROLES.items():
         role = roles.get(role_name)
         if not isinstance(role, dict):
             raise HarnessError(f"configuration role {role_name!r} is unavailable for Claude agent synchronization")
+        harness = role.get("harness")
+        if harness != "claude":
+            warnings.append(
+                f"Skipped Claude agent synchronization for role {role_name!r}: "
+                f"harness is {harness!r}, not 'claude'"
+            )
+            continue
         path = paths.claude / "agents" / filename
         text = path.read_text(encoding="utf-8")
         rendered = _render_claude_agent_role(text, role)
         if rendered != text:
             atomic_write(path, rendered, path.stat().st_mode & 0o777)
+    return warnings
 
 
 def _merge_markdown(

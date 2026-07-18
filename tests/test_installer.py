@@ -80,6 +80,28 @@ class InstallerTests(unittest.TestCase):
             self.assertIn("model: custom-reviewer", reviewer)
             self.assertIn("effort: review-effort", reviewer)
 
+    def test_install_does_not_write_codex_role_settings_to_claude_agents(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            config = home / ".config/cross-harness/config.toml"
+            config.parent.mkdir(parents=True)
+            contents = (repo / "config/default.toml").read_text(encoding="utf-8")
+            contents = contents.replace(
+                'harness = "claude"\nmodel = "haiku"\neffort = "low"',
+                'harness = "codex"\nmodel = "gpt-5.6-terra"\neffort = "high"',
+            )
+            config.write_text(contents, encoding="utf-8")
+
+            install(home, repo)
+
+            explorer = (home / ".claude/agents/cross-harness-explorer.md").read_text()
+            self.assertIn("model: haiku", explorer)
+            self.assertIn("effort: low", explorer)
+
     def test_dry_run_does_not_touch_home(self):
         with tempfile.TemporaryDirectory() as folder:
             home = Path(folder) / "home"
