@@ -18,6 +18,23 @@ class HookTests(unittest.TestCase):
             code = function()
             return code, stderr.getvalue()
 
+    def _execution_environment(self, runtime_root, *, harness="claude", write=False, run_dir=None):
+        run_dir = run_dir or runtime_root / "runs" / "delegated-claude"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "execution.json").write_text(json.dumps({
+            "role_name": "implementer",
+            "harness": harness,
+            "write": write,
+            "kind": "implementation",
+            "cwd": "/tmp/project",
+        }), encoding="utf-8")
+        return {
+            "CROSS_HARNESS_ACTIVE": "1",
+            "CROSS_HARNESS_EXECUTOR": "claude",
+            "CROSS_HARNESS_WRITE": "1",
+            "CROSS_HARNESS_RUN_DIR": str(run_dir),
+        }
+
     def test_claude_direct_edit_and_direct_codex_are_blocked(self):
         code, message = self._run(claude_pre_tool_use, '{"tool_name":"Edit","tool_input":{}}')
         self.assertEqual(2, code)
@@ -26,36 +43,67 @@ class HookTests(unittest.TestCase):
         self.assertEqual(2, code)
 
     def test_delegated_claude_read_only_blocks_edits_and_nested_executors(self):
-        environment = {"CROSS_HARNESS_ACTIVE": "1", "CROSS_HARNESS_EXECUTOR": "claude"}
-        with patch.dict("os.environ", environment, clear=True):
-            code, message = self._run(claude_pre_tool_use, '{"tool_name":"Edit","tool_input":{}}')
-            self.assertEqual(2, code)
-            self.assertIn("read-only", message)
-            for command in (
-                "cross-harness task create --role tester",
-                "/Users/example/.local/bin/cross-harness delegate --role tester",
-                "codex exec nested",
-                "claude -p nested",
-            ):
-                payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
-                code, message = self._run(claude_pre_tool_use, payload)
+        with tempfile.TemporaryDirectory() as folder:
+            runtime_root = Path(folder) / "runtime"
+            environment = self._execution_environment(runtime_root)
+            with patch("cross_harness.hooks.load_config", return_value={"runtime_root": str(runtime_root)}), patch.dict("os.environ", environment, clear=True):
+                code, message = self._run(claude_pre_tool_use, '{"tool_name":"Edit","tool_input":{}}')
                 self.assertEqual(2, code)
-                self.assertIn("nested executor", message)
+                self.assertIn("read-only", message)
+                for command in (
+                    "cross-harness task create --role tester",
+                    "/Users/example/.local/bin/cross-harness delegate --role tester",
+                    "codex exec nested",
+                    "claude -p nested",
+                ):
+                    payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
+                    code, message = self._run(claude_pre_tool_use, payload)
+                    self.assertEqual(2, code)
+                    self.assertIn("nested executor", message)
 
     def test_delegated_claude_write_access_allows_edits_but_not_nested_executors(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runtime_root = Path(folder) / "runtime"
+            environment = self._execution_environment(runtime_root, write=True)
+            environment["CROSS_HARNESS_WRITE"] = "0"
+            with patch("cross_harness.hooks.load_config", return_value={"runtime_root": str(runtime_root)}), patch.dict("os.environ", environment, clear=True):
+                self.assertEqual(0, self._run(claude_pre_tool_use, '{"tool_name":"Edit","tool_input":{}}')[0])
+                self.assertEqual(0, self._run(claude_pre_tool_use, '{"tool_name":"Write","tool_input":{}}')[0])
+                code, _ = self._run(
+                    claude_pre_tool_use,
+                    '{"tool_name":"Bash","tool_input":{"command":"claude -p nested"}}',
+                )
+                self.assertEqual(2, code)
+
+    def test_claimed_claude_write_access_without_execution_record_is_blocked(self):
         environment = {
             "CROSS_HARNESS_ACTIVE": "1",
             "CROSS_HARNESS_EXECUTOR": "claude",
             "CROSS_HARNESS_WRITE": "1",
         }
         with patch.dict("os.environ", environment, clear=True):
-            self.assertEqual(0, self._run(claude_pre_tool_use, '{"tool_name":"Edit","tool_input":{}}')[0])
-            self.assertEqual(0, self._run(claude_pre_tool_use, '{"tool_name":"Write","tool_input":{}}')[0])
-            code, _ = self._run(
-                claude_pre_tool_use,
-                '{"tool_name":"Bash","tool_input":{"command":"claude -p nested"}}',
-            )
-            self.assertEqual(2, code)
+            code, message = self._run(claude_pre_tool_use, '{"tool_name":"Edit","tool_input":{}}')
+        self.assertEqual(2, code)
+        self.assertIn("orchestrator", message)
+
+    def test_execution_record_outside_runtime_root_is_not_trusted(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runtime_root = root / "runtime"
+            environment = self._execution_environment(root / "outside", write=True)
+            with patch("cross_harness.hooks.load_config", return_value={"runtime_root": str(runtime_root)}), patch.dict("os.environ", environment, clear=True):
+                code, message = self._run(claude_pre_tool_use, '{"tool_name":"Write","tool_input":{}}')
+        self.assertEqual(2, code)
+        self.assertIn("orchestrator", message)
+
+    def test_non_claude_execution_record_is_not_trusted(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runtime_root = Path(folder) / "runtime"
+            environment = self._execution_environment(runtime_root, harness="codex", write=True)
+            with patch("cross_harness.hooks.load_config", return_value={"runtime_root": str(runtime_root)}), patch.dict("os.environ", environment, clear=True):
+                code, message = self._run(claude_pre_tool_use, '{"tool_name":"Write","tool_input":{}}')
+        self.assertEqual(2, code)
+        self.assertIn("orchestrator", message)
 
     def test_codex_nested_claude_is_blocked(self):
         code, message = self._run(codex_pre_tool_use, '{"tool_name":"Bash","tool_input":{"command":"env /opt/homebrew/bin/claude -p hi"}}')

@@ -11,6 +11,7 @@ import sys
 
 from .auth import detected_api_keys, sanitized_environment, verify_codex_chatgpt
 from .config import load_config
+from .errors import ConfigError
 from .files import atomic_write, dump_json
 from .maintenance import cleanup
 from .paths import user_paths
@@ -49,10 +50,42 @@ def _deny(message: str) -> int:
     return 2
 
 
+def _delegated_claude_execution() -> dict | None:
+    """Return a runner-issued Claude execution record, or None on any uncertainty."""
+    raw_run_dir = os.environ.get("CROSS_HARNESS_RUN_DIR")
+    if not raw_run_dir:
+        return None
+    try:
+        config = load_config(home=user_paths().home)
+        runtime_root = Path(config["runtime_root"]).resolve(strict=True)
+        run_dir = Path(raw_run_dir).resolve(strict=True)
+        if not run_dir.is_dir():
+            return None
+        run_dir.relative_to(runtime_root)
+        record_path = run_dir / "execution.json"
+        if not record_path.is_file():
+            return None
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError, TypeError, KeyError, ConfigError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    if (
+        not isinstance(record.get("role_name"), str)
+        or record.get("harness") != "claude"
+        or not isinstance(record.get("write"), bool)
+        or not isinstance(record.get("kind"), str)
+        or not isinstance(record.get("cwd"), str)
+    ):
+        return None
+    return record
+
+
 def claude_pre_tool_use() -> int:
     name, command = _tool(_input())
-    if os.environ.get("CROSS_HARNESS_EXECUTOR") == "claude":
-        if name in {"Edit", "Write"} and os.environ.get("CROSS_HARNESS_WRITE") != "1":
+    execution = _delegated_claude_execution()
+    if execution is not None:
+        if name in {"Edit", "Write"} and not execution["write"]:
             return _deny("cross-harness: delegated Claude has read-only access")
         if name == "Bash" and (
             CODEX_EXEC.search(command)

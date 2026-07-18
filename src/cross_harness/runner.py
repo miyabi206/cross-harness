@@ -94,6 +94,17 @@ def _write_baseline(run_dir: Path, cwd: Path) -> None:
     }))
 
 
+def _write_execution_record(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path) -> None:
+    """Record the runner-authorized execution identity before starting an executor."""
+    atomic_write(run_dir / "execution.json", dump_json({
+        "role_name": role_name,
+        "harness": role["harness"],
+        "write": role["write"],
+        "kind": kind,
+        "cwd": str(cwd),
+    }))
+
+
 def _execution_delta(run_dir: Path, current: list[dict]) -> tuple[list[dict], set[str]]:
     baseline_path = run_dir / "baseline.json"
     if not baseline_path.exists():
@@ -290,6 +301,7 @@ def delegate(
     else:
         environment.pop("CROSS_HARNESS_WRITE", None)
     command = _command(codex, role, execution_root, run_dir)
+    _write_execution_record(run_dir, role_name, role, kind, execution_root)
     atomic_write(run_dir / "command.json", dump_json({"argv": command, "auth_cached": cached, "cwd": str(execution_root)}))
     exit_code = _invoke_safe(command, task, environment, execution_root, run_dir, role["timeout_seconds"])
     return finalize_run(run_dir, role_name, role, kind, execution_root, exit_code, attempt=1)
@@ -698,6 +710,7 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
     else:
         environment.pop("CROSS_HARNESS_WRITE", None)
     command = _command(codex, role, Path(state["cwd"]), retry_root, state["thread_id"])
+    _write_execution_record(retry_root, state["role"], role, state["kind"], Path(state["cwd"]))
     atomic_write(retry_root / "command.json", dump_json({"argv": command, "auth_cached": cached, "resume": state["thread_id"]}))
     exit_code = _invoke_safe(command, task_file.read_text(encoding="utf-8"), environment, Path(state["cwd"]), retry_root, role["timeout_seconds"])
     summary = finalize_run(retry_root, state["role"], role, state["kind"], Path(state["cwd"]), exit_code, state["attempts"] + 1)
@@ -712,6 +725,7 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         shutil.copy2(task_file, escalation_root / "task.md")
         _write_baseline(escalation_root, Path(state["cwd"]))
         command = _command(codex, escalation, Path(state["cwd"]), escalation_root, summary.get("thread_id") or state["thread_id"])
+        _write_execution_record(escalation_root, state["role"], escalation, state["kind"], Path(state["cwd"]))
         atomic_write(escalation_root / "command.json", dump_json({"argv": command, "escalation": True, "previous_run": str(retry_root)}))
         code = _invoke_safe(command, task_file.read_text(encoding="utf-8"), environment | {"CROSS_HARNESS_RUN_DIR": str(escalation_root)}, Path(state["cwd"]), escalation_root, escalation["timeout_seconds"])
         escalated_summary = finalize_run(escalation_root, state["role"], escalation, state["kind"], Path(state["cwd"]), code, new_state["attempts"] + 1)
