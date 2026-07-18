@@ -147,6 +147,30 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("success", summary["error"])
         self.assertIn("partial", summary["error"])
 
+    def test_finalized_dict_tests_are_normalized_and_artifacts_are_written(self):
+        run = self.root / "dict-tests-run"
+        run.mkdir()
+        (run / "events.jsonl").write_text('{"type":"turn.completed","usage":{}}\n')
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "tested",
+            "changed_files": [{"z": 1, "a": "result"}, 3],
+            "tests": [{"result": "passed", "command": "uv run pytest -q"}],
+            "error": None, "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-luna", "effort": "low", "output_limit_chars": 8000}
+
+        summary = finalize_run(run, "tester", role, "test", self.repo, 0, 1)
+
+        expected_test = '{"command": "uv run pytest -q", "result": "passed"}'
+        expected_changed = ['{"a": "result", "z": 1}', "3"]
+        self.assertEqual([expected_test], summary["tests"])
+        self.assertEqual(expected_changed, summary["changed_files"])
+        self.assertTrue((run / "summary.txt").exists())
+        self.assertTrue((run / "summary.json").exists())
+        self.assertIn(expected_test, (run / "summary.txt").read_text())
+        self.assertEqual([expected_test], json.loads((run / "summary.json").read_text())["tests"])
+
     def test_large_event_log_is_preserved_and_summary_compresses_over_ninety_percent(self):
         run = self.root / "large-output-run"
         run.mkdir()

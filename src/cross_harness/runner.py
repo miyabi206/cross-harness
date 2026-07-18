@@ -24,7 +24,7 @@ from .config import CLAUDE_EFFORTS, CODEX_EFFORTS, load_config, project_config
 from .errors import AuthError, ConfigError, DirtyWorktreeError, HarnessError, SupervisorDiedError
 from .files import atomic_write, dump_json, sha256
 from .paths import source_root, user_paths
-from .summarize import failure_signature, load_final, parse_events, render_summary
+from .summarize import failure_signature, load_final, parse_events, render_summary, summary_item_text
 from .taskfile import contains_secret
 
 
@@ -730,6 +730,7 @@ def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path
         combined_error = f"{combined_error}\n{readonly_error}".strip()
     atomic_write(run_dir / "diff-stat.txt", diff_stat)
     reported_changed = final.get("changed_files") if isinstance(final.get("changed_files"), list) else []
+    reported_changed = [summary_item_text(name) for name in reported_changed]
     filtered_reported = [name for name in reported_changed if name not in baseline_names or name in detected_changed]
     changed = list(dict.fromkeys([*detected_changed, *filtered_reported]))
     signature = failure_signature(exit_code, parsed, stderr)
@@ -738,6 +739,8 @@ def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path
         reported_tests = [reported_tests]
     elif not isinstance(reported_tests, list):
         reported_tests = []
+    else:
+        reported_tests = [summary_item_text(test) for test in reported_tests]
     summary = {
         "status": status,
         "run_dir": str(run_dir),

@@ -74,6 +74,21 @@ class FileTests(unittest.TestCase):
         self.assertLessEqual(len(rendered), 1000)
         self.assertIn("summary truncated", rendered)
 
+    def test_summary_renders_non_string_list_items_deterministically(self):
+        summary = {
+            "status": "success", "run_dir": "/tmp/run", "exit_code": 0,
+            "role": "tester", "model": "luna", "effort": "medium",
+            "changed_files": [{"z": 1, "a": "file"}, 42],
+            "tests": [{"result": "passed", "command": "uv run pytest -q"}, 7],
+            "event_log": "/tmp/run/events.jsonl", "stderr_log": "/tmp/run/stderr.log",
+            "final_message": "/tmp/run/final.json",
+        }
+
+        rendered = render_summary(summary, 10_000)
+
+        self.assertIn('changed_files: {"a": "file", "z": 1}, 42', rendered)
+        self.assertIn('tests: {"command": "uv run pytest -q", "result": "passed"}; 7', rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

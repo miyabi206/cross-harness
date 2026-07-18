@@ -202,6 +202,16 @@ def failure_signature(exit_code: int, parsed: dict, stderr: str = "") -> str | N
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def summary_item_text(value: object) -> str:
+    """Return a deterministic, readable representation for summary list items."""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def render_summary(summary: dict, limit: int) -> str:
     lines = [
         f"status: {summary['status']}",
@@ -210,8 +220,8 @@ def render_summary(summary: dict, limit: int) -> str:
         f"role: {summary['role']}",
         f"model: {summary['model']}",
         f"effort: {summary['effort']}",
-        f"changed_files: {', '.join(summary.get('changed_files', [])) or 'none'}",
-        f"tests: {'; '.join(summary.get('tests', [])) or 'not reported'}",
+        f"changed_files: {', '.join(summary_item_text(item) for item in summary.get('changed_files', [])) or 'none'}",
+        f"tests: {'; '.join(summary_item_text(item) for item in summary.get('tests', [])) or 'not reported'}",
     ]
     for item in summary.get("diff_summary", []):
         if item.get("removed_preexisting_change"):
