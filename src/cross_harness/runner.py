@@ -13,7 +13,12 @@ import threading
 import time
 import uuid
 
-from .auth import sanitized_environment, verify_codex_chatgpt, verify_codex_config_ownership
+from .auth import (
+    sanitized_environment,
+    verify_claude_subscription,
+    verify_codex_chatgpt,
+    verify_codex_config_ownership,
+)
 from .config import load_config, project_config
 from .errors import AuthError, ConfigError, DirtyWorktreeError, HarnessError, SupervisorDiedError
 from .files import atomic_write, dump_json, sha256
@@ -206,10 +211,15 @@ def _invoke_inner(command: list[str], task: str, env: dict[str, str], cwd: Path,
             process.stderr.close()
 
 
-def _command(codex: Path, role: dict, cwd: Path, run_dir: Path, resume: str | None = None) -> list[str]:
+def _delegation_schema() -> Path:
     schema = source_root() / "schemas/delegation-result.schema.json"
     if not schema.exists():
         schema = user_paths().install_root / "schemas/delegation-result.schema.json"
+    return schema
+
+
+def _codex_command(codex: Path, role: dict, cwd: Path, run_dir: Path, resume: str | None = None) -> list[str]:
+    schema = _delegation_schema()
     base = [str(codex), "exec"]
     if resume:
         return [
@@ -234,6 +244,35 @@ def _command(codex: Path, role: dict, cwd: Path, run_dir: Path, resume: str | No
     ]
 
 
+def _claude_command(claude: Path, role: dict, run_dir: Path) -> list[str]:
+    schema = _delegation_schema()
+    permission_mode = "acceptEdits" if role["write"] else "plan"
+    final_path = run_dir / "final.json"
+    result_instruction = (
+        "When the task is complete, write a JSON object conforming to "
+        f"{schema} to {final_path}. This file must contain only the result object. "
+        "Do not include credentials or authentication material."
+    )
+    return [
+        str(claude), "-p",
+        "--model", role["model"],
+        "--effort", role["effort"],
+        "--output-format", "stream-json",
+        "--permission-mode", permission_mode,
+        "--append-system-prompt", result_instruction,
+    ]
+
+
+def _command(executor: Path, role: dict, cwd: Path, run_dir: Path, resume: str | None = None) -> list[str]:
+    if role["harness"] == "codex":
+        return _codex_command(executor, role, cwd, run_dir, resume)
+    if role["harness"] == "claude":
+        if resume:
+            raise HarnessError("retry is not supported for Claude roles")
+        return _claude_command(executor, role, run_dir)
+    raise ConfigError(f"unsupported harness: {role['harness']}")
+
+
 def delegate(
     role_name: str,
     kind: str,
@@ -251,8 +290,6 @@ def delegate(
     if role_name not in config["roles"]:
         raise ConfigError(f"unknown role: {role_name}")
     role = dict(config["roles"][role_name])
-    if role["harness"] != "codex":
-        raise ConfigError(f"role {role_name} is assigned to Claude, not Codex")
     if kind not in config["delegate_kinds"] or kind not in role["delegate_kinds"]:
         raise ConfigError(f"delegation kind {kind!r} is not allowed for {role_name}")
     if role_name == "security_reviewer" and not confirm_high_risk:
@@ -286,13 +323,18 @@ def delegate(
         execution_root = _create_isolated_worktree(root, run_dir)
     _write_baseline(run_dir, execution_root)
     try:
-        verify_codex_config_ownership(paths.home, root, execution_root)
-        codex, cached = verify_codex_chatgpt(runtime_root, paths.home, config["auth_cache_hours"])
+        if role["harness"] == "codex":
+            verify_codex_config_ownership(paths.home, root, execution_root)
+            executor, cached = verify_codex_chatgpt(runtime_root, paths.home, config["auth_cache_hours"])
+        elif role["harness"] == "claude":
+            executor, cached = verify_claude_subscription(runtime_root, paths.home, config["auth_cache_hours"])
+        else:
+            raise ConfigError(f"unsupported harness: {role['harness']}")
     except AuthError as exc:
         return finalize_blocked_run(run_dir, role_name, role, kind, execution_root, str(exc), "authentication")
     environment = sanitized_environment(paths.home, {
         "CROSS_HARNESS_ACTIVE": "1",
-        "CROSS_HARNESS_EXECUTOR": "codex",
+        "CROSS_HARNESS_EXECUTOR": role["harness"],
         "CROSS_HARNESS_PARENT": "claude",
         "CROSS_HARNESS_RUN_DIR": str(run_dir),
     })
@@ -300,7 +342,7 @@ def delegate(
         environment["CROSS_HARNESS_WRITE"] = "1"
     else:
         environment.pop("CROSS_HARNESS_WRITE", None)
-    command = _command(codex, role, execution_root, run_dir)
+    command = _command(executor, role, execution_root, run_dir)
     _write_execution_record(run_dir, role_name, role, kind, execution_root)
     atomic_write(run_dir / "command.json", dump_json({"argv": command, "auth_cached": cached, "cwd": str(execution_root)}))
     exit_code = _invoke_safe(command, task, environment, execution_root, run_dir, role["timeout_seconds"])
@@ -324,8 +366,6 @@ def start_detached_delegate(
     if role_name not in config["roles"]:
         raise ConfigError(f"unknown role: {role_name}")
     role = config["roles"][role_name]
-    if role["harness"] != "codex":
-        raise ConfigError(f"role {role_name} is assigned to Claude, not Codex")
     if kind not in config["delegate_kinds"] or kind not in role["delegate_kinds"]:
         raise ConfigError(f"delegation kind {kind!r} is not allowed for {role_name}")
     if role_name == "security_reviewer" and not confirm_high_risk:
@@ -501,7 +541,7 @@ def finalize_blocked_run(
 ) -> dict:
     final = {
         "status": "blocked",
-        "work_completed": "Codex was not started.",
+        "work_completed": "Executor was not started.",
         "changed_files": [],
         "tests": [],
         "error": reason,
@@ -674,6 +714,8 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         raise HarnessError(f"run state not found: {state_path}")
     state = json.loads(state_path.read_text(encoding="utf-8"))
     role = dict(config["roles"][state["role"]])
+    if role["harness"] == "claude":
+        raise HarnessError("retry is not supported for Claude roles")
     if state["status"] == "blocked":
         raise HarnessError("blocked runs cannot be retried automatically")
     if state["attempts"] > role["retries"]:

@@ -9,7 +9,7 @@ import time
 import unittest
 
 from cross_harness.errors import AuthError, DirtyWorktreeError, HarnessError, SupervisorDiedError
-from cross_harness.runner import _invoke_safe, delegate, retry, start_detached_delegate, wait_for_run
+from cross_harness.runner import _claude_command, _invoke_safe, delegate, retry, start_detached_delegate, wait_for_run
 from cross_harness.runner import finalize_run
 
 
@@ -178,6 +178,86 @@ class RunnerTests(unittest.TestCase):
         with patch.dict(os.environ, {"CROSS_HARNESS_ACTIVE": "1"}):
             with self.assertRaisesRegex(HarnessError, "nested cross-harness"):
                 delegate("tester", "test", self.task, self.repo, home=self.home)
+
+    def test_claude_command_uses_headless_streaming_and_minimal_permissions(self):
+        run = self.root / "claude-run"
+        read_only = {
+            "harness": "claude", "model": "sonnet", "effort": "high", "write": False,
+        }
+        command = _claude_command(Path("/usr/local/bin/claude"), read_only, run)
+        self.assertEqual("-p", command[1])
+        self.assertEqual("stream-json", command[command.index("--output-format") + 1])
+        self.assertEqual("plan", command[command.index("--permission-mode") + 1])
+        self.assertEqual("sonnet", command[command.index("--model") + 1])
+        self.assertNotIn("-C", command)
+        self.assertNotIn("bypassPermissions", command)
+        self.assertIn(str(run / "final.json"), command[command.index("--append-system-prompt") + 1])
+
+        writable = dict(read_only, write=True)
+        write_command = _claude_command(Path("/usr/local/bin/claude"), writable, run)
+        self.assertEqual("acceptEdits", write_command[write_command.index("--permission-mode") + 1])
+
+    @patch("cross_harness.runner.verify_codex_chatgpt")
+    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner.verify_claude_subscription")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_claude_delegation_selects_claude_auth_and_executor(self, invoke, verify_claude, ownership, verify_codex):
+        verify_claude.return_value = (Path("/usr/local/bin/claude"), False)
+
+        def complete(command, task, env, cwd, run_dir, timeout):
+            self.assertEqual("claude", env["CROSS_HARNESS_EXECUTOR"])
+            self.assertEqual("plan", command[command.index("--permission-mode") + 1])
+            (run_dir / "events.jsonl").write_text(
+                '{"type":"result","session_id":"session-1","is_error":false,"usage":{"input_tokens":10,"output_tokens":2}}\n'
+            )
+            (run_dir / "stderr.log").write_text("")
+            (run_dir / "final.json").write_text(json.dumps({
+                "status": "success", "work_completed": "reviewed", "changed_files": [],
+                "tests": ["review"], "error": None, "next_decision": None,
+            }))
+            return 0
+
+        invoke.side_effect = complete
+        summary = delegate("reviewer", "review", self.task, self.repo, home=self.home)
+        run = Path(summary["run_dir"])
+        self.assertEqual("success", summary["status"])
+        self.assertEqual("session-1", summary["thread_id"])
+        self.assertEqual("claude", json.loads((run / "execution.json").read_text())["harness"])
+        self.assertFalse(json.loads((run / "execution.json").read_text())["write"])
+        verify_claude.assert_called_once()
+        verify_codex.assert_not_called()
+        ownership.assert_not_called()
+
+    @patch("cross_harness.runner.verify_claude_subscription")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_claude_write_role_records_write_authorization(self, invoke, verify_claude):
+        config = self.root / "claude-implementer.toml"
+        contents = (Path(__file__).resolve().parents[1] / "config/default.toml").read_text()
+        config.write_text(contents.replace(
+            '[roles.implementer]\nharness = "codex"',
+            '[roles.implementer]\nharness = "claude"',
+            1,
+        ))
+        verify_claude.return_value = (Path("/usr/local/bin/claude"), False)
+
+        def complete(command, task, env, cwd, run_dir, timeout):
+            self.assertEqual("claude", env["CROSS_HARNESS_EXECUTOR"])
+            self.assertEqual("acceptEdits", command[command.index("--permission-mode") + 1])
+            (run_dir / "events.jsonl").write_text('{"type":"result","is_error":false,"usage":{}}\n')
+            (run_dir / "stderr.log").write_text("")
+            (run_dir / "final.json").write_text(json.dumps({
+                "status": "success", "work_completed": "implemented", "changed_files": [],
+                "tests": [], "error": None, "next_decision": None,
+            }))
+            return 0
+
+        invoke.side_effect = complete
+        summary = delegate("implementer", "implementation", self.task, self.repo, config_path=config, home=self.home)
+        environment = invoke.call_args.args[2]
+        run = Path(summary["run_dir"])
+        self.assertEqual("claude", environment["CROSS_HARNESS_EXECUTOR"])
+        self.assertEqual("1", environment["CROSS_HARNESS_WRITE"])
+        self.assertTrue(json.loads((run / "execution.json").read_text())["write"])
 
     def test_retry_budget_exhaustion_stops_before_auth_or_executor(self):
         previous = self.root / "retry-exhausted"

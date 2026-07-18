@@ -27,6 +27,13 @@ def parse_events(path: Path) -> dict:
                 result["thread_id"] = event.get("thread_id")
             elif kind == "turn.completed":
                 result["usage"] = event.get("usage", {})
+            elif kind == "result":
+                result["thread_id"] = event.get("session_id", result["thread_id"])
+                usage = event.get("usage")
+                if isinstance(usage, dict):
+                    result["usage"] = usage
+                if event.get("is_error") is True:
+                    result["errors"].append(_event_text(event))
             elif kind in {"turn.failed", "error"}:
                 result["errors"].append(_event_text(event))
             item = event.get("item")
@@ -42,7 +49,7 @@ def parse_events(path: Path) -> dict:
 
 
 def _event_text(event: dict) -> str:
-    for key in ("message", "error", "detail"):
+    for key in ("message", "error", "detail", "result"):
         value = event.get(key)
         if isinstance(value, str):
             return value

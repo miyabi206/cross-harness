@@ -1,8 +1,15 @@
 from pathlib import Path
+from unittest.mock import patch
+import subprocess
 import tempfile
 import unittest
 
-from cross_harness.auth import detected_api_keys, sanitized_environment, verify_codex_config_ownership
+from cross_harness.auth import (
+    detected_api_keys,
+    sanitized_environment,
+    verify_claude_subscription,
+    verify_codex_config_ownership,
+)
 from cross_harness.errors import AuthError
 
 
@@ -27,6 +34,24 @@ class AuthTests(unittest.TestCase):
             (repo / ".codex/config.toml").write_text('model_provider = "proxy"\n')
             with self.assertRaises(AuthError):
                 verify_codex_config_ownership(home, repo, repo)
+
+    @patch("cross_harness.auth.resolve_claude", return_value=Path("/usr/local/bin/claude"))
+    @patch("cross_harness.auth.subprocess.run")
+    def test_claude_subscription_requires_logged_in_status(self, run, resolve):
+        run.return_value = subprocess.CompletedProcess([], 0, '{"loggedIn": true}', "")
+        with tempfile.TemporaryDirectory() as folder:
+            runtime = Path(folder) / "runtime"
+            cli, cached = verify_claude_subscription(runtime, Path(folder) / "home", 24, environment={"PATH": "/bin"})
+        self.assertEqual(Path("/usr/local/bin/claude"), cli)
+        self.assertFalse(cached)
+        self.assertEqual(["/usr/local/bin/claude", "auth", "status"], run.call_args.args[0])
+
+    @patch("cross_harness.auth.resolve_claude")
+    def test_claude_subscription_rejects_api_key_environment(self, resolve):
+        with tempfile.TemporaryDirectory() as folder:
+            with self.assertRaisesRegex(AuthError, "API-key environment"):
+                verify_claude_subscription(Path(folder) / "runtime", Path(folder) / "home", 24, environment={"ANTHROPIC_API_KEY": "x"})
+        resolve.assert_not_called()
 
 
 if __name__ == "__main__":

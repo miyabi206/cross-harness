@@ -51,6 +51,16 @@ def resolve_codex(environment: dict[str, str] | None = None) -> Path:
     return Path(resolved).resolve()
 
 
+def resolve_claude(environment: dict[str, str] | None = None) -> Path:
+    for candidate in (Path("/opt/homebrew/bin/claude"), Path("/usr/local/bin/claude")):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate.resolve()
+    resolved = shutil.which("claude", path=(environment or os.environ).get("PATH"))
+    if not resolved:
+        raise AuthError("Claude CLI not found on PATH")
+    return Path(resolved).resolve()
+
+
 def verify_codex_chatgpt(
     runtime_root: Path,
     home: Path,
@@ -94,6 +104,57 @@ def verify_codex_chatgpt(
     }
     atomic_write(cache, dump_json(payload))
     return codex, False
+
+
+def verify_claude_subscription(
+    runtime_root: Path,
+    home: Path,
+    cache_hours: int,
+    environment: dict[str, str] | None = None,
+    force: bool = False,
+) -> tuple[Path, bool]:
+    keys = detected_api_keys(environment)
+    if keys:
+        raise AuthError("API-key environment detected; refusing delegation: " + ", ".join(keys))
+    clean = sanitized_environment(home)
+    claude = resolve_claude(clean)
+    cache = runtime_root / "auth" / f"claude-{datetime.now().astimezone().date().isoformat()}.json"
+    if not force and cache.exists():
+        try:
+            data = json.loads(cache.read_text(encoding="utf-8"))
+            checked = datetime.fromisoformat(data["checked_at"])
+            fresh = datetime.now(timezone.utc) - checked <= timedelta(hours=cache_hours)
+            if fresh and data.get("method") == "subscription" and data.get("claude") == str(claude):
+                return claude, True
+        except (KeyError, ValueError, json.JSONDecodeError):
+            pass
+    try:
+        result = subprocess.run(
+            [str(claude), "auth", "status"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            env=clean,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AuthError(f"could not verify Claude authentication: {exc}") from exc
+    output = f"{result.stdout}\n{result.stderr}"
+    try:
+        status = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        status = None
+    compact = output.replace(" ", "").lower()
+    logged_in = isinstance(status, dict) and status.get("loggedIn") is True
+    if result.returncode != 0 or not (logged_in or '"loggedin":true' in compact):
+        raise AuthError("Claude subscription authentication was not proven; run `claude auth login`")
+    payload = {
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "method": "subscription",
+        "claude": str(claude),
+    }
+    atomic_write(cache, dump_json(payload))
+    return claude, False
 
 
 def verify_codex_config_ownership(home: Path, repo_root: Path, cwd: Path) -> None:

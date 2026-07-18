@@ -42,7 +42,7 @@ def parser() -> argparse.ArgumentParser:
     uninstall_parser.add_argument("--preserve-user-changes", action="store_true")
     uninstall_parser.add_argument("--purge-runtime", action="store_true")
 
-    delegate_parser = commands.add_parser("delegate", help="run a bounded Codex task")
+    delegate_parser = commands.add_parser("delegate", help="run a bounded delegated task")
     delegate_parser.add_argument("--role", required=True)
     delegate_parser.add_argument("--kind", required=True)
     delegate_parser.add_argument("--task-file", required=True, type=Path)

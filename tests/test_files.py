@@ -3,7 +3,7 @@ import tempfile
 import unittest
 
 from cross_harness.files import MARKER_START, append_marker, atomic_write, remove_marker
-from cross_harness.summarize import failure_signature, render_summary
+from cross_harness.summarize import failure_signature, parse_events, render_summary
 
 
 class FileTests(unittest.TestCase):
@@ -26,6 +26,18 @@ class FileTests(unittest.TestCase):
         second = failure_signature(1, {"errors": ["test failed at 99.8s address 0xdef999"], "commands": []})
         self.assertEqual(first, second)
 
+    def test_parse_events_reads_claude_stream_result(self):
+        with tempfile.TemporaryDirectory() as folder:
+            events = Path(folder) / "events.jsonl"
+            events.write_text(
+                '{"type":"result","session_id":"session-123","is_error":true,'
+                '"result":"permission denied","usage":{"input_tokens":3,"output_tokens":1}}\n'
+            )
+            parsed = parse_events(events)
+        self.assertEqual("session-123", parsed["thread_id"])
+        self.assertEqual({"input_tokens": 3, "output_tokens": 1}, parsed["usage"])
+        self.assertEqual(["permission denied"], parsed["errors"])
+
     def test_summary_is_bounded_and_points_to_raw_artifacts(self):
         summary = {
             "status": "failed", "run_dir": "/tmp/run", "exit_code": 1,
@@ -41,4 +53,3 @@ class FileTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
