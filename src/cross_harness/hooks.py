@@ -28,6 +28,28 @@ HARNESS_DELEGATION = re.compile(
 HARNESS_REDELEGATION = re.compile(
     rf"(?:^|{SHELL_BOUNDARY})(?:[^\s;&|()'\"`]*/)?cross-harness\s+(?:delegate|retry|task\s+create)(?=$|{SHELL_BOUNDARY})"
 )
+SIMPLE_WRAPPER_UNSAFE_SYNTAX = re.compile(r"[;&|()\n\r`<>{}]")
+
+
+def _installed_wrapper_arguments(command: str) -> str | None:
+    """Return wrapper arguments only for an unambiguously single wrapper command.
+
+    This intentionally does not parse shell syntax.  It recognizes just the
+    installed wrapper's literal absolute path at the start of a command and
+    rejects every shell construct that could introduce another command.
+    """
+    executable = user_paths().executable
+    if not executable.is_absolute():
+        return None
+    expected = str(executable)
+    if not command.startswith(expected):
+        return None
+    arguments = command[len(expected):]
+    if arguments and arguments[0] not in " \t":
+        return None
+    if SIMPLE_WRAPPER_UNSAFE_SYNTAX.search(command):
+        return None
+    return arguments
 
 
 def _input() -> dict:
@@ -96,7 +118,9 @@ def claude_pre_tool_use() -> int:
         return 0
     if name in {"Edit", "Write"}:
         return _deny("cross-harness: Claude is the orchestrator; delegate project edits through cross-harness")
-    if name == "Bash" and CODEX_EXEC.search(command):
+    wrapper_arguments = _installed_wrapper_arguments(command)
+    executor_scan = command if wrapper_arguments is None else ""
+    if name == "Bash" and CODEX_EXEC.search(executor_scan):
         return _deny("cross-harness: direct codex exec is blocked; use cross-harness delegate with a task file")
     if name == "Bash" and BARE_WRAPPER.search(command):
         expected = user_paths().executable.resolve()
@@ -108,9 +132,11 @@ def claude_pre_tool_use() -> int:
 
 def codex_pre_tool_use() -> int:
     _, command = _tool(_input())
-    if CLAUDE_EXEC.search(command):
+    wrapper_arguments = _installed_wrapper_arguments(command)
+    executor_scan = command if wrapper_arguments is None else ""
+    if CLAUDE_EXEC.search(executor_scan):
         return _deny("cross-harness: nested Claude launch from Codex is blocked")
-    if CODEX_EXEC.search(command) or HARNESS_DELEGATION.search(command):
+    if CODEX_EXEC.search(executor_scan) or HARNESS_DELEGATION.search(command):
         return _deny("cross-harness: nested executor launch from delegated Codex is blocked")
     return 0
 
