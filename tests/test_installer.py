@@ -65,7 +65,10 @@ class InstallerTests(unittest.TestCase):
             config = home / ".config/cross-harness/config.toml"
             config.parent.mkdir(parents=True)
             contents = (repo / "config/default.toml").read_text(encoding="utf-8")
-            contents = contents.replace('model = "haiku"', 'model = "custom explorer"')
+            contents = contents.replace(
+                '[roles.explorer]\nharness = "claude"\nmodel = "haiku"',
+                '[roles.explorer]\nharness = "claude"\nmodel = "custom explorer"',
+            )
             contents = contents.replace('effort = "low"', 'effort = "future-effort"')
             contents = contents.replace('model = "opus"', 'model = "custom-reviewer"')
             contents = contents.replace(
@@ -77,8 +80,8 @@ class InstallerTests(unittest.TestCase):
                 '[roles.implementer]\nharness = "claude"\nmodel = "custom-implementer"\neffort = "implement-effort"',
             )
             contents = contents.replace(
-                '[roles.tester]\nharness = "codex"\nmodel = "gpt-5.6-luna"\neffort = "medium"',
-                '[roles.tester]\nharness = "claude"\nmodel = "custom-tester"\neffort = "test-effort"',
+                'harness = "claude"\nmodel = "haiku"\neffort = "medium"',
+                'harness = "claude"\nmodel = "custom-tester"\neffort = "test-effort"',
             )
             contents = contents.replace(
                 '[roles.debugger]\nharness = "codex"\nmodel = "gpt-5.6-sol"\neffort = "high"',

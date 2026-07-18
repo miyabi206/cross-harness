@@ -41,7 +41,7 @@ class RunnerTests(unittest.TestCase):
 
     def fake_invoke(self, command, task, env, cwd, run_dir, timeout):
         self.assertEqual("1", env["CROSS_HARNESS_ACTIVE"])
-        self.assertEqual("codex", env["CROSS_HARNESS_EXECUTOR"])
+        self.assertIn(env["CROSS_HARNESS_EXECUTOR"], {"claude", "codex"})
         (run_dir / "events.jsonl").write_text(
             '{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000001"}\n'
             '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}\n'
@@ -53,8 +53,8 @@ class RunnerTests(unittest.TestCase):
         }))
         return 0
 
-    @patch("cross_harness.runner.verify_codex_chatgpt")
-    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner.verify_claude_subscription")
+    @patch("cross_harness.runner.verify_claude_config_ownership")
     @patch("cross_harness.runner._invoke_safe")
     def test_read_only_delegation_generates_bounded_artifacts(self, invoke, ownership, verify):
         verify.return_value = (Path("/usr/bin/true"), False)
@@ -67,6 +67,7 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue((run / "summary.txt").exists())
         self.assertTrue((run / "baseline.json").exists())
         self.assertEqual(1, invoke.call_count)
+        self.assertEqual("claude", invoke.call_args.args[2]["CROSS_HARNESS_EXECUTOR"])
 
     @patch("cross_harness.runner.verify_codex_chatgpt")
     @patch("cross_harness.runner.verify_codex_config_ownership")
@@ -79,8 +80,8 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("1", environment["CROSS_HARNESS_WRITE"])
         self.assertEqual("success", summary["status"])
 
-    @patch("cross_harness.runner.verify_codex_chatgpt")
-    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner.verify_claude_subscription")
+    @patch("cross_harness.runner.verify_claude_config_ownership")
     @patch("cross_harness.runner._invoke_safe")
     def test_read_only_summary_excludes_preexisting_untracked_file(self, invoke, ownership, verify):
         (self.repo / "mine.txt").write_text("pre-existing\n")
@@ -107,8 +108,8 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("dirty_worktree", state["blocked_category"])
         self.assertTrue((runs[0] / "BLOCKED").exists())
 
-    @patch("cross_harness.runner.verify_codex_chatgpt", side_effect=AuthError("not logged in"))
-    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner.verify_claude_subscription", side_effect=AuthError("not logged in"))
+    @patch("cross_harness.runner.verify_claude_config_ownership")
     @patch("cross_harness.runner._invoke_safe")
     def test_auth_failure_saves_blocked_state_before_codex(self, invoke, ownership, verify):
         summary = delegate("tester", "test", self.task, self.repo, home=self.home)
@@ -811,19 +812,12 @@ class RunnerTests(unittest.TestCase):
     def test_detached_supervisor_receives_package_path_for_clean_interpreter(self):
         fake_bin = self.root / "bin"
         fake_bin.mkdir()
-        fake_codex = fake_bin / "codex"
-        fake_codex.write_text(
+        fake_claude = fake_bin / "claude"
+        fake_claude.write_text(
             "#!/bin/sh\n"
-            "if [ \"$1\" = login ]; then echo 'Logged in using ChatGPT'; exit 0; fi\n"
-            "output=''\n"
-            "while [ \"$#\" -gt 0 ]; do\n"
-            "  if [ \"$1\" = -o ]; then shift; output=$1; fi\n"
-            "  shift\n"
-            "done\n"
-            "printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"00000000-0000-0000-0000-000000000001\"}' '{\"type\":\"turn.completed\",\"usage\":{}}'\n"
-            "printf '%s\\n' '{\"status\":\"success\",\"work_completed\":\"finished\",\"changed_files\":[],\"tests\":[],\"error\":null,\"next_decision\":null}' > \"$output\"\n"
+            "printf '%s\\n' '{\"type\":\"result\",\"session_id\":\"00000000-0000-0000-0000-000000000001\",\"is_error\":false,\"usage\":{},\"result\":\"{\\\"status\\\":\\\"success\\\",\\\"work_completed\\\":\\\"finished\\\",\\\"changed_files\\\":[],\\\"tests\\\":[],\\\"error\\\":null,\\\"next_decision\\\":null}\"}'\n"
         )
-        fake_codex.chmod(0o755)
+        fake_claude.chmod(0o755)
         clean_interpreter = self.root / "clean-python"
         clean_interpreter.write_text(
             "#!/bin/sh\n"
@@ -831,8 +825,8 @@ class RunnerTests(unittest.TestCase):
             "import os, runpy, sys\n"
             "from pathlib import Path\n"
             "import cross_harness.runner\n"
-            "cross_harness.runner.verify_codex_chatgpt = lambda *args: (Path(os.environ[\"TEST_FAKE_CODEX\"]), False)\n"
-            "cross_harness.runner.verify_codex_config_ownership = lambda *args: None\n"
+            "cross_harness.runner.verify_claude_subscription = lambda *args: (Path(os.environ[\"TEST_FAKE_CLAUDE\"]), False)\n"
+            "cross_harness.runner.verify_claude_config_ownership = lambda *args: None\n"
             "sys.argv = [\"cross-harness\", *sys.argv[3:]]\n"
             "runpy.run_module(\"cross_harness.cli\", run_name=\"__main__\")\n"
             "' \"$@\"\n"
@@ -841,7 +835,7 @@ class RunnerTests(unittest.TestCase):
         environment = {
             "PATH": f"{fake_bin}{os.pathsep}/usr/bin:/bin",
             "CROSS_HARNESS_TEST_PYTHON": sys.executable,
-            "TEST_FAKE_CODEX": str(fake_codex),
+            "TEST_FAKE_CLAUDE": str(fake_claude),
         }
         with patch.dict(os.environ, environment, clear=True), patch(
             "cross_harness.runner.sys.executable", str(clean_interpreter)
@@ -886,36 +880,29 @@ class RunnerTests(unittest.TestCase):
     def test_detached_supervisor_finalizes_after_foreground_is_killed(self):
         fake_bin = self.root / "bin"
         fake_bin.mkdir()
-        fake_codex = fake_bin / "codex"
-        fake_codex.write_text(
+        fake_claude = fake_bin / "claude"
+        fake_claude.write_text(
             "#!/bin/sh\n"
-            "if [ \"$1\" = login ]; then echo 'Logged in using ChatGPT'; exit 0; fi\n"
             "touch \"$CROSS_HARNESS_RUN_DIR/fake-running\"\n"
-            "output=''\n"
-            "while [ \"$#\" -gt 0 ]; do\n"
-            "  if [ \"$1\" = -o ]; then shift; output=$1; fi\n"
-            "  shift\n"
-            "done\n"
             "sleep 1\n"
-            "printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"00000000-0000-0000-0000-000000000001\"}' '{\"type\":\"turn.completed\",\"usage\":{}}'\n"
-            "printf '%s\\n' '{\"status\":\"success\",\"work_completed\":\"finished after detach\",\"changed_files\":[],\"tests\":[],\"error\":null,\"next_decision\":null}' > \"$output\"\n"
+            "printf '%s\\n' '{\"type\":\"result\",\"session_id\":\"00000000-0000-0000-0000-000000000001\",\"is_error\":false,\"usage\":{},\"result\":\"{\\\"status\\\":\\\"success\\\",\\\"work_completed\\\":\\\"finished after detach\\\",\\\"changed_files\\\":[],\\\"tests\\\":[],\\\"error\\\":null,\\\"next_decision\\\":null}\"}'\n"
         )
-        fake_codex.chmod(0o755)
+        fake_claude.chmod(0o755)
         injector = self.root / "injector"
         injector.mkdir()
         (injector / "sitecustomize.py").write_text(
             "import os\n"
             "from pathlib import Path\n"
             "import cross_harness.runner\n"
-            "cross_harness.runner.verify_codex_chatgpt = lambda *args: (Path(os.environ['TEST_FAKE_CODEX']), False)\n"
-            "cross_harness.runner.verify_codex_config_ownership = lambda *args: None\n"
+            "cross_harness.runner.verify_claude_subscription = lambda *args: (Path(os.environ['TEST_FAKE_CLAUDE']), False)\n"
+            "cross_harness.runner.verify_claude_config_ownership = lambda *args: None\n"
         )
         environment = os.environ.copy()
         environment.pop("CROSS_HARNESS_ACTIVE", None)
         environment.update({
             "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
             "PYTHONPATH": os.pathsep.join([str(injector), str(Path(__file__).resolve().parents[1] / "src")]),
-            "TEST_FAKE_CODEX": str(fake_codex),
+            "TEST_FAKE_CLAUDE": str(fake_claude),
         })
         command = [
             sys.executable, "-m", "cross_harness.cli", "--home", str(self.home),
@@ -945,8 +932,8 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue((run_dir / "final.json").is_file())
 
     @patch("cross_harness.runner.failure_signature", return_value="same-signature")
-    @patch("cross_harness.runner.verify_codex_chatgpt")
-    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner.verify_claude_subscription")
+    @patch("cross_harness.runner.verify_claude_config_ownership")
     @patch("cross_harness.runner._invoke_safe")
     def test_identical_failure_triggers_exactly_one_escalation(self, invoke, ownership, verify, signature):
         previous = self.root / "previous"
@@ -955,13 +942,13 @@ class RunnerTests(unittest.TestCase):
             "role": "tester", "kind": "test", "cwd": str(self.repo),
             "thread_id": "00000000-0000-0000-0000-000000000001",
             "attempts": 1, "signatures": ["same-signature"], "escalated": False,
-            "status": "failed", "model": "gpt-5.6-luna", "effort": "medium",
+            "status": "failed", "model": "haiku", "effort": "medium",
         }))
         verify.return_value = (Path("/usr/bin/true"), False)
 
         def fail(command, task, env, cwd, run_dir, timeout):
             self.assertEqual("1", env["CROSS_HARNESS_ACTIVE"])
-            self.assertEqual("codex", env["CROSS_HARNESS_EXECUTOR"])
+            self.assertEqual("claude", env["CROSS_HARNESS_EXECUTOR"])
             self.assertNotIn("CROSS_HARNESS_WRITE", env)
             (run_dir / "events.jsonl").write_text(
                 '{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000002"}\n'
@@ -977,12 +964,12 @@ class RunnerTests(unittest.TestCase):
         invoke.side_effect = fail
         result = retry(previous, self.task, home=self.home)
         self.assertEqual(2, invoke.call_count)
-        self.assertEqual("gpt-5.6-terra", result["model"])
+        self.assertEqual("sonnet", result["model"])
         escalated = json.loads((Path(result["run_dir"]) / "state.json").read_text())
         self.assertTrue(escalated["escalated"])
 
-    @patch("cross_harness.runner.verify_codex_chatgpt", side_effect=AuthError("expired"))
-    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner.verify_claude_subscription", side_effect=AuthError("expired"))
+    @patch("cross_harness.runner.verify_claude_config_ownership")
     @patch("cross_harness.runner._invoke_safe")
     def test_retry_auth_failure_preserves_attempt_history(self, invoke, ownership, verify):
         previous = self.root / "retry-auth-previous"
@@ -991,7 +978,7 @@ class RunnerTests(unittest.TestCase):
             "role": "tester", "kind": "test", "cwd": str(self.repo),
             "thread_id": "00000000-0000-0000-0000-000000000001",
             "attempts": 1, "signatures": ["prior"], "escalated": False,
-            "status": "failed", "model": "gpt-5.6-luna", "effort": "medium",
+            "status": "failed", "model": "haiku", "effort": "medium",
         }))
         summary = retry(previous, self.task, home=self.home)
         state = json.loads((Path(summary["run_dir"]) / "state.json").read_text())

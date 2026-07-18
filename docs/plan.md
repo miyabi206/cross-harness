@@ -239,7 +239,7 @@ Claude Code(司令塔)が要約のみ読み取り、差分と完了条件を検�
 | 明確な単一ファイル修正 | Codex implementer | terra/medium | 日常タスクの標準モデル【公式】 |
 | 通常の複数ファイル実装 | Codex implementer | terra/high | renaiリポジトリハーネスの実績値と一致 |
 | テスト作成 | Codex implementer | terra/medium | 実装より定型性が高い |
-| テスト実行・lint・build | Codex tester | luna/medium | 判断が少なく安価で十分。renai実績値と一致 |
+| テスト実行・lint・build | Claude tester | haiku/medium | implementer(Codex)とのクロスモデル検証を成立させる。Codex read-only sandboxは一切の書き込みを許さず、uvのキャッシュ書き込みを伴う検査を実行できないため |
 | コードレビュー | Claude reviewer subagent+大変更時にCodex reviewer併用 | opus/high+sol/xhigh | 検証はクロスモデルの視点差が有効。最終判断は親が行う |
 | 複雑なデバッグ | Codex debugger | sol/high | 深い推論向けモデル【公式】。失敗でxhighへ |
 | アーキテクチャ設計 | Claude司令塔(親) | fable/xhigh(現行ユーザー設定) | 司令塔の中核責務であり委譲しない |
@@ -253,7 +253,7 @@ Claude Code(司令塔)が要約のみ読み取り、差分と完了条件を検�
 | orchestrator | Claude(親) | fable[1m]/xhigh | 現行ユーザー設定を尊重。親役ハーネスの指定キーを持つが既定はclaude |
 | explorer | Claude subagent | haiku/low | リポジトリ横断の広域調査はCodex explorer(luna/medium)へ切替可能 |
 | implementer | Codex | terra/high | 明確な単一ファイル修正はterra/medium(上のタスク分類表) |
-| tester | Codex | luna/medium | renaiリポジトリハーネスの実績値と一致 |
+| tester | Claude subagent | haiku/medium | implementer(Codex)とのクロスモデル検証。Codex read-only sandboxでは書き込みを伴う検査が静かに失敗するためClaudeを既定とする。Claude read-onlyにはOSレベルのsandboxがなく、ツール制限と実行後のdiff検出で封じ込めるためCodex read-onlyより弱い |
 | reviewer | Claude subagent | opus/high | 大変更・高リスク時はCodex reviewer(sol/xhigh)を併用。最終判断は親 |
 | debugger | Codex | sol/high | 失敗時はxhighへ昇格 |
 | security reviewer | Codex | sol/xhigh | Claude親レビューを併用し、人間の明示確認を必須とする |

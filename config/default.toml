@@ -72,8 +72,10 @@ output_limit_chars = 8000
 delegate_kinds = ["implementation", "test"]
 
 [roles.tester]
-harness = "codex"
-model = "gpt-5.6-luna"
+# Codex read-only disallows every write, so checks that write caches cannot run;
+# returning tester to Codex would make those checks fail silently.
+harness = "claude"
+model = "haiku"
 effort = "medium"
 max_parallel = 1
 retries = 2
