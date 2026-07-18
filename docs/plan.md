@@ -483,3 +483,110 @@ TaskSpec規約の具体形を次のとおり決定した(トークン削減と�
   matrixを含むハーネス検証を未検証扱いにしない。第11節・第12節で残した
   「1タスクがClaudeとCodexの両方のquotaを消費する」懸念は、この観察で継続して
   記録・判断する。
+
+## 17. ハーネス対称性の調査結果と是正計画(2026-07-18)
+
+2026-07-18、ロールのmodel・effort・harnessを双方向に設定可能にする変更を
+行った。しかし、対称化されたのは実行役の起動経路のみであり、その周辺は依然として
+Codex前提であることが調査で判明した。本節はリポジトリ読解に加え、実際のrun
+ディレクトリの記録と実測により確認した。以下では実測済みの事実を「実測確認済み」、
+コード読解から導いた未実測の挙動を「読解確認」と明記し、推測と区別する。
+
+### 確認済みの非対称一覧(優先度順)
+
+#### 実行役側
+
+1. **最優先: read-only Claudeが検査を実行できない(実測確認済み)。**
+   `src/cross_harness/runner.py`の`_claude_command`はwrite=falseで
+   permission-modeをmanualにする。headless実行では承認を要するコマンドが拒否
+   されるため、Claudeロールのtesterとsecurity_reviewerはプロジェクトの検査を
+   実行できない。両ロールをharness=claudeにした実測では、検査を実行しないまま
+   successを返した。これは誤った成功報告を生む。
+2. **watchがClaudeの作業詳細を表示しない(読解確認)。**
+   `src/cross_harness/watch.py`の`format_event`は`item.`で始まるイベント型だけを
+   詳細化する。Claudeのstream-jsonではtype名だけが並び、実行コマンドと変更
+   ファイルをwatchから確認できない。実行中の監査可能性が下がる。
+3. **要約がClaudeのtool失敗を検出しない(読解確認)。**
+   `src/cross_harness/summarize.py`の`parse_events`はcommand_execution項目だけを
+   コマンド失敗として扱う。このためClaudeのtool_useとtool_resultの失敗を拾わず、
+   失敗したテストをsuccessと報告しうる。
+4. **Claudeのrate limitと認証失敗を正しく終端できない(読解確認)。**
+   `src/cross_harness/runner.py`のRATE_LIMITとAUTH_FAILUREはCodexの文言を前提に
+   判定する。一方Claudeはレート制限をrate_limit_eventという構造で通知するため、
+   blockedにならずretryされる。この項目も誤った成功報告または誤った再試行を
+   生むため、(1)とともに最優先とする。
+5. **Claude設定の課金・接続先を検査しない(読解確認)。**
+   `src/cross_harness/auth.py`には`verify_codex_config_ownership`があるが、Claude側
+   に相当する検査がない。Claude設定ファイル経由のAPI課金や外部ルータへの切替を
+   無検査で許すため、サブスクリプション利用という前提を保証できない。
+6. **timeout後のClaude resume情報を失う(読解確認)。**
+   `src/cross_harness/summarize.py`の`parse_events`は終端のresultイベントからのみ
+   Claudeのsession_idを取得する。全イベントにsession_idが含まれるにもかかわらず、
+   timeoutで中断するとresumeできない。
+7. **Claudeのwriteロールを作業ディレクトリに拘束しない(読解確認)。**
+   `src/cross_harness/runner.py`のClaude起動経路はCodexのsandbox指定に相当する
+   作業ディレクトリ拘束を渡さない。worktree分離時でも元リポジトリへ書けるため、
+   分離と既存変更の保護を損なう。
+8. **Claudeの役割定義が不足する(読解確認)。**
+   `.claude/agents/`にはimplementer、tester、debugger、security_reviewerに対応する
+   Claudeエージェント定義がない。ロール別の実行契約がClaude側では具体化されない。
+9. **委譲先Claudeが指示役の憲章を読んでしまう(読解確認)。**
+   `AGENTS.md`とClaude向けのブリッジ設定により、委譲されたClaudeもorchestratorの
+   憲章を読む。実行役に必要な役割と指示役の規則が矛盾し、委譲時の指示が不安定に
+   なる。
+10. **Codex resumeがsandbox指定を落とす(読解確認)。**
+    `src/cross_harness/runner.py`のresume用Codex起動経路では初回起動時のsandbox
+    指定を再適用しない。再試行後だけ権限制約が初回と異なり、実行条件の一貫性を
+    保てない。
+
+#### 副次的な非対称
+
+- `src/cross_harness/runner.py`ではCodexのfinal.jsonを出力スキーマで強制する一方、
+  Claudeのfinal.jsonはイベント後のパースで作る。結果形式の保証と不正な最終応答の
+  検出強度が異なる。
+- doctor、inventory、trustはCodexのみを手厚く扱う。該当する運用診断がClaudeには
+  なく、障害時の自己診断範囲が非対称である。
+- `src/cross_harness/config/default.toml`のClaudeロールは全てretries=0である。retryと
+  escalationに到達せず、設定上の復旧経路を検証できない。
+- `README.md`冒頭は一方向の記述のままであり、利用者が双方向設定の範囲と制限を
+  誤認しうる。
+
+#### 指示役側
+
+- `src/cross_harness/config.py`ではparent_harnessを検証するのみで、実行時には消費
+  しない。設定値によって親の振る舞いを切り替えられない。
+- `src/cross_harness/runner.py`のCROSS_HARNESS_PARENTは固定値であり、参照する箇所が
+  ない。親ハーネスの実態を子へ伝える契約になっていない。
+- `src/cross_harness/hooks.py`の`codex_pre_tool_use`は文脈を判定せず、Claudeへの
+  委譲を無条件に拒否する。Codexを正規の指示役にする経路を塞いでいる。
+- Codex側の資産は実行役専用であり、Claudeのorchestrator skillに相当する指示役用
+  資産が存在しない。したがって、Codexを指示役にする対応は未実装である。
+
+### 段階計画
+
+#### フェーズA: 実行役の対称化を先行する
+
+実行役の(1)から(10)を順に是正し、Claudeのstream-jsonをwatchで詳細表示できるよう
+にする。(1)のread-only検査実行と(4)のrate limit・認証失敗判定は、誤った成功報告を
+生むため、他の項目に先行して完了させる。次に要約・session resume・作業ディレクトリ
+拘束・設定所有権検査を整え、Claudeの役割定義、憲章の分離、Codex resume時のsandbox
+維持を扱う。
+
+完了条件は、両harnessのtesterとsecurity_reviewerが実際に検査を実行し、その成功・
+失敗・rate limit・認証失敗が同じ意味のsuccess、failed、blockedへ記録されることとする。
+watchとsummaryには両形式のコマンド、変更ファイル、tool失敗が残り、timeout後も
+sessionをresumeできることをrun記録で確認する。writeロールはworktree外へ書けず、
+各対応Claudeロールは実行役専用の指示で動作し、Codexの再試行も初回と同じsandboxで
+動作することを完了条件とする。
+
+#### フェーズB: 指示役の対称化
+
+フェーズAの実行契約が揃った後、hooksに親・子・通常操作を区別する文脈判定を入れ、
+Codex向けorchestrator資産を整備する。あわせてparent_harnessを実際の起動・環境・
+制御フローで消費し、固定値のCROSS_HARNESS_PARENTを実際の親に一致させる。
+
+完了条件は、ClaudeとCodexのどちらをparent_harnessに選んでも、同一の役割・制約・
+委譲深さで正規の子実行を開始できることとする。hookは委譲された子からの入れ子起動
+だけを拒否し、指示役からの正規委譲を拒否しない。親ハーネス値はrun記録と子環境で
+一致し、両指示役が対応するorchestrator資産を用いて同じ完了判定と停止規則に従うことを
+確認する。
