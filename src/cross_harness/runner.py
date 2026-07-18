@@ -113,11 +113,19 @@ def _write_baseline(run_dir: Path, cwd: Path) -> None:
     }))
 
 
-def _write_execution_record(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path) -> None:
+def _write_execution_record(
+    run_dir: Path,
+    role_name: str,
+    role: dict,
+    kind: str,
+    cwd: Path,
+    parent_harness: str,
+) -> None:
     """Record the runner-authorized execution identity before starting an executor."""
     atomic_write(run_dir / "execution.json", dump_json({
         "role_name": role_name,
         "harness": role["harness"],
+        "parent_harness": parent_harness,
         "write": role["write"],
         "kind": kind,
         "cwd": str(cwd),
@@ -480,7 +488,7 @@ def delegate(
     environment = sanitized_environment(paths.home, {
         "CROSS_HARNESS_ACTIVE": "1",
         "CROSS_HARNESS_EXECUTOR": role["harness"],
-        "CROSS_HARNESS_PARENT": "claude",
+        "CROSS_HARNESS_PARENT": config["parent_harness"],
         "CROSS_HARNESS_RUN_DIR": str(run_dir),
     })
     if role["write"]:
@@ -491,7 +499,9 @@ def delegate(
     command, sandbox_exec = _contain_claude_write_command(
         command, role, execution_root, run_dir, paths.home
     )
-    _write_execution_record(run_dir, role_name, role, kind, execution_root)
+    _write_execution_record(
+        run_dir, role_name, role, kind, execution_root, config["parent_harness"]
+    )
     atomic_write(run_dir / "command.json", dump_json({
         "argv": command,
         "auth_cached": cached,
@@ -940,7 +950,7 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
     environment = sanitized_environment(paths.home, {
         "CROSS_HARNESS_ACTIVE": "1",
         "CROSS_HARNESS_EXECUTOR": role["harness"],
-        "CROSS_HARNESS_PARENT": "claude",
+        "CROSS_HARNESS_PARENT": config["parent_harness"],
         "CROSS_HARNESS_RUN_DIR": str(retry_root),
     })
     if role["write"]:
@@ -953,7 +963,14 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
     command, sandbox_exec = _contain_claude_write_command(
         command, role, Path(state["cwd"]), retry_root, paths.home
     )
-    _write_execution_record(retry_root, state["role"], role, state["kind"], Path(state["cwd"]))
+    _write_execution_record(
+        retry_root,
+        state["role"],
+        role,
+        state["kind"],
+        Path(state["cwd"]),
+        config["parent_harness"],
+    )
     atomic_write(retry_root / "command.json", dump_json({
         "argv": command,
         "auth_cached": cached,
@@ -986,7 +1003,14 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         command, sandbox_exec = _contain_claude_write_command(
             command, escalation, Path(state["cwd"]), escalation_root, paths.home
         )
-        _write_execution_record(escalation_root, state["role"], escalation, state["kind"], Path(state["cwd"]))
+        _write_execution_record(
+            escalation_root,
+            state["role"],
+            escalation,
+            state["kind"],
+            Path(state["cwd"]),
+            config["parent_harness"],
+        )
         atomic_write(escalation_root / "command.json", dump_json({
             "argv": command,
             "escalation": True,

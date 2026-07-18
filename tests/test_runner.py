@@ -42,6 +42,8 @@ class RunnerTests(unittest.TestCase):
     def fake_invoke(self, command, task, env, cwd, run_dir, timeout):
         self.assertEqual("1", env["CROSS_HARNESS_ACTIVE"])
         self.assertIn(env["CROSS_HARNESS_EXECUTOR"], {"claude", "codex"})
+        execution = json.loads((run_dir / "execution.json").read_text())
+        self.assertEqual(env["CROSS_HARNESS_PARENT"], execution["parent_harness"])
         (run_dir / "events.jsonl").write_text(
             '{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000001"}\n'
             '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}\n'
@@ -77,8 +79,28 @@ class RunnerTests(unittest.TestCase):
         invoke.side_effect = self.fake_invoke
         summary = delegate("implementer", "implementation", self.task, self.repo, home=self.home)
         environment = invoke.call_args.args[2]
+        execution = json.loads((Path(summary["run_dir"]) / "execution.json").read_text())
         self.assertEqual("1", environment["CROSS_HARNESS_WRITE"])
+        self.assertEqual("claude", environment["CROSS_HARNESS_PARENT"])
+        self.assertEqual(environment["CROSS_HARNESS_PARENT"], execution["parent_harness"])
         self.assertEqual("success", summary["status"])
+
+    @patch("cross_harness.runner.verify_codex_chatgpt")
+    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_codex_parent_harness_is_passed_and_recorded(self, invoke, ownership, verify):
+        config = self.root / "codex-parent.toml"
+        contents = (Path(__file__).resolve().parents[1] / "config/default.toml").read_text()
+        config.write_text(contents.replace('parent_harness = "claude"', 'parent_harness = "codex"', 1))
+        verify.return_value = (Path("/usr/bin/true"), False)
+        invoke.side_effect = self.fake_invoke
+
+        summary = delegate("implementer", "implementation", self.task, self.repo, config_path=config, home=self.home)
+
+        environment = invoke.call_args.args[2]
+        execution = json.loads((Path(summary["run_dir"]) / "execution.json").read_text())
+        self.assertEqual("codex", environment["CROSS_HARNESS_PARENT"])
+        self.assertEqual(environment["CROSS_HARNESS_PARENT"], execution["parent_harness"])
 
     @patch("cross_harness.runner.verify_claude_subscription")
     @patch("cross_harness.runner.verify_claude_config_ownership")
@@ -421,6 +443,10 @@ class RunnerTests(unittest.TestCase):
 
         def complete(command, task, env, cwd, run_dir, timeout):
             self.assertEqual("claude", env["CROSS_HARNESS_EXECUTOR"])
+            self.assertEqual(
+                env["CROSS_HARNESS_PARENT"],
+                json.loads((run_dir / "execution.json").read_text())["parent_harness"],
+            )
             self.assertEqual("manual", command[command.index("--permission-mode") + 1])
             self.assertNotIn("--agent", command)
             (run_dir / "events.jsonl").write_text(
@@ -936,6 +962,9 @@ class RunnerTests(unittest.TestCase):
     @patch("cross_harness.runner.verify_claude_config_ownership")
     @patch("cross_harness.runner._invoke_safe")
     def test_identical_failure_triggers_exactly_one_escalation(self, invoke, ownership, verify, signature):
+        config = self.root / "codex-parent-retry.toml"
+        default = (Path(__file__).resolve().parents[1] / "config/default.toml").read_text()
+        config.write_text(default.replace('parent_harness = "claude"', 'parent_harness = "codex"', 1))
         previous = self.root / "previous"
         previous.mkdir()
         (previous / "state.json").write_text(json.dumps({
@@ -949,6 +978,11 @@ class RunnerTests(unittest.TestCase):
         def fail(command, task, env, cwd, run_dir, timeout):
             self.assertEqual("1", env["CROSS_HARNESS_ACTIVE"])
             self.assertEqual("claude", env["CROSS_HARNESS_EXECUTOR"])
+            self.assertEqual("codex", env["CROSS_HARNESS_PARENT"])
+            self.assertEqual(
+                env["CROSS_HARNESS_PARENT"],
+                json.loads((run_dir / "execution.json").read_text())["parent_harness"],
+            )
             self.assertNotIn("CROSS_HARNESS_WRITE", env)
             (run_dir / "events.jsonl").write_text(
                 '{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000002"}\n'
@@ -962,7 +996,7 @@ class RunnerTests(unittest.TestCase):
             return 1
 
         invoke.side_effect = fail
-        result = retry(previous, self.task, home=self.home)
+        result = retry(previous, self.task, config_path=config, home=self.home)
         self.assertEqual(2, invoke.call_count)
         self.assertEqual("sonnet", result["model"])
         escalated = json.loads((Path(result["run_dir"]) / "state.json").read_text())
