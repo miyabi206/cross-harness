@@ -44,7 +44,7 @@ class InstallerTests(unittest.TestCase):
             reviewer = (home / ".claude/agents/cross-harness-reviewer.md").read_text()
             self.assertIn("model: haiku", explorer)
             self.assertIn("effort: low", explorer)
-            self.assertIn("model: sonnet", reviewer)
+            self.assertIn("model: opus", reviewer)
             self.assertIn("effort: high", reviewer)
             for agent in ("implementer", "tester", "debugger", "security_reviewer"):
                 self.assertTrue((home / f".claude/agents/cross-harness-{agent}.md").is_file())
@@ -66,7 +66,7 @@ class InstallerTests(unittest.TestCase):
             contents = (repo / "config/default.toml").read_text(encoding="utf-8")
             contents = contents.replace('model = "haiku"', 'model = "custom explorer"')
             contents = contents.replace('effort = "low"', 'effort = "future-effort"')
-            contents = contents.replace('model = "sonnet"', 'model = "custom-reviewer"')
+            contents = contents.replace('model = "opus"', 'model = "custom-reviewer"')
             contents = contents.replace(
                 'model = "custom-reviewer"\neffort = "high"',
                 'model = "custom-reviewer"\neffort = "review-effort"',

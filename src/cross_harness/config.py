@@ -11,7 +11,6 @@ from .paths import expand_user, source_root, user_paths
 REQUIRED_ROLES = {
     "orchestrator",
     "explorer",
-    "planner",
     "implementer",
     "tester",
     "reviewer",
@@ -47,7 +46,7 @@ PROJECT_KEYS = {"checks", "delegate_kinds", "dirty_worktree_policy"}
 CODEX_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DELEGATE_KINDS = {"exploration", "implementation", "test", "debug", "review", "security_review"}
-ROLE_DELEGATE_KINDS = DELEGATE_KINDS | {"planning"}
+ROLE_DELEGATE_KINDS = DELEGATE_KINDS
 
 
 def load_toml(path: Path) -> dict:

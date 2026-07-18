@@ -31,8 +31,8 @@ delegate_kinds = ["exploration", "implementation", "test", "debug", "review", "s
 #   claude roles  the next Claude session (the session-start hook syncs
 #                 ~/.claude/agents/cross-harness-*.md)
 #
-# orchestrator is the running session itself and planner has no agent
-# definition or delegation path, so their model and effort have no effect.
+# orchestrator is the running session itself, so its model and effort describe
+# the parent session rather than a delegated agent.
 
 [fallback]
 codex = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
@@ -60,17 +60,6 @@ write = false
 output_limit_chars = 6000
 delegate_kinds = ["exploration"]
 
-[roles.planner]
-harness = "claude"
-model = "fable[1m]"
-effort = "xhigh"
-max_parallel = 1
-retries = 0
-timeout_seconds = 1800
-write = false
-output_limit_chars = 8000
-delegate_kinds = ["planning"]
-
 [roles.implementer]
 harness = "codex"
 model = "gpt-5.6-terra"
@@ -95,7 +84,7 @@ delegate_kinds = ["test"]
 
 [roles.reviewer]
 harness = "claude"
-model = "sonnet"
+model = "opus"
 effort = "high"
 max_parallel = 1
 retries = 0

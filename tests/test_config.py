@@ -2,7 +2,14 @@ from pathlib import Path
 import copy
 import unittest
 
-from cross_harness.config import default_config, project_config, validate, warnings
+from cross_harness.config import (
+    DELEGATE_KINDS,
+    ROLE_DELEGATE_KINDS,
+    default_config,
+    project_config,
+    validate,
+    warnings,
+)
 
 
 class ConfigTests(unittest.TestCase):
@@ -11,7 +18,18 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual([], validate(config))
         self.assertEqual("gpt-5.6-terra", config["roles"]["implementer"]["model"])
         self.assertEqual("gpt-5.6-luna", config["roles"]["tester"]["model"])
+        self.assertEqual("opus", config["roles"]["reviewer"]["model"])
+        self.assertNotIn("planner", config["roles"])
+        self.assertEqual(DELEGATE_KINDS, ROLE_DELEGATE_KINDS)
         self.assertEqual(70, config["context_threshold_percent"])
+
+    def test_planning_is_not_a_supported_role_delegate_kind(self):
+        config = copy.deepcopy(default_config())
+        config["roles"]["explorer"]["delegate_kinds"] = ["planning"]
+        self.assertIn(
+            "roles.explorer.delegate_kinds: unsupported values planning",
+            validate(config),
+        )
 
     def test_unknown_missing_and_invalid_values_are_rejected(self):
         config = copy.deepcopy(default_config())

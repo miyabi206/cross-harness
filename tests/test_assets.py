@@ -15,7 +15,7 @@ class AssetTests(unittest.TestCase):
         self.assertIn("model: haiku", explorer)
         self.assertIn("effort: low", explorer)
         self.assertIn("at most three", explorer)
-        self.assertIn("model: sonnet", reviewer)
+        self.assertIn("model: opus", reviewer)
         self.assertIn("effort: high", reviewer)
         self.assertIn("Do not edit files or delegate", " ".join(reviewer.split()))
 

@@ -240,7 +240,7 @@ Claude Code(司令塔)が要約のみ読み取り、差分と完了条件を検�
 | 通常の複数ファイル実装 | Codex implementer | terra/high | renaiリポジトリハーネスの実績値と一致 |
 | テスト作成 | Codex implementer | terra/medium | 実装より定型性が高い |
 | テスト実行・lint・build | Codex tester | luna/medium | 判断が少なく安価で十分。renai実績値と一致 |
-| コードレビュー | Claude reviewer subagent+大変更時にCodex reviewer併用 | sonnet/high+sol/xhigh | 検証はクロスモデルの視点差が有効。最終判断は親が行う |
+| コードレビュー | Claude reviewer subagent+大変更時にCodex reviewer併用 | opus/high+sol/xhigh | 検証はクロスモデルの視点差が有効。最終判断は親が行う |
 | 複雑なデバッグ | Codex debugger | sol/high | 深い推論向けモデル【公式】。失敗でxhighへ |
 | アーキテクチャ設計 | Claude司令塔(親) | fable/xhigh(現行ユーザー設定) | 司令塔の中核責務であり委譲しない |
 | セキュリティ関連 | Claude司令塔レビュー+Codex reviewer | sol/xhigh固定 | 段階昇格を待たず最初から最高段。人間の明示確認を必須とする |
@@ -252,16 +252,17 @@ Claude Code(司令塔)が要約のみ読み取り、差分と完了条件を検�
 |---|---|---|---|
 | orchestrator | Claude(親) | fable[1m]/xhigh | 現行ユーザー設定を尊重。親役ハーネスの指定キーを持つが既定はclaude |
 | explorer | Claude subagent | haiku/low | リポジトリ横断の広域調査はCodex explorer(luna/medium)へ切替可能 |
-| planner | Claude(親が兼務) | 親と同じ | 独立subagentとして常時起動しない。大規模時のみsonnet/highの補助を許可 |
 | implementer | Codex | terra/high | 明確な単一ファイル修正はterra/medium(上のタスク分類表) |
 | tester | Codex | luna/medium | renaiリポジトリハーネスの実績値と一致 |
-| reviewer | Claude subagent | sonnet/high | 大変更・高リスク時はCodex reviewer(sol/xhigh)を併用。最終判断は親 |
+| reviewer | Claude subagent | opus/high | 大変更・高リスク時はCodex reviewer(sol/xhigh)を併用。最終判断は親 |
 | debugger | Codex | sol/high | 失敗時はxhighへ昇格 |
 | security reviewer | Codex | sol/xhigh | Claude親レビューを併用し、人間の明示確認を必須とする |
 
+plannerはグローバルな`delegate_kinds`にplanningがなく、委譲経路もエージェント定義もないため置かない。orchestratorは動作中の親セッションそのものを指すため残す。
+
 昇格条件: (1)再試行上限内の失敗、(2)同一失敗2回、(3)変更範囲が計画から拡大、(4)高リスクパス(DB・認証・公開API・security)に接触、(5)要件の曖昧さを司令塔が検知して再計画する場合。降格は自動では行わず、初期値の見直しとして運用観察(第11節)に基づき手動で調整する(初期導入では複雑な自動降格を持たない)。
 
-利用不可時のフォールバック: 個人設定に同一ハーネス内の降格チェーン(例: sol→terra→luna、fable→sonnet→haiku)を定義し、ラッパーは利用不可を検知したらチェーン内でのみ代替し、その事実を必ず報告に含める。チェーン外(APIモデル・外部ルーター)へのフォールバックはラッパーが構造的に拒否する。レート上限による一時利用不可は代替せず停止・報告する(枠の使い分けはユーザー判断)。
+利用不可時のフォールバック: 個人設定に同一ハーネス内の降格チェーン(例: sol→terra→luna、fable→opus→sonnet→haiku)を定義し、ラッパーは利用不可を検知したらチェーン内でのみ代替し、その事実を必ず報告に含める。チェーン外(APIモデル・外部ルーター)へのフォールバックはラッパーが構造的に拒否する。レート上限による一時利用不可は代替せず停止・報告する(枠の使い分けはユーザー判断)。
 
 ## 7. トークン削減設計
 
@@ -616,8 +617,13 @@ run記録で確認した挙動、「読解確認」はコード読解または�
    testerによる検査実行とimplementerによる編集がそれぞれ成功したことを確認した。
 9. **委譲先Claudeへの実行役憲章: 達成(実測確認済み)。** 実行役憲章が実際のargvに
    含まれることを確認した。
-10. **Codex resume時のsandbox維持: 実装済み(読解確認)。** resume経路で初回と同じ
-    sandbox指定を再適用する実装と単体テストはあるが、実条件では未検証である。
+10. **Codex resume時のsandbox維持: 達成(実測確認済み)。** resume経路に`--sandbox`と
+    `-C`を渡す実装は誤りだった。Codex CLIの`resume`サブコマンドはこの2つを受け付けず、
+    実runでは`unexpected argument --sandbox`となって全てのCodex再試行が失敗していた。
+    sandboxは`-c sandbox_mode`による設定上書きとして渡す形に修正し、
+    `20260719T005918-dbce5e11`でretryがresumeして成功することを確認した
+    (`20260719T005530-26f95e4b`は修正前の失敗記録)。単体テストはargv構築のみを検証して
+    いたため、このCLI実行条件の不整合を検出できなかった。
 
 実装過程では、次の2件の誤成功欠陥も判明し、修正した。(1) 実行役がスキーマ外の
 `status=completed`を返すと、exit code 0であるため`success`として記録されていた。
@@ -630,8 +636,10 @@ run記録で確認した挙動、「読解確認」はコード読解または�
 設定にのみ存在し、リポジトリにないロール設定ドキュメントがあり、再インストールで失われる
 状態だった。`config/default.toml`へ取り込んで解消した。
 
-したがって、フェーズAの完了条件で残るのは、項目4・5・10の実条件での確認である。
+したがって、フェーズAの完了条件で残るのは、項目4・5の実条件での確認である。
 項目3のread-onlyロールの上書き機構も単体テストのみであり、実runでの発火は未確認である。
+項目10のように実条件未検証の実装が実際に壊れていた例があるため、項目4・5にも同種の
+リスクが残る。
 なお、`CROSS_HARNESS_ACTIVE=1`による14件の失敗は`tests/conftest.py`のautouse fixtureで
 解消した。委譲実行役による実runで全件通過を確認している。
 
