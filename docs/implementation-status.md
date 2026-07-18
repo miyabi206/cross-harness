@@ -15,11 +15,16 @@
 | T11 | Claude explorer/reviewer definitions | **Pass:** installed roles launched natively as Haiku 4.5 and Sonnet 5 with zero permission denials; model/effort/tool/retrieval bounds are tested |
 | T12 | SessionStart, Stop, PreToolUse, structured permissions merge | **Pass:** active authenticated session; wrapper task/delegate permission denials were zero |
 | T13 | reproducible suite and 14-item evidence matrix | **Pass/known limits:** 56 deterministic tests pass; dashboard/disruptive limits are itemized in `docs/e2e.md` |
-| T14 | five-task/commit verifier, strict 5×2 validator, stream collector, full-metric tables, aggregation and recommendation | **In progress:** private-repository transmission is approved; 4/10 runs are complete with manual audits, while the remaining six wait for the Claude session-limit reset at 18:30 JST |
-| T15 | runbook, rollback/recovery, activation, observation template | **Implemented/active:** home activation and recovery verified; benchmark-driven routing adjustment waits on T14 |
+| T14 | five-task/commit verifier, strict 5×2 validator, stream collector, full-metric tables, aggregation and recommendation | **Stopped/documented limitation:** the 5×2 measurement produced one usable comparison pair (`small_fix`) only. The other records are not a basis for aggregation or a routing recommendation; its delivered value was discovery of the background-delegation-kill defect, fixed in `5472f0c` on 2026-07-18; `98cdfa7` later repaired the supervisor's package import through the installed wrapper. |
+| T15 | runbook, rollback/recovery, activation, observation template | **Implemented/active:** home activation and recovery are verified. Routing adjustment now depends on the two-week production-task observation log, not on the stopped benchmark. |
 
-All verification outside the real RenAI comparison is complete. Authorization
-to send task-relevant source and tool output to Anthropic and OpenAI has been
-received, and the real 5×2 measurement is in progress. Its final aggregation
-gates the T14 comparison and T15 routing adjustment. Exact evidence and
-remaining checks are in `docs/live-verification.md`.
+Tasks T01 through T13 remain independently verified, including the fourteen-item
+end-to-end evidence matrix; stopping this measurement does not make the harness
+itself unverified. The RenAI 5×2 benchmark is stopped as a documented
+limitation rather than described as nearly complete: only `small_fix` has a
+usable baseline/cross-harness pair. It also used a fable parent model while the
+installed orchestrator setting is opus, so the existing records cannot support
+a routing recommendation. Effect measurement now moves to
+`docs/observation-log.md`, where real production tasks can be observed for two
+weeks without additional subscription-quota cost. Exact audit evidence and the
+decision are in `docs/benchmark-results.md` and `docs/plan.md` section 16.
