@@ -218,6 +218,7 @@ class RunnerTests(unittest.TestCase):
         writable = dict(read_only, write=True)
         write_command = _claude_command(Path("/usr/local/bin/claude"), writable, run)
         self.assertEqual("acceptEdits", write_command[write_command.index("--permission-mode") + 1])
+        self.assertNotIn("--disallowed-tools", write_command)
 
     @patch("cross_harness.runner.verify_codex_chatgpt")
     @patch("cross_harness.runner.verify_codex_config_ownership")
@@ -309,6 +310,24 @@ class RunnerTests(unittest.TestCase):
         state = json.loads((run / "state.json").read_text())
         self.assertEqual("rate_limit", state["blocked_category"])
         self.assertTrue((run / "BLOCKED").exists())
+
+    def test_read_only_change_does_not_override_rate_limit_block(self):
+        run = self.root / "read-only-rate-limit-run"
+        run.mkdir()
+        _write_baseline(run, self.repo)
+        (self.repo / "README.md").write_text("after\n")
+        (run / "events.jsonl").write_text(
+            '{"type":"turn.failed","error":{"message":"usage limit reached"}}\n'
+        )
+        (run / "stderr.log").write_text("")
+        role = {"model": "gpt-5.6-luna", "effort": "low", "output_limit_chars": 8000, "write": False}
+
+        summary = finalize_run(run, "tester", role, "test", self.repo, 1, 1)
+
+        self.assertEqual("blocked", summary["status"])
+        state = json.loads((run / "state.json").read_text())
+        self.assertEqual("blocked", state["status"])
+        self.assertEqual("rate_limit", state["blocked_category"])
 
     @patch("cross_harness.runner.verify_codex_chatgpt")
     @patch("cross_harness.runner.verify_codex_config_ownership")

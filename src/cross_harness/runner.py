@@ -260,7 +260,7 @@ def _claude_command(claude: Path, role: dict, run_dir: Path) -> list[str]:
         "--output-format", "stream-json",
         "--verbose",
         "--permission-mode", permission_mode,
-        "--disallowed-tools", "Edit", "Write", "NotebookEdit",
+        *([] if role["write"] else ["--disallowed-tools", "Edit", "Write", "NotebookEdit"]),
         "--append-system-prompt", result_instruction,
     ]
 
@@ -623,9 +623,8 @@ def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path
     detected_changed = [item["file"] for item in diff_summary]
     if not diff_summary:
         diff_stat = ""
-    if role.get("write") is False and diff_summary:
+    if role.get("write") is False and diff_summary and status != "blocked":
         status = "failed"
-        blocked_category = None
         readonly_error = "read-only role modified the worktree"
         combined_error = f"{combined_error}\n{readonly_error}".strip()
     atomic_write(run_dir / "diff-stat.txt", diff_stat)
