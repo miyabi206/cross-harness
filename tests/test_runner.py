@@ -129,6 +129,24 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("failed", summary["status"])
         self.assertIn("invalid schema", summary["error"])
 
+    def test_invalid_final_status_fails_closed_and_records_reason(self):
+        run = self.root / "invalid-final-status-run"
+        run.mkdir()
+        (run / "events.jsonl").write_text('{"type":"turn.completed","usage":{}}\n')
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "completed", "work_completed": "tests failed", "changed_files": [],
+            "tests": ["uv run pytest -q: 14 failed"], "error": None, "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-luna", "effort": "low", "output_limit_chars": 8000}
+
+        summary = finalize_run(run, "tester", role, "test", self.repo, 0, 1)
+
+        self.assertEqual("failed", summary["status"])
+        self.assertIn("invalid final status 'completed'", summary["error"])
+        self.assertIn("success", summary["error"])
+        self.assertIn("partial", summary["error"])
+
     def test_large_event_log_is_preserved_and_summary_compresses_over_ninety_percent(self):
         run = self.root / "large-output-run"
         run.mkdir()

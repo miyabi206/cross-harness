@@ -679,12 +679,24 @@ def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path
     final = load_final(run_dir / "final.json") or {}
     stderr = (run_dir / "stderr.log").read_text(encoding="utf-8", errors="replace") if (run_dir / "stderr.log").exists() else ""
     event_failed = bool(parsed.get("errors"))
-    status = final.get("status") if final.get("status") in {"success", "failed", "blocked", "partial"} else ("success" if exit_code == 0 and not event_failed else "failed")
+    allowed_statuses = {"success", "failed", "blocked", "partial"}
+    reported_status = final.get("status")
+    invalid_reported_status = "status" in final and reported_status not in allowed_statuses
+    if invalid_reported_status:
+        status = "failed"
+        status_error = f"invalid final status {reported_status!r}; expected one of {sorted(allowed_statuses)}"
+    elif reported_status in allowed_statuses:
+        status = reported_status
+        status_error = ""
+    else:
+        status = "success" if exit_code == 0 and not event_failed else "failed"
+        status_error = ""
     if exit_code != 0 and status == "success":
         status = "failed"
     if event_failed and status == "success":
         status = "failed"
-    combined_error = str(final.get("error") or "\n".join(parsed.get("errors", [])[-3:]) or stderr[-2000:] or "")
+    executor_error = str(final.get("error") or "\n".join(parsed.get("errors", [])[-3:]) or stderr[-2000:] or "")
+    combined_error = "\n".join(error for error in (status_error, executor_error) if error)
     blocked_category = parsed.get("blocked_category")
     if blocked_category == "rate_limit":
         status = "blocked"
