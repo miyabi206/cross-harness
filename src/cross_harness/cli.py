@@ -8,7 +8,7 @@ import sys
 from .benchmark import load_records, load_task_plan, render as render_benchmark, verify_task_commits
 from .config import load_config, validate, load_toml
 from .doctor import doctor, render as render_doctor
-from .errors import HarnessError
+from .errors import HarnessError, SupervisorDiedError
 from .files import atomic_write
 from .hooks import run_hook
 from .installer import install, uninstall
@@ -206,6 +206,9 @@ def main(argv: list[str] | None = None) -> int:
             for verified in verify_task_commits(tasks, args.repo.resolve()):
                 print(verified)
         return 0
+    except SupervisorDiedError as exc:
+        print(f"cross-harness: {exc}", file=sys.stderr)
+        return 5
     except HarnessError as exc:
         print(f"cross-harness: {exc}", file=sys.stderr)
         return 2

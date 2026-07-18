@@ -8,8 +8,8 @@ import tempfile
 import time
 import unittest
 
-from cross_harness.errors import AuthError, DirtyWorktreeError, HarnessError
-from cross_harness.runner import _invoke_safe, delegate, retry, wait_for_run
+from cross_harness.errors import AuthError, DirtyWorktreeError, HarnessError, SupervisorDiedError
+from cross_harness.runner import _invoke_safe, delegate, retry, start_detached_delegate, wait_for_run
 from cross_harness.runner import finalize_run
 
 
@@ -226,6 +226,81 @@ class RunnerTests(unittest.TestCase):
         )
         self.assertEqual(124, code)
         self.assertEqual("timeout\n", (run / "INTERRUPTED").read_text())
+
+    def test_detached_supervisor_receives_package_path_for_clean_interpreter(self):
+        fake_bin = self.root / "bin"
+        fake_bin.mkdir()
+        fake_codex = fake_bin / "codex"
+        fake_codex.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = login ]; then echo 'Logged in using ChatGPT'; exit 0; fi\n"
+            "output=''\n"
+            "while [ \"$#\" -gt 0 ]; do\n"
+            "  if [ \"$1\" = -o ]; then shift; output=$1; fi\n"
+            "  shift\n"
+            "done\n"
+            "printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"00000000-0000-0000-0000-000000000001\"}' '{\"type\":\"turn.completed\",\"usage\":{}}'\n"
+            "printf '%s\\n' '{\"status\":\"success\",\"work_completed\":\"finished\",\"changed_files\":[],\"tests\":[],\"error\":null,\"next_decision\":null}' > \"$output\"\n"
+        )
+        fake_codex.chmod(0o755)
+        clean_interpreter = self.root / "clean-python"
+        clean_interpreter.write_text(
+            "#!/bin/sh\n"
+            "exec \"$CROSS_HARNESS_TEST_PYTHON\" -S -c '\n"
+            "import os, runpy, sys\n"
+            "from pathlib import Path\n"
+            "import cross_harness.runner\n"
+            "cross_harness.runner.verify_codex_chatgpt = lambda *args: (Path(os.environ[\"TEST_FAKE_CODEX\"]), False)\n"
+            "cross_harness.runner.verify_codex_config_ownership = lambda *args: None\n"
+            "sys.argv = [\"cross-harness\", *sys.argv[3:]]\n"
+            "runpy.run_module(\"cross_harness.cli\", run_name=\"__main__\")\n"
+            "' \"$@\"\n"
+        )
+        clean_interpreter.chmod(0o755)
+        environment = {
+            "PATH": f"{fake_bin}{os.pathsep}/usr/bin:/bin",
+            "CROSS_HARNESS_TEST_PYTHON": sys.executable,
+            "TEST_FAKE_CODEX": str(fake_codex),
+        }
+        with patch.dict(os.environ, environment, clear=True), patch(
+            "cross_harness.runner.sys.executable", str(clean_interpreter)
+        ):
+            run_dir = start_detached_delegate("tester", "test", self.task, self.repo, home=self.home)
+        summary = wait_for_run(run_dir, 5)
+        self.assertIsNotNone(summary)
+        assert summary is not None
+        self.assertEqual("success", summary["status"])
+        self.assertTrue((run_dir / "events.jsonl").is_file())
+        self.assertTrue((run_dir / "state.json").is_file())
+        self.assertNotIn("ModuleNotFoundError", (run_dir / "supervisor.stderr.log").read_text())
+
+    def test_wait_reports_and_reaps_a_zombie_supervisor(self):
+        run = self.root / "zombie-supervisor"
+        run.mkdir()
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        (run / "supervisor.pid").write_text(f"{pid}\n")
+        started = time.monotonic()
+        with self.assertRaisesRegex(SupervisorDiedError, "exited without producing a summary"):
+            wait_for_run(run, 10, poll_seconds=0.01)
+        self.assertLess(time.monotonic() - started, 1)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)
+
+    def test_wait_returns_summary_finalized_after_supervisor_exit(self):
+        run = self.root / "finalized-after-exit"
+        run.mkdir()
+        (run / "supervisor.pid").write_text("12345\n")
+        expected = {"status": "success", "work_completed": "finished"}
+
+        def finalize_after_liveness_check(_run_dir):
+            (run / "summary.json").write_text(json.dumps(expected))
+            (run / "summary.txt").write_text("success summary\n")
+            return False
+
+        with patch("cross_harness.runner._supervisor_alive", side_effect=finalize_after_liveness_check):
+            self.assertEqual(expected, wait_for_run(run, 1))
 
     def test_detached_supervisor_finalizes_after_foreground_is_killed(self):
         fake_bin = self.root / "bin"

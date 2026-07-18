@@ -13,3 +13,6 @@ class AuthError(HarnessError):
 class DirtyWorktreeError(HarnessError):
     """A write delegation would overlap user changes."""
 
+
+class SupervisorDiedError(HarnessError):
+    """A detached delegation supervisor exited before finalizing its run."""

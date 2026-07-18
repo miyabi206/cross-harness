@@ -15,7 +15,7 @@ import uuid
 
 from .auth import sanitized_environment, verify_codex_chatgpt, verify_codex_config_ownership
 from .config import load_config, project_config
-from .errors import AuthError, ConfigError, DirtyWorktreeError, HarnessError
+from .errors import AuthError, ConfigError, DirtyWorktreeError, HarnessError, SupervisorDiedError
 from .files import atomic_write, dump_json, sha256
 from .paths import source_root, user_paths
 from .summarize import failure_signature, load_final, parse_events, render_summary
@@ -24,6 +24,7 @@ from .taskfile import contains_secret
 
 RATE_LIMIT = re.compile(r"rate.?limit|usage.?limit|quota|too many requests", re.IGNORECASE)
 AUTH_FAILURE = re.compile(r"unauthorized|authentication|not logged in|login required", re.IGNORECASE)
+_DETACHED_SUPERVISORS: dict[int, subprocess.Popen] = {}
 
 
 def _git(cwd: Path, args: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
@@ -343,6 +344,11 @@ def start_detached_delegate(
         command.append("--confirm-high-risk")
     environment = os.environ.copy()
     environment.pop("CROSS_HARNESS_ACTIVE", None)
+    package_root = str(Path(__file__).resolve().parents[1])
+    existing_python_path = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        path for path in (package_root, existing_python_path) if path
+    )
     with (
         (run_dir / "supervisor.stdin").open("w+b") as stdin,
         (run_dir / "supervisor.stdout.log").open("wb") as stdout,
@@ -359,22 +365,105 @@ def start_detached_delegate(
             close_fds=True,
         )
     atomic_write(run_dir / "supervisor.pid", f"{process.pid}\n")
+    _DETACHED_SUPERVISORS[process.pid] = process
     return run_dir
 
 
+def _supervisor_pid(run_dir: Path) -> int | None:
+    try:
+        pid = int((run_dir / "supervisor.pid").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def _supervisor_alive(run_dir: Path) -> bool:
+    """Return whether a recorded supervisor is running, reaping it if possible."""
+    pid = _supervisor_pid(run_dir)
+    if pid is None:
+        return False
+    process = _DETACHED_SUPERVISORS.get(pid)
+    if process is not None:
+        if process.poll() is not None:
+            del _DETACHED_SUPERVISORS[pid]
+            return False
+        return True
+    if _reap_supervisor_pid(pid):
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:
+        status = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=1,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    if status.returncode:
+        return False
+    if status.stdout.lstrip().startswith("Z"):
+        _reap_supervisor_pid(pid)
+        return False
+    return True
+
+
+def _reap_supervisor_pid(pid: int) -> bool:
+    try:
+        reaped, _ = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        return False
+    if reaped != pid:
+        return False
+    _DETACHED_SUPERVISORS.pop(pid, None)
+    return True
+
+
+def _reap_supervisor(run_dir: Path) -> None:
+    pid = _supervisor_pid(run_dir)
+    if pid is None:
+        return
+    process = _DETACHED_SUPERVISORS.get(pid)
+    if process is None:
+        return
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        return
+    del _DETACHED_SUPERVISORS[pid]
+
+
+def _completed_summary(run_dir: Path) -> dict | None:
+    summary_path = run_dir / "summary.json"
+    if not summary_path.is_file() or not (run_dir / "summary.txt").is_file():
+        return None
+    try:
+        return json.loads(summary_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        # Atomic writes make this unlikely, but a concurrent finalizer is harmless.
+        return None
+
+
 def wait_for_run(run_dir: Path, timeout_seconds: float, poll_seconds: float = 0.1) -> dict | None:
-    """Return a completed run summary, or None after the wait deadline."""
+    """Return a completed summary, None at timeout, or fail if its supervisor died."""
     if timeout_seconds < 0:
         raise HarnessError("timeout seconds must be non-negative")
-    summary_path = run_dir / "summary.json"
     deadline = time.monotonic() + timeout_seconds
     while True:
-        if summary_path.is_file() and (run_dir / "summary.txt").is_file():
-            try:
-                return json.loads(summary_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                # Atomic writes make this unlikely, but a concurrent finalizer is harmless.
-                pass
+        summary = _completed_summary(run_dir)
+        if summary is not None:
+            _reap_supervisor(run_dir)
+            return summary
+        if (run_dir / "supervisor.pid").is_file() and not _supervisor_alive(run_dir):
+            summary = _completed_summary(run_dir)
+            if summary is not None:
+                _reap_supervisor(run_dir)
+                return summary
+            raise SupervisorDiedError("delegation supervisor exited without producing a summary")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return None

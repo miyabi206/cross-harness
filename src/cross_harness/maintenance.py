@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
-import os
 import shutil
 import subprocess
 
@@ -11,18 +10,7 @@ from .config import load_config
 from .errors import HarnessError
 from .files import atomic_write
 from .paths import user_paths
-
-
-def _supervisor_alive(run_dir: Path) -> bool:
-    pid_path = run_dir / "supervisor.pid"
-    try:
-        pid = int(pid_path.read_text(encoding="utf-8").strip())
-        if pid <= 0:
-            return False
-        os.kill(pid, 0)
-    except (OSError, ValueError):
-        return False
-    return True
+from .runner import _supervisor_alive
 
 
 def cleanup(config_path: Path | None = None, home: Path | None = None, now: datetime | None = None) -> dict:
