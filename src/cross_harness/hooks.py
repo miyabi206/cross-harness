@@ -57,19 +57,56 @@ def _installed_wrapper_arguments(command: str) -> str | None:
     return arguments
 
 
-def _input() -> dict:
+def _input() -> dict | None:
     try:
         value = json.load(sys.stdin)
-        return value if isinstance(value, dict) else {}
+        return value if isinstance(value, dict) else None
     except json.JSONDecodeError:
-        return {}
+        return None
 
 
-def _tool(data: dict) -> tuple[str, str]:
-    name = str(data.get("tool_name", data.get("toolName", "")))
-    details = data.get("tool_input", data.get("toolInput", {}))
-    command = str(details.get("command", "")) if isinstance(details, dict) else ""
+def _tool(data: dict | None) -> tuple[str, str] | None:
+    """Extract a tool invocation, rejecting incomplete hook input.
+
+    A command is required only for Bash.  Other tools are safe to classify by
+    name alone, including when their input is absent or uses an unexpected
+    shape.
+    """
+    if data is None:
+        return None
+    name = data.get("tool_name", data.get("toolName"))
+    if not isinstance(name, str):
+        return None
+    if name != "Bash":
+        return name, ""
+    details = data.get("tool_input", data.get("toolInput"))
+    if not isinstance(details, dict):
+        return None
+    command = details.get("command")
+    if not isinstance(command, str):
+        return None
     return name, command
+
+
+def _normalized_command(command: str) -> str:
+    """Remove shell word-splitting quotes and backslash escapes for matching."""
+    normalized: list[str] = []
+    index = 0
+    while index < len(command):
+        character = command[index]
+        if character == "\\" and index + 1 < len(command):
+            normalized.append(command[index + 1])
+            index += 2
+        elif character in "'\"":
+            index += 1
+        else:
+            normalized.append(character)
+            index += 1
+    return "".join(normalized)
+
+
+def _matches(pattern: re.Pattern[str], command: str) -> bool:
+    return bool(pattern.search(command) or pattern.search(_normalized_command(command)))
 
 
 def _deny(message: str) -> int:
@@ -109,15 +146,18 @@ def _delegated_claude_execution() -> dict | None:
 
 
 def claude_pre_tool_use() -> int:
-    name, command = _tool(_input())
+    tool = _tool(_input())
+    if tool is None:
+        return _deny("cross-harness: invalid tool hook input is blocked")
+    name, command = tool
     execution = _delegated_claude_execution()
     if execution is not None:
         if name in {"Edit", "Write"} and not execution["write"]:
             return _deny("cross-harness: delegated Claude has read-only access")
         if name == "Bash" and (
-            CODEX_EXEC.search(command)
-            or CLAUDE_EXEC.search(command)
-            or HARNESS_REDELEGATION.search(command)
+            _matches(CODEX_EXEC, command)
+            or _matches(CLAUDE_EXEC, command)
+            or _matches(HARNESS_REDELEGATION, command)
         ):
             return _deny("cross-harness: nested executor launch from delegated Claude is blocked")
         return 0
@@ -125,9 +165,9 @@ def claude_pre_tool_use() -> int:
         return _deny("cross-harness: Claude is the orchestrator; delegate project edits through cross-harness")
     wrapper_arguments = _installed_wrapper_arguments(command)
     executor_scan = command if wrapper_arguments is None else ""
-    if name == "Bash" and CODEX_EXEC.search(executor_scan):
+    if name == "Bash" and _matches(CODEX_EXEC, executor_scan):
         return _deny("cross-harness: direct codex exec is blocked; use cross-harness delegate with a task file")
-    if name == "Bash" and BARE_WRAPPER.search(command):
+    if name == "Bash" and _matches(BARE_WRAPPER, command):
         expected = user_paths().executable.resolve()
         resolved = shutil.which("cross-harness")
         if not resolved or Path(resolved).resolve() != expected:
@@ -136,12 +176,15 @@ def claude_pre_tool_use() -> int:
 
 
 def codex_pre_tool_use() -> int:
-    _, command = _tool(_input())
+    tool = _tool(_input())
+    if tool is None:
+        return _deny("cross-harness: invalid tool hook input is blocked")
+    _, command = tool
     wrapper_arguments = _installed_wrapper_arguments(command)
     executor_scan = command if wrapper_arguments is None else ""
-    if CLAUDE_EXEC.search(executor_scan):
+    if _matches(CLAUDE_EXEC, executor_scan):
         return _deny("cross-harness: nested Claude launch from Codex is blocked")
-    if CODEX_EXEC.search(executor_scan) or HARNESS_DELEGATION.search(command):
+    if _matches(CODEX_EXEC, executor_scan) or _matches(HARNESS_DELEGATION, command):
         return _deny("cross-harness: nested executor launch from delegated Codex is blocked")
     return 0
 
@@ -211,7 +254,7 @@ def claude_session_start(home: Path | None = None) -> int:
 
 def claude_stop(home: Path | None = None) -> int:
     paths = user_paths(home)
-    data = _input()
+    data = _input() or {}
     config = load_config(home=paths.home)
     runtime = Path(config["runtime_root"])
     payload = {

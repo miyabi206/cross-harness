@@ -42,6 +42,27 @@ class HookTests(unittest.TestCase):
         code, _ = self._run(claude_pre_tool_use, '{"tool_name":"Bash","tool_input":{"command":"/opt/bin/codex exec task"}}')
         self.assertEqual(2, code)
 
+    def test_pre_tool_use_rejects_malformed_input(self):
+        malformed_payloads = (
+            "{",
+            "[]",
+            '{"tool_name":"Bash","tool_input":[]}',
+            '{"tool_name":"Bash","tool_input":{"command":[]}}',
+        )
+        for function in (claude_pre_tool_use, codex_pre_tool_use):
+            for payload in malformed_payloads:
+                code, message = self._run(function, payload)
+                self.assertEqual(2, code, payload)
+                self.assertIn("invalid tool hook input", message, payload)
+
+    def test_non_bash_tool_without_input_is_allowed(self):
+        for payload in (
+            '{"tool_name":"Read"}',
+            '{"tool_name":"Read","tool_input":{"file_path":"README.md"}}',
+        ):
+            self.assertEqual(0, self._run(claude_pre_tool_use, payload)[0], payload)
+            self.assertEqual(0, self._run(codex_pre_tool_use, payload)[0], payload)
+
     def test_claude_installed_wrapper_ignores_executor_like_arguments(self):
         wrapper = str(user_paths().executable)
         command = f"{wrapper} task create --description 'ask Codex to run codex exec later'"
@@ -160,6 +181,33 @@ class HookTests(unittest.TestCase):
             code, message = self._run(codex_pre_tool_use, payload)
             self.assertEqual(2, code)
             self.assertIn("nested executor", message)
+
+    def test_word_splitting_quotes_and_escapes_cannot_bypass_patterns(self):
+        command = "co''dex e\\xec nested"
+        payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
+        code, _ = self._run(claude_pre_tool_use, payload)
+        self.assertEqual(2, code, command)
+
+        with tempfile.TemporaryDirectory() as folder:
+            runtime_root = Path(folder) / "runtime"
+            environment = self._execution_environment(runtime_root)
+            with patch("cross_harness.hooks.load_config", return_value={"runtime_root": str(runtime_root)}), patch.dict("os.environ", environment, clear=True):
+                for command in ("cl''aude -p nested", "cross-harness de\\legate --role tester"):
+                    payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
+                    code, message = self._run(claude_pre_tool_use, payload)
+                    self.assertEqual(2, code, command)
+                    self.assertIn("nested executor", message, command)
+
+        codex_commands = (
+            "cl\\aude -p nested",
+            "co''dex e\\xec nested",
+            "cross-harness de\\legate --role tester",
+        )
+        for command in codex_commands:
+            payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
+            code, message = self._run(codex_pre_tool_use, payload)
+            self.assertEqual(2, code, command)
+            self.assertIn("nested", message, command)
 
     def test_codex_installed_wrapper_ignores_executor_like_arguments(self):
         wrapper = str(user_paths().executable)
