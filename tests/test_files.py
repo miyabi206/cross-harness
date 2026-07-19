@@ -52,6 +52,26 @@ class FileTests(unittest.TestCase):
         }], parsed["commands"])
         self.assertIsNotNone(failure_signature(0, parsed))
 
+    def test_parse_events_marks_cross_harness_hook_rejection_as_policy_denied(self):
+        with tempfile.TemporaryDirectory() as folder:
+            events = Path(folder) / "events.jsonl"
+            events.write_text(
+                '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"bash-1","name":"Bash","input":{"command":"git status"}}]}}\n'
+                '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"bash-1","is_error":true,"content":"PreToolUse:Bash hook error: [/Users/example/.local/bin/cross-harness hook claude-pre-tool-use]: cross-harness: nested executor launch from delegated Claude is blocked"}]}}\n'
+            )
+            parsed = parse_events(events)
+        self.assertTrue(parsed["commands"][0]["policy_denied"])
+
+    def test_parse_events_does_not_mark_quoted_hook_rejection_as_policy_denied(self):
+        with tempfile.TemporaryDirectory() as folder:
+            events = Path(folder) / "events.jsonl"
+            events.write_text(
+                '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"bash-1","name":"Bash","input":{"command":"uv run pytest -q"}}]}}\n'
+                '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"bash-1","is_error":true,"content":"FAILED test_policy.py\\nassert output == \'PreToolUse:Bash hook error: [/Users/example/.local/bin/cross-harness hook claude-pre-tool-use]: cross-harness: nested executor launch from delegated Claude is blocked\'"}]}}\n'
+            )
+            parsed = parse_events(events)
+        self.assertNotIn("policy_denied", parsed["commands"][0])
+
     def test_parse_events_extracts_structured_claude_terminal_categories(self):
         with tempfile.TemporaryDirectory() as folder:
             events = Path(folder) / "events.jsonl"

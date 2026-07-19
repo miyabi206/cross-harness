@@ -27,6 +27,15 @@ _CLAUDE_AUTHENTICATION_CODES = frozenset({
 })
 
 
+def _is_cross_harness_policy_denial(output: str) -> bool:
+    """Return whether a Bash failure was rejected by this harness's hook."""
+    return bool(re.match(
+        r"^PreToolUse:Bash hook error: \[[^\r\n\]]*/cross-harness hook "
+        r"claude-pre-tool-use\]: cross-harness: \S",
+        output,
+    ))
+
+
 def parse_events(path: Path) -> dict:
     result = {"thread_id": None, "usage": {}, "errors": [], "commands": [], "blocked_category": None}
     claude_commands: dict[str, str] = {}
@@ -69,11 +78,16 @@ def parse_events(path: Path) -> dict:
             # and no exit code, so it must not be treated as a failure.
             if kind == "item.completed" and isinstance(item, dict) and item.get("type") == "command_execution":
                 if item.get("status") not in {None, "completed", "success"} or item.get("exit_code") not in {None, 0}:
-                    result["commands"].append({
+                    full_output = str(item.get("aggregated_output", item.get("output", "")))
+                    output = full_output[-4000:]
+                    command = {
                         "command": item.get("command", ""),
                         "exit_code": item.get("exit_code"),
-                        "output": str(item.get("aggregated_output", item.get("output", "")))[-4000:],
-                    })
+                        "output": output,
+                    }
+                    if _is_cross_harness_policy_denial(full_output):
+                        command["policy_denied"] = True
+                    result["commands"].append(command)
     result["errors"] = [text for text in result["errors"] if text]
     return result
 
@@ -106,7 +120,10 @@ def _parse_claude_tool_events(event: dict, commands: dict[str, str], result: dic
         command = commands.get(tool_id) if isinstance(tool_id, str) else None
         if command is None:
             continue
-        result["commands"].append({"command": command, "exit_code": 1, "output": text[-4000:]})
+        command_result = {"command": command, "exit_code": 1, "output": text[-4000:]}
+        if _is_cross_harness_policy_denial(text):
+            command_result["policy_denied"] = True
+        result["commands"].append(command_result)
 
 
 def _tool_result_text(block: dict) -> str:

@@ -282,6 +282,30 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(["14 failed, 100 passed"], summary["tests"])
         self.assertIn("tests: 14 failed, 100 passed", (run / "summary.txt").read_text())
 
+    def test_read_only_cross_harness_hook_rejection_does_not_override_success(self):
+        run = self.root / "read-only-policy-denial-run"
+        run.mkdir()
+        (run / "events.jsonl").write_text(json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "git status",
+                "status": "failed",
+                "exit_code": 1,
+                "aggregated_output": "PreToolUse:Bash hook error: [/Users/example/.local/bin/cross-harness hook claude-pre-tool-use]: cross-harness: nested executor launch from delegated Claude is blocked",
+            },
+        }) + "\n")
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "inspected", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-luna", "effort": "low", "output_limit_chars": 8000, "write": False}
+
+        summary = finalize_run(run, "tester", role, "test", self.repo, 0, 1)
+
+        self.assertEqual("success", summary["status"])
+
     def test_read_only_successful_command_does_not_override_reported_success(self):
         run = self.root / "read-only-command-success-run"
         run.mkdir()

@@ -780,7 +780,9 @@ def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path
         status = "failed"
     if event_failed and status == "success":
         status = "failed"
-    read_only_command_failed = role.get("write") is False and bool(parsed.get("commands"))
+    read_only_command_failed = role.get("write") is False and any(
+        not command.get("policy_denied") for command in parsed.get("commands", [])
+    )
     command_error = ""
     if read_only_command_failed and status == "success":
         status = "failed"
