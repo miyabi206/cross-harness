@@ -3,10 +3,12 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 import json
+import os
+import re
 import tempfile
 import unittest
 
-from cross_harness.watch import RunWatcher, format_event, watch
+from cross_harness.watch import EventLine, RunWatcher, describe_event, format_event, render_lines, watch
 
 
 class WatchTests(unittest.TestCase):
@@ -23,12 +25,14 @@ class WatchTests(unittest.TestCase):
         first.mkdir()
         (first / "events.jsonl").write_text('{"type":"turn.started"}\n')
         watcher = RunWatcher(self.runs)
-        self.assertEqual([], watcher.poll())
+        self.assertRegex(watcher.poll()[0], r"^── \d\d:\d\d:\d\d · 20260718T174441-11111111")
 
         second = self.runs / "20260718T174442-22222222"
         second.mkdir()
-        (second / "events.jsonl").write_text('{"type":"turn.completed"}\n')
-        self.assertEqual(["[20260718T174442-22222222] turn.completed"], watcher.poll())
+        (second / "events.jsonl").write_text('{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}\n')
+        lines = watcher.poll()
+        self.assertRegex(lines[0], r"^── \d\d:\d\d:\d\d · 20260718T174442-22222222")
+        self.assertEqual("  ⎿ 10 in / 2 out", lines[1])
 
     def test_initial_attach_skips_finished_run_history_and_verdict(self):
         run = self.runs / "20260718T174442-2d5c2ebf"
@@ -43,7 +47,7 @@ class WatchTests(unittest.TestCase):
         older.mkdir()
         newer.mkdir()
         watcher = RunWatcher(self.runs)
-        self.assertEqual([], watcher.poll())
+        watcher.poll()
         (older / "ORPHANED").write_text("marked\n")
         self.assertEqual([], watcher.poll())
         self.assertEqual(newer, watcher.run_dir)
@@ -54,12 +58,12 @@ class WatchTests(unittest.TestCase):
             "type": "item.completed",
             "item": {"type": "command_execution", "command": command, "exit_code": 7, "aggregated_output": "secret"},
         })
-        self.assertEqual("[run] item.completed command_execution: python " + "x" * 112 + "…, exit_code=7", line)
+        self.assertEqual("  ⏺ Bash   python " + "x" * 112 + "…\n  ⎿ exit 7", line)
         change = format_event(Path("run"), {
             "type": "item.completed",
             "item": {"type": "file_change", "changes": [{"kind": "modified", "path": "src/a.py"}]},
         })
-        self.assertEqual("[run] item.completed file_change: modified src/a.py", change)
+        self.assertEqual("  ⏺ Edit   src/a.py", change)
 
     def test_formats_claude_tool_use_and_result_details(self):
         command = "uv run pytest " + "x" * 200
@@ -72,14 +76,14 @@ class WatchTests(unittest.TestCase):
             ]},
         })
         self.assertEqual(
-            "[run] assistant tool_use: Bash uv run pytest " + "x" * 105 + "…, Edit src/a.py, Write tests/test_a.py",
+            "  ⏺ Bash   uv run pytest " + "x" * 105 + "…\n  ⏺ Edit   src/a.py\n  ⏺ Write  tests/test_a.py",
             tool_use,
         )
         tool_result = format_event(Path("run"), {
             "type": "user",
             "message": {"content": [{"type": "tool_result", "is_error": True, "content": "secret"}]},
         })
-        self.assertEqual("[run] user tool_result: failed=1", tool_result)
+        self.assertEqual("  ⎿ error (1)", tool_result)
 
     def test_renders_final_verdict_once(self):
         watcher = RunWatcher(self.runs)
@@ -87,7 +91,7 @@ class WatchTests(unittest.TestCase):
         run = self.runs / "20260718T174442-22222222"
         run.mkdir()
         (run / "state.json").write_text(json.dumps({"status": "partial", "error": "not printed"}))
-        self.assertEqual(["[20260718T174442-22222222] verdict: partial"], watcher.poll())
+        self.assertEqual(["  ◐ partial"], watcher.poll())
         self.assertEqual([], watcher.poll())
 
     def test_missing_or_empty_runs_root_waits_quietly(self):
@@ -104,6 +108,85 @@ class WatchTests(unittest.TestCase):
             with redirect_stdout(output):
                 self.assertEqual(0, watch(output=output))
         self.assertEqual("", output.getvalue())
+
+    def test_describe_codex_event_variants(self):
+        self.assertEqual(
+            (EventLine("⏺", "Bash", "echo hi"), EventLine("⎿", detail="exit 0", tone="dim")),
+            describe_event({"type": "item.completed", "item": {"type": "command_execution", "command": "echo hi", "exit_code": 0}}),
+        )
+        self.assertEqual(
+            (EventLine("⏺", "Search", "cross harness"),),
+            describe_event({"type": "item.completed", "item": {"type": "web_search", "query": "cross harness"}}),
+        )
+        self.assertEqual((EventLine("·", detail="item.started", noise=True),), describe_event({"type": "item.started"}))
+
+    def test_describe_claude_event_variants(self):
+        event = {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "I will inspect it."},
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "src/a.py"}},
+            {"type": "tool_use", "name": "Grep", "input": {"pattern": "watch"}},
+        ]}}
+        self.assertEqual(
+            (EventLine("›", detail="I will inspect it.", wrap=True), EventLine("⏺", "Read", "src/a.py"), EventLine("⏺", "Grep", "watch")),
+            describe_event(event),
+        )
+        self.assertEqual((EventLine("·", detail="system", noise=True),), describe_event({"type": "system", "subtype": "init"}))
+
+    def test_noise_is_hidden_by_default_and_restored_by_all(self):
+        event = {"type": "system", "subtype": "init", "secret": "not visible"}
+        self.assertEqual([], render_lines(describe_event(event)))
+        self.assertEqual(["  · system"], render_lines(describe_event(event), show_all=True))
+
+    def test_sensitive_payloads_never_render_even_with_all(self):
+        events = [
+            {"type": "item.completed", "item": {"type": "command_execution", "command": "echo safe", "aggregated_output": "AGGREGATED_SECRET"}},
+            {"type": "user", "message": {"content": [{"type": "tool_result", "content": "TOOL_RESULT_SECRET"}]}},
+        ]
+        output = "\n".join(line for event in events for line in render_lines(describe_event(event), show_all=True))
+        self.assertNotIn("AGGREGATED_SECRET", output)
+        self.assertNotIn("TOOL_RESULT_SECRET", output)
+        watcher = RunWatcher(self.runs, show_all=True)
+        watcher.poll()
+        run = self.runs / "20260718T174442-22222222"
+        run.mkdir()
+        (run / "state.json").write_text(json.dumps({"status": "failed", "error": "STATE_SECRET", "blocked_reason": "BLOCKED_SECRET"}))
+        output = "\n".join(watcher.poll())
+        self.assertNotIn("STATE_SECRET", output)
+        self.assertNotIn("BLOCKED_SECRET", output)
+
+    def test_color_controls_and_non_tty_default(self):
+        line = (EventLine("✔", detail="success", tone="green"),)
+        self.assertNotIn("\033[", "\n".join(render_lines(line, color=False)))
+        self.assertIn("\033[", "\n".join(render_lines(line, color=True)))
+        output = StringIO()
+        run = self.runs / "20260718T174442-22222222"
+        run.mkdir()
+        with patch("cross_harness.watch.load_config", return_value={"runtime_root": str(self.runs.parent)}), patch(
+            "cross_harness.watch.time.sleep", side_effect=KeyboardInterrupt
+        ), patch.dict(os.environ, {"NO_COLOR": "1"}):
+            self.assertEqual(0, watch(output=output, color="auto"))
+        self.assertNotIn("\033[", output.getvalue())
+        output = StringIO()
+        with patch("cross_harness.watch.load_config", return_value={"runtime_root": str(self.runs.parent)}), patch(
+            "cross_harness.watch.time.sleep", side_effect=KeyboardInterrupt
+        ):
+            self.assertEqual(0, watch(output=output, color="always"))
+        self.assertIn("\033[", output.getvalue())
+
+    def test_header_once_for_active_run_and_not_completed_run(self):
+        active = self.runs / "20260718T174442-22222222"
+        active.mkdir()
+        (active / "execution.json").write_text(json.dumps({"role_name": "implementer", "harness": "codex"}))
+        watcher = RunWatcher(self.runs)
+        self.assertRegex(watcher.poll()[0], r"^── \d\d:\d\d:\d\d · implementer · codex")
+        self.assertEqual([], watcher.poll())
+        (active / "state.json").write_text(json.dumps({"status": "success"}))
+        self.assertEqual(["  ✔ success"], watcher.poll())
+
+    def test_long_agent_message_wraps_at_requested_width(self):
+        lines = render_lines((EventLine("›", detail="one two three four five six", wrap=True),), width=12)
+        self.assertEqual(["  › one two ", "    three ", "    four ", "    five six"], lines)
+        self.assertTrue(all(len(line) <= 12 for line in lines))
 
 
 if __name__ == "__main__":

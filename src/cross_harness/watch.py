@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO
+from typing import Iterable, TextIO
 import json
+import os
+import shutil
 import time
 
 from .config import load_config
@@ -11,6 +14,26 @@ from .paths import user_paths
 
 _VERDICTS = {"success", "failed", "blocked", "partial"}
 _COMMAND_LIMIT = 120
+_DEFAULT_WIDTH = 100
+_RESET = "\033[0m"
+_BOLD = "\033[1m"
+_DIM = "\033[2m"
+_RED = "\033[31m"
+_GREEN = "\033[32m"
+_YELLOW = "\033[33m"
+_CYAN = "\033[36m"
+
+
+@dataclass(frozen=True)
+class EventLine:
+    """A safe, structured watch line before terminal rendering."""
+
+    marker: str
+    label: str = ""
+    detail: str = ""
+    noise: bool = False
+    tone: str = ""
+    wrap: bool = False
 
 
 def _short_command(value: object) -> str:
@@ -20,94 +43,203 @@ def _short_command(value: object) -> str:
     return command[: _COMMAND_LIMIT - 1] + "…"
 
 
-def format_event(run_dir: Path, event: dict) -> str:
-    """Render a safe, single-line description of one executor event."""
+def _usage_line(usage: object) -> EventLine:
+    data = usage if isinstance(usage, dict) else {}
+    incoming = data.get("input_tokens", 0)
+    outgoing = data.get("output_tokens", 0)
+    incoming = incoming if isinstance(incoming, int) and not isinstance(incoming, bool) else 0
+    outgoing = outgoing if isinstance(outgoing, int) and not isinstance(outgoing, bool) else 0
+    return EventLine("⎿", detail=f"{_token_count(incoming)} in / {_token_count(outgoing)} out", tone="dim")
+
+
+def _token_count(value: int) -> str:
+    if abs(value) < 1000:
+        return str(value)
+    rendered = f"{value / 1000:.1f}".rstrip("0").rstrip(".")
+    return f"{rendered}k"
+
+
+def _error_text(event: dict) -> str:
+    error = event.get("error")
+    if isinstance(error, str):
+        return error
+    if isinstance(error, dict) and isinstance(error.get("message"), str):
+        return error["message"]
+    message = event.get("message")
+    return message if isinstance(message, str) else "error"
+
+
+def _claude_tool_target(name: str, inputs: dict) -> str:
+    if name == "Bash":
+        return _short_command(inputs.get("command"))
+    if name in {"Read", "Edit", "Write"}:
+        value = inputs.get("file_path")
+    elif name in {"Grep", "Glob"}:
+        value = inputs.get("pattern")
+    else:
+        return ""
+    return _short_command(value) if isinstance(value, str) else ""
+
+
+def _codex_change_label(kind: object) -> str:
+    return {
+        "modified": "Edit",
+        "update": "Edit",
+        "added": "Write",
+        "created": "Write",
+        "create": "Write",
+        "deleted": "Delete",
+        "delete": "Delete",
+    }.get(kind, "Edit")
+
+
+def _noise(detail: str) -> tuple[EventLine, ...]:
+    # Details here are fixed event names, never event payloads.
+    return (EventLine("·", detail=detail, noise=True),)
+
+
+def describe_event(event: dict) -> tuple[EventLine, ...]:
+    """Describe only allow-listed fields from a Codex or Claude stream event."""
     event_type = event.get("type")
-    prefix = f"[{run_dir.name}]"
     if not isinstance(event_type, str):
-        return f"{prefix} event"
+        return _noise("event")
+
     if event_type == "assistant":
-        details = _claude_tool_use_details(event)
-        suffix = f": {', '.join(details)}" if details else ""
-        return f"{prefix} assistant tool_use{suffix}"
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            return _noise("assistant")
+        lines: list[EventLine] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "text" and isinstance(block.get("text"), str):
+                lines.append(EventLine("›", detail=block["text"], wrap=True))
+            elif block_type == "tool_use" and isinstance(block.get("name"), str):
+                inputs = block.get("input") if isinstance(block.get("input"), dict) else {}
+                lines.append(EventLine("⏺", label=block["name"], detail=_claude_tool_target(block["name"], inputs)))
+            elif block_type == "thinking":
+                lines.append(EventLine("·", detail="thinking", noise=True))
+        return tuple(lines) or _noise("assistant")
+
     if event_type == "user":
-        details = _claude_tool_result_details(event)
-        suffix = f": {', '.join(details)}" if details else ""
-        return f"{prefix} user tool_result{suffix}"
-    if not event_type.startswith("item."):
-        return f"{prefix} {event_type}"
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            return _noise("user")
+        results = [block for block in content if isinstance(block, dict) and block.get("type") == "tool_result"]
+        if not results:
+            return _noise("user")
+        failed = sum(block.get("is_error") is True for block in results)
+        status = "error" if failed else "ok"
+        return (EventLine("⎿", detail=f"{status} ({len(results)})", tone="red" if failed else "dim"),)
 
-    item = event.get("item")
-    item = item if isinstance(item, dict) else {}
-    item_type = item.get("type")
-    item_type = item_type if isinstance(item_type, str) else "unknown"
-    details: list[str] = []
-    if item_type == "command_execution":
-        command = _short_command(item.get("command"))
-        if command:
-            details.append(command)
-        if "exit_code" in item and isinstance(item["exit_code"], int):
-            details.append(f"exit_code={item['exit_code']}")
-    elif item_type == "file_change":
-        changes = item.get("changes")
-        if isinstance(changes, list):
-            for change in changes:
-                if not isinstance(change, dict) or not isinstance(change.get("path"), str):
-                    continue
-                kind = change.get("kind")
-                details.append(f"{kind} {change['path']}" if isinstance(kind, str) else change["path"])
-    suffix = f": {', '.join(details)}" if details else ""
-    return f"{prefix} {event_type} {item_type}{suffix}"
+    if event_type == "rate_limit_event":
+        info = event.get("rate_limit_info")
+        status = info.get("status") if isinstance(info, dict) else None
+        if isinstance(status, str) and status != "allowed":
+            return (EventLine("⚠", label="rate limit", detail=status, tone="yellow"),)
+        return _noise("rate_limit_event")
+
+    if event_type == "result":
+        return (_usage_line(event.get("usage")),)
+
+    if event_type in {"turn.failed", "error"}:
+        return (EventLine("✖", label="error", detail=_error_text(event), tone="red"),)
+
+    if event_type == "turn.completed":
+        return (_usage_line(event.get("usage")),)
+
+    if event_type.startswith("item."):
+        item = event.get("item") if isinstance(event.get("item"), dict) else {}
+        item_type = item.get("type")
+        if event_type != "item.completed":
+            return _noise("item.started" if event_type == "item.started" else "item")
+        if item_type == "command_execution":
+            lines = [EventLine("⏺", label="Bash", detail=_short_command(item.get("command")))]
+            if isinstance(item.get("exit_code"), int) and not isinstance(item.get("exit_code"), bool):
+                code = item["exit_code"]
+                lines.append(EventLine("⎿", detail=f"exit {code}", tone="dim" if code == 0 else "red"))
+            return tuple(lines)
+        if item_type == "file_change":
+            changes = item.get("changes")
+            if not isinstance(changes, list):
+                return _noise("file_change")
+            return tuple(
+                EventLine("⏺", label=_codex_change_label(change.get("kind")), detail=_short_command(change["path"]))
+                for change in changes
+                if isinstance(change, dict) and isinstance(change.get("path"), str)
+            ) or _noise("file_change")
+        if item_type == "agent_message" and isinstance(item.get("text"), str):
+            return (EventLine("›", detail=item["text"], wrap=True),)
+        if item_type == "web_search" and isinstance(item.get("query"), str):
+            return (EventLine("⏺", label="Search", detail=_short_command(item["query"])),)
+        return _noise("item.completed")
+
+    if event_type in {"thread.started", "turn.started", "system"}:
+        return _noise(event_type)
+    return _noise("event")
 
 
-def _claude_tool_use_details(event: dict) -> list[str]:
-    message = event.get("message")
-    if not isinstance(message, dict):
-        return []
-    content = message.get("content")
-    if not isinstance(content, list):
-        return []
-    details: list[str] = []
-    for block in content:
-        if not isinstance(block, dict) or block.get("type") != "tool_use":
+def _styled(value: str, code: str, color: bool) -> str:
+    return f"{code}{value}{_RESET}" if color and code else value
+
+
+def _render_one(line: EventLine, *, width: int, color: bool) -> list[str]:
+    marker = _styled(line.marker, _CYAN if line.marker in {"⏺", "›"} else "", color)
+    if line.label:
+        label = _styled(f"{line.label:<7}", _BOLD + _CYAN, color)
+        prefix = f"  {marker} {label}"
+    else:
+        prefix = f"  {marker} "
+    detail = _styled(line.detail, {"dim": _DIM, "red": _RED, "green": _GREEN, "yellow": _YELLOW}.get(line.tone, ""), color)
+    if not line.wrap:
+        return [f"{prefix}{detail}".rstrip()]
+
+    # ANSI escapes are deliberately absent from wrapped message body width math.
+    raw_prefix = f"  {line.marker} " + (f"{line.label:<7}" if line.label else "")
+    available = max(1, width - len(raw_prefix))
+    import textwrap
+    chunks = textwrap.wrap(line.detail, width=available, replace_whitespace=False, drop_whitespace=False) or [""]
+    first = f"{prefix}{chunks[0]}"
+    continuation = " " * len(raw_prefix)
+    return [first, *(f"{continuation}{chunk}" for chunk in chunks[1:])]
+
+
+def render_lines(lines: Iterable[EventLine], *, width: int = _DEFAULT_WIDTH, color: bool = False, show_all: bool = False) -> list[str]:
+    """Render structured event descriptions without run-directory prefixes."""
+    rendered: list[str] = []
+    for line in lines:
+        if line.noise and not show_all:
             continue
-        name = block.get("name")
-        inputs = block.get("input")
-        if not isinstance(name, str) or not isinstance(inputs, dict):
-            continue
-        if name == "Bash":
-            command = _short_command(inputs.get("command"))
-            if command:
-                details.append(f"Bash {command}")
-        elif name in {"Edit", "Write"}:
-            file_path = inputs.get("file_path")
-            if isinstance(file_path, str) and file_path:
-                details.append(f"{name} {file_path}")
-    return details
+        rows = _render_one(line, width=max(1, width), color=color)
+        if line.noise and color:
+            rows = [_styled(row, _DIM, True) for row in rows]
+        rendered.extend(rows)
+    return rendered
 
 
-def _claude_tool_result_details(event: dict) -> list[str]:
-    message = event.get("message")
-    if not isinstance(message, dict):
-        return []
-    content = message.get("content")
-    if not isinstance(content, list):
-        return []
-    count = sum(
-        1
-        for block in content
-        if isinstance(block, dict) and block.get("type") == "tool_result"
-    )
-    if count == 0:
-        return []
-    failures = sum(
-        1
-        for block in content
-        if isinstance(block, dict)
-        and block.get("type") == "tool_result"
-        and block.get("is_error") is True
-    )
-    return [f"failed={failures}" if failures else f"completed={count}"]
+def format_event(run_dir: Path, event: dict) -> str:
+    """Compatibility helper for callers wanting a rendered event string."""
+    del run_dir
+    return "\n".join(render_lines(describe_event(event)))
+
+
+def run_header(run_dir: Path, *, color: bool = False) -> str:
+    """Return a defensive, human-readable header for an active run."""
+    role = harness = run_dir.name
+    try:
+        record = json.loads((run_dir / "execution.json").read_text(encoding="utf-8"))
+        if isinstance(record, dict):
+            if isinstance(record.get("role_name"), str):
+                role = record["role_name"]
+            if isinstance(record.get("harness"), str):
+                harness = record["harness"]
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        pass
+    value = f"── {time.strftime('%H:%M:%S')} · {role} · {harness} ──────"
+    return _styled(value, _BOLD, color)
 
 
 def newest_run(runs_root: Path) -> Path | None:
@@ -122,11 +254,15 @@ def newest_run(runs_root: Path) -> Path | None:
 class RunWatcher:
     """Incrementally follow the newest run directory using read-only operations."""
 
-    def __init__(self, runs_root: Path):
+    def __init__(self, runs_root: Path, *, show_all: bool = False, color: bool = False, width: int = _DEFAULT_WIDTH):
         self.runs_root = runs_root
+        self.show_all = show_all
+        self.color = color
+        self.width = width
         self.run_dir: Path | None = None
         self._event_offset = 0
         self._verdict_rendered = False
+        self._header_pending = False
         self._initial_scan = True
 
     def poll(self) -> list[str]:
@@ -137,23 +273,39 @@ class RunWatcher:
             self._attach(newest, skip_existing=initial_scan)
         if self.run_dir is None:
             return []
-        return [*self._event_lines(), *self._verdict_line()]
+        lines: list[str] = []
+        if self._header_pending:
+            self._header_pending = False
+            lines.append(run_header(self.run_dir, color=self.color))
+        return [*lines, *self._event_lines(), *self._verdict_line()]
 
     def _attach(self, run_dir: Path | None, skip_existing: bool) -> None:
         self.run_dir = run_dir
         self._event_offset = 0
         self._verdict_rendered = False
-        if run_dir is None or not skip_existing:
+        self._header_pending = False
+        if run_dir is None:
+            return
+        status = self._state_status(run_dir)
+        # A completed run present when watch starts is historical and must remain
+        # entirely quiet.  A run that finishes after watch has started still gets
+        # its one final verdict.
+        self._verdict_rendered = skip_existing and status in _VERDICTS
+        self._header_pending = status not in _VERDICTS
+        if not skip_existing:
             return
         try:
             self._event_offset = (run_dir / "events.jsonl").stat().st_size
         except OSError:
             pass
+
+    @staticmethod
+    def _state_status(run_dir: Path) -> object:
         try:
             state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return
-        self._verdict_rendered = isinstance(state, dict) and state.get("status") in _VERDICTS
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        return state.get("status") if isinstance(state, dict) else None
 
     def _event_lines(self) -> list[str]:
         assert self.run_dir is not None
@@ -176,35 +328,50 @@ class RunWatcher:
             except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
             if isinstance(event, dict):
-                lines.append(format_event(self.run_dir, event))
+                lines.extend(render_lines(describe_event(event), width=self.width, color=self.color, show_all=self.show_all))
         return lines
 
     def _verdict_line(self) -> list[str]:
         assert self.run_dir is not None
         if self._verdict_rendered:
             return []
-        try:
-            state = json.loads((self.run_dir / "state.json").read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return []
-        status = state.get("status") if isinstance(state, dict) else None
+        status = self._state_status(self.run_dir)
         if status not in _VERDICTS:
             return []
         self._verdict_rendered = True
-        return [f"[{self.run_dir.name}] verdict: {status}"]
+        marker, tone = {
+            "success": ("✔", "green"),
+            "failed": ("✖", "red"),
+            "blocked": ("⚠", "yellow"),
+            "partial": ("◐", "yellow"),
+        }[status]
+        return render_lines((EventLine(marker, detail=status, tone=tone),), width=self.width, color=self.color)
 
 
-def watch(config_path: Path | None = None, home: Path | None = None, output: TextIO | None = None, poll_seconds: float = 0.25) -> int:
+def watch(
+    config_path: Path | None = None,
+    home: Path | None = None,
+    output: TextIO | None = None,
+    poll_seconds: float = 0.25,
+    *,
+    show_all: bool = False,
+    color: str = "auto",
+) -> int:
     """Follow delegation activity until interrupted, without mutating runtime state."""
     if poll_seconds <= 0:
         raise ValueError("poll seconds must be positive")
+    if color not in {"auto", "always", "never"}:
+        raise ValueError("color must be auto, always, or never")
     paths = user_paths(home)
     config = load_config(config_path, paths.home)
-    watcher = RunWatcher(Path(config["runtime_root"]) / "runs")
     stream = output
     if stream is None:
         import sys
         stream = sys.stdout
+    is_tty = getattr(stream, "isatty", lambda: False)()
+    use_color = color == "always" or (color == "auto" and "NO_COLOR" not in os.environ and is_tty)
+    width = shutil.get_terminal_size(fallback=(_DEFAULT_WIDTH, 24)).columns if is_tty else _DEFAULT_WIDTH
+    watcher = RunWatcher(Path(config["runtime_root"]) / "runs", show_all=show_all, color=use_color, width=width)
     try:
         while True:
             for line in watcher.poll():

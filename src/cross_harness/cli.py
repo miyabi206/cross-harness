@@ -60,6 +60,8 @@ def parser() -> argparse.ArgumentParser:
 
     watch_parser = commands.add_parser("watch", help="follow the newest delegated run")
     watch_parser.add_argument("--config", type=Path)
+    watch_parser.add_argument("--all", action="store_true", help="include lifecycle events")
+    watch_parser.add_argument("--color", choices=("auto", "always", "never"), default="auto")
 
     retry_parser = commands.add_parser("retry", help="resume a failed task with a delta instruction")
     retry_parser.add_argument("--run-dir", required=True, type=Path)
@@ -172,7 +174,7 @@ def main(argv: list[str] | None = None) -> int:
             print((args.run.resolve() / "summary.txt").read_text(encoding="utf-8"), end="")
             return 0 if summary["status"] == "success" else 3
         elif args.command == "watch":
-            return watch(args.config, home)
+            return watch(args.config, home, show_all=args.all, color=args.color)
         elif args.command == "retry":
             summary = retry(args.run_dir.resolve(), args.task_file.resolve(), args.config, home)
             print((Path(summary["run_dir"]) / "summary.txt").read_text(encoding="utf-8"), end="")
