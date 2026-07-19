@@ -11,8 +11,11 @@ security_reviewer on Codex.
 
 The harness uses saved ChatGPT subscription authentication only. It rejects any
 `*_API_KEY` environment variable, non-OpenAI provider override, custom OpenAI
-base URL, unknown authentication state, nested harness launch, write delegation
-over an existing dirty worktree, rate-limit fallback, and exhausted retries.
+base URL, unknown authentication state, write delegation over an existing dirty
+worktree, rate-limit fallback, and exhausted retries. It blocks recursive
+delegation through its wrapper and blocks direct launch commands matched by its
+PreToolUse hook; the hook cannot inspect indirect launches through scripts or
+Makefiles. SessionStart rejection is notification only, not a blocking boundary.
 
 ## Prerequisites
 
