@@ -1,4 +1,7 @@
 version = 1
+# Declaration only: recorded with each run and passed to child environments. It
+# does not detect the actual orchestrator; setting this to "codex" does not make
+# Codex the orchestrator.
 parent_harness = "claude"
 runtime_root = "~/.local/state/cross-harness"
 retention_days = 7

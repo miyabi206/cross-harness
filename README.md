@@ -1,8 +1,13 @@
 # Cross Harness
 
-Personal, fail-closed orchestration from Claude Code to Codex CLI. Claude keeps
-requirements, planning, review, and reporting; Codex performs bounded
-implementation, test, debug, and second-review work through one wrapper.
+Personal, fail-closed orchestration from Claude Code to Codex CLI. The supported
+topology is Claude as the orchestrator and Codex as the executor: Claude keeps
+requirements, planning, review, testing, and reporting, while Codex performs
+bounded implementation, debugging, and security-review work through one wrapper.
+Every delegated role has a `harness` setting and can be placed on either
+harness, but this does not make Codex an orchestrator. The current defaults put
+explorer, reviewer, and tester on Claude; implementer, debugger, and
+security_reviewer on Codex.
 
 The harness uses saved ChatGPT subscription authentication only. It rejects any
 `*_API_KEY` environment variable, non-OpenAI provider override, custom OpenAI
@@ -77,10 +82,12 @@ editing it does not change the running configuration.
 
 Each role has `harness`, `model`, and `effort` settings. `harness` selects
 Claude or Codex as the execution target, and any role can be assigned to either
-harness. `model` accepts any string without validation. `effort` is also passed
-through without rejection; `validate` only warns when it is outside the known
-values: Codex supports `minimal`, `low`, `medium`, `high`, and `xhigh`; Claude
-supports `low`, `medium`, `high`, `xhigh`, and `max`.
+harness. The supported parent remains Claude; setting a role to Codex changes
+only that role's execution target. `model` accepts any string without
+validation. `effort` is also passed through without rejection; `validate` only
+warns when it is outside the known values: Codex supports `minimal`, `low`,
+`medium`, `high`, and `xhigh`; Claude supports `low`, `medium`, `high`, `xhigh`,
+and `max`.
 
 Codex role changes apply to the next `delegate`. Claude role changes require a
 new Claude session, because its session-start hook synchronizes
