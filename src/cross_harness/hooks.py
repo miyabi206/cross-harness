@@ -10,7 +10,7 @@ import subprocess
 import sys
 
 from .auth import detected_api_keys, sanitized_environment, verify_codex_chatgpt
-from .config import load_config
+from .config import effective_mode, load_config
 from .errors import ConfigError
 from .files import atomic_write, dump_json
 from .maintenance import cleanup
@@ -61,7 +61,7 @@ def _input() -> dict | None:
     try:
         value = json.load(sys.stdin)
         return value if isinstance(value, dict) else None
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, OSError):
         return None
 
 
@@ -97,6 +97,33 @@ def _file_path(data: dict | None) -> str | None:
         return None
     path = details.get("file_path")
     return path if isinstance(path, str) and path else None
+
+
+def _cwd(data: dict | None) -> Path | None:
+    """Extract an existing absolute cwd from hook input, failing closed otherwise."""
+    if data is None:
+        return None
+    value = data.get("cwd")
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        cwd = Path(value)
+        if not cwd.is_absolute():
+            return None
+        return cwd.resolve(strict=True) if cwd.is_dir() else None
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _mode_is_off(config: dict, data: dict | None) -> bool:
+    """Allow opt-out only when both config and cwd resolution are trustworthy."""
+    cwd = _cwd(data)
+    if cwd is None:
+        return False
+    try:
+        return effective_mode(config, cwd) == "off"
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ConfigError):
+        return False
 
 
 def _orchestrator_write_path_is_allowed(file_path: str | None) -> bool:
@@ -193,6 +220,11 @@ def claude_pre_tool_use() -> int:
             return _deny("cross-harness: nested executor launch from delegated Claude is blocked")
         return 0
     if name in {"Edit", "Write"}:
+        try:
+            if _mode_is_off(load_config(home=user_paths().home), data):
+                return 0
+        except (OSError, RuntimeError, ValueError, TypeError, ConfigError):
+            pass
         if _orchestrator_write_path_is_allowed(_file_path(data)):
             return 0
         return _deny("cross-harness: Claude is the orchestrator; delegate project edits through cross-harness")
@@ -231,10 +263,15 @@ def claude_session_start(home: Path | None = None) -> int:
         return 0
     if os.environ.get("CROSS_HARNESS_ACTIVE") == "1":
         return _deny("cross-harness: nested Claude launch from a delegated Codex run is blocked")
+    data = _input()
     warnings: list[str] = []
     config = None
     try:
         config = load_config(home=paths.home)
+        if _mode_is_off(config, data):
+            warnings.append(
+                "cross-harness is disabled for this cwd; ignore the managed orchestrator instructions in CLAUDE.md."
+            )
         if (paths.claude / "agents").exists():
             warnings.extend(synchronize_claude_agent_roles(paths, config))
     except Exception as exc:  # hooks must not hide the session for synchronization failure

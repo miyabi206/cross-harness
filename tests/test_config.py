@@ -6,6 +6,7 @@ from cross_harness.config import (
     DELEGATE_KINDS,
     ROLE_DELEGATE_KINDS,
     default_config,
+    effective_mode,
     project_config,
     validate,
     warnings,
@@ -59,6 +60,31 @@ class ConfigTests(unittest.TestCase):
         config = default_config()
         config["projects"] = {"relative/repo": {"checks": ["test"]}}
         self.assertIn("absolute path", "\n".join(validate(config)))
+
+    def test_mode_is_optional_and_defaults_to_on(self):
+        config = copy.deepcopy(default_config())
+        del config["mode"]
+        self.assertEqual([], validate(config))
+        self.assertEqual("on", effective_mode(config, Path("/tmp/project")))
+
+    def test_mode_uses_the_closest_project_override(self):
+        config = copy.deepcopy(default_config())
+        config["mode"] = "off"
+        config["projects"] = {
+            "/tmp/project": {"mode": "on"},
+            "/tmp/project/disabled": {"mode": "off"},
+        }
+        self.assertEqual("on", effective_mode(config, Path("/tmp/project/work")))
+        self.assertEqual("off", effective_mode(config, Path("/tmp/project/disabled/work")))
+        self.assertEqual("off", effective_mode(config, Path("/tmp/other")))
+
+    def test_invalid_modes_are_rejected(self):
+        config = copy.deepcopy(default_config())
+        config["mode"] = "sometimes"
+        config["projects"] = {"/tmp/project": {"mode": True}}
+        errors = "\n".join(validate(config))
+        self.assertIn("mode: expected 'on' or 'off'", errors)
+        self.assertIn("projects./tmp/project.mode: expected 'on' or 'off'", errors)
 
     def test_unknown_efforts_are_warnings_but_empty_efforts_are_errors(self):
         config = copy.deepcopy(default_config())

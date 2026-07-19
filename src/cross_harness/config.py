@@ -30,6 +30,7 @@ TOP_KEYS = {
     "fallback",
     "roles",
     "projects",
+    "mode",
 }
 ROLE_KEYS = {
     "harness",
@@ -42,7 +43,7 @@ ROLE_KEYS = {
     "output_limit_chars",
     "delegate_kinds",
 }
-PROJECT_KEYS = {"checks", "delegate_kinds", "dirty_worktree_policy"}
+PROJECT_KEYS = {"checks", "delegate_kinds", "dirty_worktree_policy", "mode"}
 CODEX_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DELEGATE_KINDS = {"exploration", "implementation", "test", "debug", "review", "security_review"}
@@ -77,7 +78,7 @@ def _integer(config: dict, key: str, low: int, high: int, errors: list[str]) -> 
 def validate(config: dict) -> list[str]:
     errors: list[str] = []
     _unknown(set(config), TOP_KEYS, "root", errors)
-    for key in TOP_KEYS - {"projects"}:
+    for key in TOP_KEYS - {"projects", "mode"}:
         if key not in config:
             errors.append(f"root: missing key {key!r}")
 
@@ -93,6 +94,8 @@ def validate(config: dict) -> list[str]:
     _integer(config, "max_parallel", 1, 2, errors)
     if config.get("dirty_worktree_policy") not in {"stop", "isolate"}:
         errors.append("dirty_worktree_policy: expected 'stop' or 'isolate'")
+    if "mode" in config and config["mode"] not in {"on", "off"}:
+        errors.append("mode: expected 'on' or 'off'")
     if not _string_list(config.get("delegate_kinds")):
         errors.append("delegate_kinds: expected a unique string array")
     elif unknown_kinds := set(config["delegate_kinds"]) - DELEGATE_KINDS:
@@ -167,6 +170,8 @@ def validate(config: dict) -> list[str]:
                 errors.append(f"{location}.delegate_kinds: unsupported values " + ", ".join(sorted(unknown_kinds)))
             if "dirty_worktree_policy" in project and project["dirty_worktree_policy"] not in {"stop", "isolate"}:
                 errors.append(f"{location}.dirty_worktree_policy: expected 'stop' or 'isolate'")
+            if "mode" in project and project["mode"] not in {"on", "off"}:
+                errors.append(f"{location}.mode: expected 'on' or 'off'")
     return errors
 
 
@@ -222,3 +227,9 @@ def project_config(config: dict, cwd: Path) -> dict:
             selected = values
             selected_length = len(str(candidate))
     return selected
+
+
+def effective_mode(config: dict, cwd: Path) -> str:
+    """Return the cwd-specific enforcement mode, defaulting to fail-closed on."""
+    mode = project_config(config, cwd).get("mode", config.get("mode", "on"))
+    return mode if mode in {"on", "off"} else "on"

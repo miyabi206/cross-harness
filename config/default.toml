@@ -3,6 +3,10 @@ version = 1
 # does not detect the actual orchestrator; setting this to "codex" does not make
 # Codex the orchestrator.
 parent_harness = "claude"
+# Enforcement is on by default. Set this to "off" to opt out everywhere, or
+# use [projects."/absolute/path"] with mode = "off" to opt out per project.
+# A project mode overrides this setting; set mode = "on" there to opt back in.
+mode = "on"
 runtime_root = "~/.local/state/cross-harness"
 retention_days = 7
 auth_cache_hours = 24

@@ -42,6 +42,30 @@ class HookTests(unittest.TestCase):
         code, _ = self._run(claude_pre_tool_use, '{"tool_name":"Bash","tool_input":{"command":"/opt/bin/codex exec task"}}')
         self.assertEqual(2, code)
 
+    def test_mode_off_allows_orchestrator_edits_but_not_direct_executor_launches(self):
+        with tempfile.TemporaryDirectory() as folder:
+            project = Path(folder) / "project"
+            project.mkdir()
+            config = {"mode": "on", "projects": {str(project): {"mode": "off"}}}
+            edit = json.dumps({"cwd": str(project), "tool_name": "Write", "tool_input": {"file_path": str(project / "code.py")}})
+            launch = json.dumps({"cwd": str(project), "tool_name": "Bash", "tool_input": {"command": "codex exec nested"}})
+            with patch("cross_harness.hooks.load_config", return_value=config), patch.dict("os.environ", {}, clear=True):
+                self.assertEqual(0, self._run(claude_pre_tool_use, edit)[0])
+                code, message = self._run(claude_pre_tool_use, launch)
+            self.assertEqual(2, code)
+            self.assertIn("direct codex exec", message)
+
+    def test_missing_or_unresolvable_cwd_fails_closed_for_orchestrator_edits(self):
+        config = {"mode": "off", "projects": {}}
+        for cwd in (None, "/does/not/exist"):
+            payload = {"tool_name": "Write", "tool_input": {"file_path": "/tmp/code.py"}}
+            if cwd is not None:
+                payload["cwd"] = cwd
+            with patch("cross_harness.hooks.load_config", return_value=config), patch.dict("os.environ", {}, clear=True):
+                code, message = self._run(claude_pre_tool_use, json.dumps(payload))
+            self.assertEqual(2, code)
+            self.assertIn("orchestrator", message)
+
     def test_orchestrator_can_write_only_claude_plans_and_project_memory(self):
         with tempfile.TemporaryDirectory() as folder:
             home = Path(folder) / "home"
@@ -173,6 +197,21 @@ class HookTests(unittest.TestCase):
                     "claude -p nested",
                 ):
                     payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
+                    code, message = self._run(claude_pre_tool_use, payload)
+                    self.assertEqual(2, code)
+                    self.assertIn("nested executor", message)
+
+    def test_mode_off_cannot_bypass_delegated_read_only_or_nested_launch_guards(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runtime_root = Path(folder) / "runtime"
+            environment = self._execution_environment(runtime_root)
+            config = {"runtime_root": str(runtime_root), "mode": "off", "projects": {"/tmp/project": {"mode": "off"}}}
+            with patch("cross_harness.hooks.load_config", return_value=config), patch.dict("os.environ", environment, clear=True):
+                code, message = self._run(claude_pre_tool_use, '{"cwd":"/tmp/project","tool_name":"Write","tool_input":{}}')
+                self.assertEqual(2, code)
+                self.assertIn("read-only", message)
+                for command in ("codex exec nested", "claude -p nested", "cross-harness delegate --role tester"):
+                    payload = json.dumps({"cwd": "/tmp/project", "tool_name": "Bash", "tool_input": {"command": command}})
                     code, message = self._run(claude_pre_tool_use, payload)
                     self.assertEqual(2, code)
                     self.assertIn("nested executor", message)
@@ -349,6 +388,37 @@ class HookTests(unittest.TestCase):
         with patch.dict("os.environ", environment, clear=True), patch("sys.stderr", new_callable=StringIO) as stderr:
             self.assertEqual(2, claude_session_start(Path("/tmp/nonexistent-home")))
             self.assertIn("nested Claude", stderr.getvalue())
+
+    def test_nested_session_guard_precedes_mode_resolution(self):
+        environment = {"CROSS_HARNESS_ACTIVE": "1", "CROSS_HARNESS_EXECUTOR": "codex"}
+        with patch.dict("os.environ", environment, clear=True), patch("cross_harness.hooks.load_config") as load, patch("sys.stdin", StringIO('{"cwd":"/tmp/project"}')):
+            self.assertEqual(2, claude_session_start(Path("/tmp/nonexistent-home")))
+        load.assert_not_called()
+
+    def test_session_start_annuls_managed_orchestrator_guidance_when_mode_is_off(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            project = root / "project"
+            project.mkdir()
+            config = {
+                "runtime_root": str(root / "runtime"),
+                "auth_cache_hours": 24,
+                "mode": "on",
+                "projects": {str(project): {"mode": "off"}},
+            }
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch("cross_harness.hooks.load_config", return_value=config),
+                patch("cross_harness.hooks.detected_api_keys", return_value=[]),
+                patch("cross_harness.hooks.subprocess.run", return_value=subprocess.CompletedProcess([], 0, '{"loggedIn": true}', "")),
+                patch("cross_harness.hooks.verify_codex_chatgpt"),
+                patch("cross_harness.hooks.cleanup"),
+                patch("sys.stdin", StringIO(json.dumps({"cwd": str(project)}))),
+                patch("sys.stdout", new_callable=StringIO) as stdout,
+            ):
+                self.assertEqual(0, claude_session_start(root / "home"))
+            self.assertIn("disabled for this cwd", stdout.getvalue())
+            self.assertIn("ignore the managed orchestrator instructions in CLAUDE.md", stdout.getvalue())
 
     @patch("cross_harness.hooks.cleanup")
     @patch("cross_harness.hooks.verify_codex_chatgpt")
