@@ -8,7 +8,7 @@ import re
 import tempfile
 import unittest
 
-from cross_harness.watch import EventLine, RunWatcher, describe_event, format_event, render_lines, watch
+from cross_harness.watch import EventLine, RunWatcher, describe_event, format_event, render_lines, run_header, watch
 
 
 class WatchTests(unittest.TestCase):
@@ -187,6 +187,38 @@ class WatchTests(unittest.TestCase):
         lines = render_lines((EventLine("›", detail="one two three four five six", wrap=True),), width=12)
         self.assertEqual(["  › one two ", "    three ", "    four ", "    five six"], lines)
         self.assertTrue(all(len(line) <= 12 for line in lines))
+
+    def test_multiline_agent_message_wraps_each_paragraph_with_marker_indent(self):
+        event = {"type": "item.completed", "item": {"type": "agent_message", "text": "一行目です。\n二行目です。\n三行目です。"}}
+        self.assertEqual(
+            ["  › 一行目です。", "    二行目です。", "    三行目です。"],
+            render_lines(describe_event(event), width=60),
+        )
+
+    def test_agent_message_wraps_by_terminal_cell_width(self):
+        lines = render_lines((EventLine("›", detail="日本語の発話本文です。次の文です。", wrap=True),), width=16)
+        self.assertEqual(["  › 日本語の発話", "    本文です。次", "    の文です。"], lines)
+        self.assertTrue(
+            all(sum(2 if __import__("unicodedata").east_asian_width(char) in {"W", "F"} else 1 for char in line) <= 16 for line in lines)
+        )
+
+    def test_unreadable_execution_header_shows_run_name_once(self):
+        run = self.runs / "20260719T151554-e73c766e"
+        run.mkdir()
+        self.assertRegex(run_header(run), r"· 20260719T151554-e73c766e ──────$")
+        self.assertNotIn("20260719T151554-e73c766e · 20260719T151554-e73c766e", run_header(run))
+
+    def test_delegation_result_message_is_summarized(self):
+        payload = json.dumps({
+            "status": "success",
+            "work_completed": "do not print this",
+            "changed_files": ["src/a.py", "tests/test_a.py"],
+            "tests": ["pytest", "lint"],
+            "error": "do not print this either",
+        })
+        rendered = "\n".join(render_lines((EventLine("›", detail=payload, wrap=True),)))
+        self.assertIn("status=success · changed_files=2 · tests=2", rendered)
+        self.assertNotIn("do not print this", rendered)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,9 @@ from typing import Iterable, TextIO
 import json
 import os
 import shutil
+import textwrap
 import time
+import unicodedata
 
 from .config import load_config
 from .paths import user_paths
@@ -193,18 +195,64 @@ def _render_one(line: EventLine, *, width: int, color: bool) -> list[str]:
         prefix = f"  {marker} {label}"
     else:
         prefix = f"  {marker} "
-    detail = _styled(line.detail, {"dim": _DIM, "red": _RED, "green": _GREEN, "yellow": _YELLOW}.get(line.tone, ""), color)
     if not line.wrap:
+        detail = _styled(line.detail, {"dim": _DIM, "red": _RED, "green": _GREEN, "yellow": _YELLOW}.get(line.tone, ""), color)
         return [f"{prefix}{detail}".rstrip()]
 
     # ANSI escapes are deliberately absent from wrapped message body width math.
     raw_prefix = f"  {line.marker} " + (f"{line.label:<7}" if line.label else "")
     available = max(1, width - len(raw_prefix))
-    import textwrap
-    chunks = textwrap.wrap(line.detail, width=available, replace_whitespace=False, drop_whitespace=False) or [""]
-    first = f"{prefix}{chunks[0]}"
+    body = line.detail
+    try:
+        payload = json.loads(body)
+        if isinstance(payload, dict) and "status" in payload:
+            status = payload["status"]
+            changed_files = payload.get("changed_files")
+            tests = payload.get("tests")
+            changed_count = len(changed_files) if isinstance(changed_files, list) else 0
+            test_count = len(tests) if isinstance(tests, list) else 0
+            rendered_status = status if isinstance(status, str) and status in _VERDICTS else "unknown"
+            body = f"status={rendered_status} · changed_files={changed_count} · tests={test_count}"
+    except (TypeError, json.JSONDecodeError):
+        pass
+
+    def display_width(value: str) -> int:
+        return sum(
+            0 if unicodedata.combining(char) else 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+            for char in value
+        )
+
+    def split_paragraph(paragraph: str) -> list[str]:
+        tokens = textwrap.TextWrapper(replace_whitespace=False, drop_whitespace=False).wordsep_re.split(paragraph)
+        chunks: list[str] = []
+        chunk = ""
+        for token in tokens:
+            if not token:
+                continue
+            if chunk and display_width(chunk) + display_width(token) > available:
+                chunks.append(chunk)
+                chunk = ""
+            while display_width(token) > available:
+                fitting = ""
+                for char in token:
+                    if fitting and display_width(fitting) + display_width(char) > available:
+                        break
+                    fitting += char
+                if chunk:
+                    chunks.append(chunk)
+                    chunk = ""
+                chunks.append(fitting)
+                token = token[len(fitting):]
+            chunk += token
+        if chunk or not chunks:
+            chunks.append(chunk)
+        return chunks
+
+    chunks = [chunk for paragraph in body.split("\n") for chunk in split_paragraph(paragraph)]
+    detail_tone = {"dim": _DIM, "red": _RED, "green": _GREEN, "yellow": _YELLOW}.get(line.tone, "")
+    first = f"{prefix}{_styled(chunks[0], detail_tone, color)}"
     continuation = " " * len(raw_prefix)
-    return [first, *(f"{continuation}{chunk}" for chunk in chunks[1:])]
+    return [first, *(f"{continuation}{_styled(chunk, detail_tone, color)}" for chunk in chunks[1:])]
 
 
 def render_lines(lines: Iterable[EventLine], *, width: int = _DEFAULT_WIDTH, color: bool = False, show_all: bool = False) -> list[str]:
@@ -228,7 +276,8 @@ def format_event(run_dir: Path, event: dict) -> str:
 
 def run_header(run_dir: Path, *, color: bool = False) -> str:
     """Return a defensive, human-readable header for an active run."""
-    role = harness = run_dir.name
+    role = run_dir.name
+    harness = ""
     try:
         record = json.loads((run_dir / "execution.json").read_text(encoding="utf-8"))
         if isinstance(record, dict):
@@ -238,7 +287,8 @@ def run_header(run_dir: Path, *, color: bool = False) -> str:
                 harness = record["harness"]
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         pass
-    value = f"── {time.strftime('%H:%M:%S')} · {role} · {harness} ──────"
+    identity = f"{role} · {harness}" if harness else role
+    value = f"── {time.strftime('%H:%M:%S')} · {identity} ──────"
     return _styled(value, _BOLD, color)
 
 
