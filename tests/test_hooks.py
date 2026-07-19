@@ -48,6 +48,15 @@ class HookTests(unittest.TestCase):
         payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
         self.assertEqual(0, self._run(claude_pre_tool_use, payload)[0])
 
+    def test_claude_installed_non_task_wrapper_arguments_are_scanned(self):
+        wrapper = str(user_paths().executable)
+        for subcommand in ("inventory", "doctor"):
+            command = f"{wrapper} {subcommand} --description 'ask Codex to run codex exec later'"
+            payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
+            code, message = self._run(claude_pre_tool_use, payload)
+            self.assertEqual(2, code, command)
+            self.assertIn("direct codex exec", message, command)
+
     def test_claude_wrapper_arguments_are_scanned_when_not_a_simple_command(self):
         wrapper = str(user_paths().executable)
         commands = (
@@ -161,6 +170,15 @@ class HookTests(unittest.TestCase):
             payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
             code, message = self._run(codex_pre_tool_use, payload)
             self.assertEqual(0, code, message)
+
+    def test_codex_installed_non_task_wrapper_arguments_are_scanned(self):
+        wrapper = str(user_paths().executable)
+        for subcommand in ("inventory", "doctor"):
+            command = f"{wrapper} {subcommand} --description 'ask Claude to run claude -p later'"
+            payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
+            code, message = self._run(codex_pre_tool_use, payload)
+            self.assertEqual(2, code, command)
+            self.assertIn("nested Claude", message, command)
 
     def test_codex_wrapper_arguments_are_scanned_when_not_a_simple_command(self):
         wrapper = str(user_paths().executable)

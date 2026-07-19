@@ -32,11 +32,13 @@ SIMPLE_WRAPPER_UNSAFE_SYNTAX = re.compile(r"[;&|()\n\r`<>{}]")
 
 
 def _installed_wrapper_arguments(command: str) -> str | None:
-    """Return wrapper arguments only for an unambiguously single wrapper command.
+    """Return task arguments only for an unambiguously single wrapper command.
 
     This intentionally does not parse shell syntax.  It recognizes just the
     installed wrapper's literal absolute path at the start of a command and
-    rejects every shell construct that could introduce another command.
+    rejects every shell construct that could introduce another command.  Only
+    ``task`` is exempt because its text arguments are not executed; other
+    wrapper subcommands may launch an executor themselves.
     """
     executable = user_paths().executable
     if not executable.is_absolute():
@@ -48,6 +50,9 @@ def _installed_wrapper_arguments(command: str) -> str | None:
     if arguments and arguments[0] not in " \t":
         return None
     if SIMPLE_WRAPPER_UNSAFE_SYNTAX.search(command):
+        return None
+    words = arguments.lstrip(" \t").split(maxsplit=1)
+    if not words or words[0] != "task":
         return None
     return arguments
 
