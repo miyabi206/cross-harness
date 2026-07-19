@@ -88,6 +88,36 @@ def _tool(data: dict | None) -> tuple[str, str] | None:
     return name, command
 
 
+def _file_path(data: dict | None) -> str | None:
+    """Extract an Edit or Write target path, failing closed on malformed input."""
+    if data is None:
+        return None
+    details = data.get("tool_input", data.get("toolInput"))
+    if not isinstance(details, dict):
+        return None
+    path = details.get("file_path")
+    return path if isinstance(path, str) and path else None
+
+
+def _orchestrator_write_path_is_allowed(file_path: str | None) -> bool:
+    """Allow only Claude's plan and per-project memory files for orchestration."""
+    if file_path is None:
+        return False
+    try:
+        claude_root = user_paths().claude.resolve()
+        target = Path(file_path).resolve()
+        plans = (claude_root / "plans").resolve()
+        if plans.is_relative_to(claude_root) and target.is_relative_to(plans):
+            return True
+        projects = (claude_root / "projects").resolve()
+        if not projects.is_relative_to(claude_root):
+            return False
+        relative = target.relative_to(projects)
+        return len(relative.parts) >= 2 and relative.parts[1] == "memory"
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return False
+
+
 def _normalized_command(command: str) -> str:
     """Remove shell word-splitting quotes and backslash escapes for matching."""
     normalized: list[str] = []
@@ -146,7 +176,8 @@ def _delegated_claude_execution() -> dict | None:
 
 
 def claude_pre_tool_use() -> int:
-    tool = _tool(_input())
+    data = _input()
+    tool = _tool(data)
     if tool is None:
         return _deny("cross-harness: invalid tool hook input is blocked")
     name, command = tool
@@ -162,6 +193,8 @@ def claude_pre_tool_use() -> int:
             return _deny("cross-harness: nested executor launch from delegated Claude is blocked")
         return 0
     if name in {"Edit", "Write"}:
+        if _orchestrator_write_path_is_allowed(_file_path(data)):
+            return 0
         return _deny("cross-harness: Claude is the orchestrator; delegate project edits through cross-harness")
     wrapper_arguments = _installed_wrapper_arguments(command)
     executor_scan = command if wrapper_arguments is None else ""

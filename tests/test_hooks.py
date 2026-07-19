@@ -42,6 +42,66 @@ class HookTests(unittest.TestCase):
         code, _ = self._run(claude_pre_tool_use, '{"tool_name":"Bash","tool_input":{"command":"/opt/bin/codex exec task"}}')
         self.assertEqual(2, code)
 
+    def test_orchestrator_can_write_only_claude_plans_and_project_memory(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder) / "home"
+            claude = home / ".claude"
+            plans = claude / "plans"
+            memory = claude / "projects" / "project-a" / "memory"
+            plans.mkdir(parents=True)
+            memory.mkdir(parents=True)
+            paths = user_paths(home)
+            allowed = (
+                plans / "implementation-plan.md",
+                memory / "notes.md",
+            )
+            with patch("cross_harness.hooks.user_paths", return_value=paths):
+                for tool_name in ("Edit", "Write"):
+                    for target in allowed:
+                        payload = json.dumps({"tool_name": tool_name, "tool_input": {"file_path": str(target)}})
+                        self.assertEqual(0, self._run(claude_pre_tool_use, payload)[0], payload)
+
+    def test_orchestrator_rejects_all_other_edit_write_paths_and_path_bypasses(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            claude = home / ".claude"
+            plans = claude / "plans"
+            memory = claude / "projects" / "project-a" / "memory"
+            project = root / "project"
+            plans.mkdir(parents=True)
+            memory.mkdir(parents=True)
+            project.mkdir()
+            (plans / "project-link").symlink_to(project, target_is_directory=True)
+            paths = user_paths(home)
+            rejected = (
+                claude / "CLAUDE.md",
+                claude / "settings.json",
+                claude / "settings.local.json",
+                claude / "top-level.txt",
+                claude / "projects" / "project-a" / "notes.md",
+                project / "code.py",
+                plans / ".." / "settings.json",
+                memory / ".." / "notes.md",
+                plans / "project-link" / "code.py",
+            )
+            malformed = (
+                {"tool_name": "Write", "tool_input": {}},
+                {"tool_name": "Write", "tool_input": {"file_path": []}},
+                {"tool_name": "Write", "tool_input": {"file_path": ""}},
+            )
+            with patch("cross_harness.hooks.user_paths", return_value=paths):
+                for tool_name in ("Edit", "Write"):
+                    for target in rejected:
+                        payload = json.dumps({"tool_name": tool_name, "tool_input": {"file_path": str(target)}})
+                        code, message = self._run(claude_pre_tool_use, payload)
+                        self.assertEqual(2, code, payload)
+                        self.assertIn("orchestrator", message, payload)
+                for request in malformed:
+                    code, message = self._run(claude_pre_tool_use, json.dumps(request))
+                    self.assertEqual(2, code, request)
+                    self.assertIn("orchestrator", message, request)
+
     def test_pre_tool_use_rejects_malformed_input(self):
         malformed_payloads = (
             "{",
