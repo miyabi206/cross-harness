@@ -685,6 +685,29 @@ class RunnerTests(unittest.TestCase):
         verify.assert_not_called()
         invoke.assert_not_called()
 
+    def test_retry_rejects_credential_task_files_before_creating_a_run(self):
+        previous = self.root / "retry-credential-previous"
+        previous.mkdir()
+        (previous / "state.json").write_text(json.dumps({
+            "role": "tester", "kind": "test", "cwd": str(self.repo),
+            "thread_id": "00000000-0000-0000-0000-000000000001",
+            "attempts": 1, "signatures": [], "escalated": False, "status": "failed",
+            "model": "haiku", "effort": "medium",
+        }))
+        runtime_runs = self.home / ".local/state/cross-harness/runs"
+        credential_task = self.root / "credentials.json"
+        credential_task.write_text("dummy credential material")
+
+        with self.assertRaisesRegex(HarnessError, "credential or environment files cannot be used as task files"):
+            retry(previous, credential_task, home=self.home)
+        self.assertFalse(runtime_runs.exists())
+
+        secret_task = self.root / "retry-secret.md"
+        secret_task.write_text("OPENAI_API_KEY=dummy-secret-value-for-fixture")
+        with self.assertRaisesRegex(HarnessError, "task file appears to contain credential material; refusing delegation"):
+            retry(previous, secret_task, home=self.home)
+        self.assertFalse(runtime_runs.exists())
+
     @patch("cross_harness.runner.verify_claude_config_ownership")
     @patch("cross_harness.runner.verify_claude_subscription")
     @patch("cross_harness.runner._invoke_safe")

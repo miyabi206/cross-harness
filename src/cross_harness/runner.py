@@ -922,8 +922,15 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         raise HarnessError("blocked runs cannot be retried automatically")
     if state["attempts"] > role["retries"]:
         raise HarnessError("normal retry budget exhausted")
-    if not task_file.is_file() or not task_file.read_text(encoding="utf-8").strip():
-        raise HarnessError("retry delta task file is missing or empty")
+    if not task_file.is_file():
+        raise HarnessError(f"task file not found: {task_file}")
+    if task_file.name.lower() in {"auth.json", ".env", "credentials.json"}:
+        raise HarnessError("credential or environment files cannot be used as task files")
+    task = task_file.read_text(encoding="utf-8")
+    if not task.strip():
+        raise HarnessError("task file is empty")
+    if contains_secret(task):
+        raise HarnessError("task file appears to contain credential material; refusing delegation")
     retry_root = _new_run_dir(Path(config["runtime_root"]))
     shutil.copy2(task_file, retry_root / "task.md")
     _write_baseline(retry_root, Path(state["cwd"]))
@@ -979,7 +986,7 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         "resume": state["thread_id"],
         "sandbox_exec": sandbox_exec,
     }))
-    exit_code = _invoke_safe(command, task_file.read_text(encoding="utf-8"), environment, Path(state["cwd"]), retry_root, role["timeout_seconds"])
+    exit_code = _invoke_safe(command, task, environment, Path(state["cwd"]), retry_root, role["timeout_seconds"])
     if role["harness"] == "claude":
         _write_claude_final_from_events(retry_root)
     summary = finalize_run(retry_root, state["role"], role, state["kind"], Path(state["cwd"]), exit_code, state["attempts"] + 1)
@@ -1019,7 +1026,7 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
             "previous_run": str(retry_root),
             "sandbox_exec": sandbox_exec,
         }))
-        code = _invoke_safe(command, task_file.read_text(encoding="utf-8"), environment | {"CROSS_HARNESS_RUN_DIR": str(escalation_root)}, Path(state["cwd"]), escalation_root, escalation["timeout_seconds"])
+        code = _invoke_safe(command, task, environment | {"CROSS_HARNESS_RUN_DIR": str(escalation_root)}, Path(state["cwd"]), escalation_root, escalation["timeout_seconds"])
         if escalation["harness"] == "claude":
             _write_claude_final_from_events(escalation_root)
         escalated_summary = finalize_run(escalation_root, state["role"], escalation, state["kind"], Path(state["cwd"]), code, new_state["attempts"] + 1)
