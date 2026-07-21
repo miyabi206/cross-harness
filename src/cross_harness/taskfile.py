@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 import re
+import sys
 import uuid
 
 from .config import load_config
@@ -51,12 +52,20 @@ def create_task_file(
     if not 1 <= len(done_when) <= 3 or any(not item.strip() for item in done_when):
         raise HarnessError("task requires one to three non-empty completion conditions")
 
+    normalized_checks = [item.strip() for item in checks or [] if item.strip()]
+    if kind in {"test", "implementation", "debug"} and not normalized_checks:
+        print(
+            f"warning: no checks declared for {kind} task; checks must be executable command lines, "
+            "not prose, or they cannot match executions and are treated as not_run",
+            file=sys.stderr,
+        )
+
     sections: list[tuple[str, list[str]]] = [
         ("Goal", [goal.strip()]),
         ("Done when", [item.strip() for item in done_when]),
         ("Scope", [item.strip() for item in scope or [] if item.strip()]),
         ("Constraints", [item.strip() for item in constraints or [] if item.strip()]),
-        ("Checks", [item.strip() for item in checks or [] if item.strip()]),
+        ("Checks", normalized_checks),
         ("References", [item.strip() for item in references or [] if item.strip()]),
         ("Assumptions", [item.strip() for item in assumptions or [] if item.strip()]),
     ]

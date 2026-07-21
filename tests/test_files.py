@@ -3,7 +3,7 @@ import tempfile
 import unittest
 
 from cross_harness.files import MARKER_START, append_marker, atomic_write, remove_marker
-from cross_harness.summarize import failure_signature, parse_events, render_summary
+from cross_harness.summarize import command_matches_check, failure_signature, parse_events, render_summary
 
 
 class FileTests(unittest.TestCase):
@@ -29,6 +29,17 @@ class FileTests(unittest.TestCase):
             "errors": [], "commands": [],
             "executions": [{"command": "uv run pytest -q", "exit_code": 1}],
         }))
+
+    def test_command_match_ignores_read_only_mentions_but_keeps_executable_check(self):
+        check = "scripts/test.sh"
+        self.assertFalse(command_matches_check('/bin/zsh -lc "cat scripts/test.sh"', check))
+        self.assertFalse(command_matches_check('/bin/zsh -lc "grep scripts/test.sh README.md"', check))
+        self.assertTrue(command_matches_check(
+            '/bin/zsh -lc "env -u CROSS_HARNESS_ACTIVE scripts/test.sh"', check,
+        ))
+        self.assertTrue(command_matches_check(
+            '/bin/zsh -lc "cat scripts/test.sh"', "cat scripts/test.sh",
+        ))
 
     def test_parse_events_reads_claude_stream_result(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -139,6 +150,7 @@ class FileTests(unittest.TestCase):
 
         self.assertIn('changed_files: {"a": "file", "z": 1}, 42', rendered)
         self.assertIn('tests: {"command": "uv run pytest -q", "result": "passed"}; 7', rendered)
+        self.assertIn("checks: none declared", rendered)
 
     def test_summary_renders_nonempty_work_completed_and_missing_final_message(self):
         summary = {

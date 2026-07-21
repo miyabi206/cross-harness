@@ -24,12 +24,28 @@ from .config import CLAUDE_EFFORTS, CODEX_EFFORTS, load_config, project_config
 from .errors import AuthError, ConfigError, DirtyWorktreeError, HarnessError, SupervisorDiedError
 from .files import atomic_write, dump_json, sha256
 from .paths import source_root, user_paths
-from .summarize import failure_signature, load_final, parse_events, render_summary, summary_item_text
+from .summarize import command_matches_check, failure_signature, load_final, parse_events, render_summary, summary_item_text
 from .taskfile import contains_secret
 
 
 RATE_LIMIT = re.compile(r"rate.?limit|usage.?limit|quota|too many requests", re.IGNORECASE)
 AUTH_FAILURE = re.compile(r"unauthorized|authentication|not logged in|login required", re.IGNORECASE)
+_CHECKS_HEADING = re.compile(r"^#{1,6}\s+Checks\s*$", re.IGNORECASE)
+_HEADING = re.compile(r"^#{1,6}\s+")
+_CHECK_ITEM = re.compile(r"^\s*[-*+]\s+(.+?)\s*$")
+_GIT_GLOBAL_OPTION = (
+    r"(?:-(?:C|c)[ \t]+\S+|--(?:git-dir|work-tree|namespace|config-env)"
+    r"(?:[ \t]+\S+|=\S+)|--(?:no-pager|paginate|literal-pathspecs|glob-pathspecs|noglob-pathspecs|icase-pathspecs))"
+)
+_GIT_COMMAND_PREFIX = rf"(?:^|[;\n&|][ \t]*)git(?:[ \t]+{_GIT_GLOBAL_OPTION})*[ \t]+"
+_GIT_SHOW_HEAD_REDIRECT = re.compile(
+    _GIT_COMMAND_PREFIX + r"show[ \t]+HEAD(?:[~^][^\s:]*)?(?::[^\s]+)?[^\n>]*>[ \t]*([^\s;&|]+)"
+)
+_GIT_CHECKOUT_PATHSPEC = re.compile(
+    _GIT_COMMAND_PREFIX + r"checkout(?:[ \t]+[^;&|\s]+)?[ \t]+--[ \t]+([^;&|\n]+)"
+)
+_GIT_RESTORE = re.compile(_GIT_COMMAND_PREFIX + r"restore\b([^;&|\n]*)")
+_GIT_STASH = re.compile(_GIT_COMMAND_PREFIX + r"stash\b([^;&|\n]*)")
 CLAUDE_INSPECTION_TOOLS = "Bash,Read,Grep,Glob"
 CLAUDE_EXECUTOR_CHARTER = """# Cross-harness executor
 
@@ -159,6 +175,111 @@ def _execution_delta(run_dir: Path, current: list[dict]) -> tuple[list[dict], se
                 "removed_preexisting_change": True,
             })
     return delta, set(before)
+
+
+def _declared_checks(run_dir: Path) -> list[str]:
+    """Read the bullet commands from the task file's Checks section."""
+    path = run_dir / "task.md"
+    if not path.exists():
+        return []
+    checks: list[str] = []
+    in_checks = False
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if _CHECKS_HEADING.match(line):
+            in_checks = True
+            continue
+        if in_checks and _HEADING.match(line):
+            break
+        if not in_checks:
+            continue
+        item = _CHECK_ITEM.match(line)
+        if not item:
+            continue
+        check = item.group(1).strip()
+        if len(check) >= 2 and check.startswith("`") and check.endswith("`"):
+            check = check[1:-1].strip()
+        if check:
+            checks.append(check)
+    return checks
+
+
+def _check_results(checks: list[str], executions: list[dict]) -> list[dict]:
+    """Evaluate each check from its last non-policy-denied matching execution."""
+    results: list[dict] = []
+    for check in checks:
+        matching = [
+            execution for execution in executions
+            if not execution.get("policy_denied")
+            and command_matches_check(str(execution.get("command", "")), check)
+        ]
+        if not matching:
+            results.append({"check": check, "status": "not_run", "exit_code": None})
+            continue
+        last = matching[-1]
+        exit_code = last.get("exit_code")
+        results.append({
+            "check": check,
+            "status": "passed" if exit_code == 0 else "not_run" if exit_code is None else "failed",
+            "exit_code": exit_code,
+        })
+    return results
+
+
+def _tracked_path(cwd: Path, value: str) -> str | None:
+    path = value.strip().strip("'\"")
+    if not path or path.startswith("-") or path == "/dev/null":
+        return None
+    result = _git(cwd, ["ls-files", "--error-unmatch", "--", path])
+    if result.returncode == 0:
+        return path
+    basename = Path(path).name
+    if not basename:
+        return None
+    tracked = _git(cwd, ["ls-files"])
+    if any(Path(candidate).name == basename for candidate in tracked.stdout.splitlines()):
+        return path
+    return None
+
+
+def _self_reversions(cwd: Path, executions: list[dict]) -> list[dict]:
+    """Return successful Git commands that can restore tracked worktree state."""
+    reversions: list[dict] = []
+    for execution in executions:
+        if execution.get("policy_denied") or execution.get("exit_code") not in {None, 0}:
+            continue
+        command = str(execution.get("command", ""))
+        targets: list[tuple[str, str]] = []
+        for match in _GIT_SHOW_HEAD_REDIRECT.finditer(command):
+            target = _tracked_path(cwd, match.group(1))
+            if target:
+                targets.append(("git show HEAD redirect", target))
+        for match in _GIT_CHECKOUT_PATHSPEC.finditer(command):
+            for value in match.group(1).split():
+                target = _tracked_path(cwd, value)
+                if target:
+                    targets.append(("git checkout", target))
+        for match in _GIT_RESTORE.finditer(command):
+            values = match.group(1)
+            if "--" in values:
+                values = values.split("--", 1)[1]
+            for value in values.split():
+                target = _tracked_path(cwd, value)
+                if target:
+                    targets.append(("git restore", target))
+        for match in _GIT_STASH.finditer(command):
+            values = match.group(1)
+            if "--" in values:
+                for value in values.split("--", 1)[1].split():
+                    target = _tracked_path(cwd, value)
+                    if target:
+                        targets.append(("git stash", target))
+            elif re.match(r"\s*(?:$|push\b|save\b)", values):
+                targets.append(("git stash", "tracked worktree changes"))
+        for source, target in targets:
+            reversion = {"command": command, "source": source, "target": target}
+            if reversion not in reversions:
+                reversions.append(reversion)
+    return reversions
 
 
 def _create_isolated_worktree(root: Path, run_dir: Path) -> Path:
@@ -779,6 +900,16 @@ def finalize_blocked_run(
 
 def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path, exit_code: int, attempt: int) -> dict:
     parsed = parse_events(run_dir / "events.jsonl")
+    declared_checks = _declared_checks(run_dir)
+    check_results = _check_results(declared_checks, parsed.get("executions", []))
+    unrelated_failed_command_count = sum(
+        1
+        for execution in parsed.get("executions", [])
+        if not execution.get("policy_denied")
+        and execution.get("exit_code") not in {None, 0}
+        and not any(command_matches_check(str(execution.get("command", "")), check) for check in declared_checks)
+    )
+    self_reversions = _self_reversions(cwd, parsed.get("executions", [])) if role.get("write") else []
     final = load_final(run_dir / "final.json") or {}
     stderr = (run_dir / "stderr.log").read_text(encoding="utf-8", errors="replace") if (run_dir / "stderr.log").exists() else ""
     event_failed = bool(parsed.get("errors"))
@@ -798,13 +929,31 @@ def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path
         status = "failed"
     if event_failed and status == "success":
         status = "failed"
-    read_only_command_failed = role.get("write") is False and any(
-        not command.get("policy_denied") for command in parsed.get("commands", [])
-    )
     command_error = ""
-    if read_only_command_failed and status == "success":
+    reversion_error = ""
+    failed_checks = [item for item in check_results if item["status"] == "failed"]
+    unrun_checks = [item for item in check_results if item["status"] == "not_run"]
+    if failed_checks and status == "success":
         status = "failed"
-        command_error = "read-only inspection command failed"
+        command_error = "declared check failed: " + "; ".join(
+            f"{item['check']} (exit {item['exit_code']})" for item in failed_checks
+        )
+    elif unrun_checks and status == "success":
+        status = "partial"
+        command_error = "declared check not run: " + "; ".join(item["check"] for item in unrun_checks)
+    if not declared_checks and kind in {"test", "implementation", "debug"} and status == "success":
+        status = "partial"
+        command_error = (
+            "no checks declared; outcome could not be verified. "
+            "Create the task with an executable command line passed to task create --check."
+        )
+    if self_reversions:
+        reversion_error = "tracked files restored from Git: " + "; ".join(
+            item["target"] for item in self_reversions
+        )
+        command_error = "\n".join(item for item in (command_error, reversion_error) if item)
+        if status == "success":
+            status = "partial"
     executor_error = str(final.get("error") or "\n".join(parsed.get("errors", [])[-3:]) or stderr[-2000:] or "")
     combined_error = "\n".join(error for error in (status_error, command_error, executor_error) if error)
     blocked_category = parsed.get("blocked_category")
@@ -824,6 +973,8 @@ def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path
         combined_error = "authentication failure detected; no billing fallback was attempted"
     elif status == "blocked":
         blocked_category = "executor_reported"
+    if reversion_error and reversion_error not in combined_error:
+        combined_error = f"{combined_error}\n{reversion_error}".strip()
     diff_stat, current_diff_summary, _ = _diff_details(cwd)
     diff_summary, baseline_names = _execution_delta(run_dir, current_diff_summary)
     detected_changed = [item["file"] for item in diff_summary]
@@ -859,6 +1010,9 @@ def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path
         "changed_files": changed,
         "diff_summary": diff_summary,
         "tests": reported_tests,
+        "checks": check_results,
+        "unrelated_failed_command_count": unrelated_failed_command_count,
+        "self_reversions": self_reversions,
         "work_completed": str(final.get("work_completed", "")),
         "error": combined_error[:4000] or None,
         "next_decision": final.get("next_decision"),

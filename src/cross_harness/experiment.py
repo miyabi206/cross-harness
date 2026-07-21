@@ -6,6 +6,8 @@ from typing import Iterable
 import json
 import re
 
+from .summarize import command_matches_check
+
 
 READ_TOOLS = {"Read", "Grep", "Glob", "NotebookRead"}
 READ_COMMAND = re.compile(
@@ -214,15 +216,6 @@ def collect_codex_metrics(run_dirs: Iterable[Path]) -> CodexMetrics:
     )
 
 
-def command_matches_check(command: str, check: str) -> bool:
-    normalized_command = " ".join(command.split())
-    normalized_check = " ".join(check.split())
-    if normalized_check in normalized_command:
-        return True
-    tail = normalized_check.split("&&", 1)[-1].strip()
-    return len(tail) >= 12 and tail in normalized_command
-
-
 def first_check_pass(
     checks: Iterable[str],
     claude_commands: Iterable[CommandResult],
@@ -258,4 +251,3 @@ required_checks:
 - 実装後にrequired_checksを実行する。実行不能または失敗は成功扱いにしない。
 - 最終報告は日本語で、変更ファイル、check結果、残課題を簡潔に示す。
 """
-

@@ -25,6 +25,41 @@ _CLAUDE_AUTHENTICATION_CODES = frozenset({
     "login_required",
     "oauth_org_not_allowed",
 })
+_READ_COMMANDS = frozenset({
+    "cat", "less", "more", "head", "tail", "bat", "echo", "printf", "grep", "rg", "ag", "sed",
+    "awk", "wc", "file", "stat", "ls", "find",
+})
+_SHELL_WRAPPER = re.compile(r"^/bin/(?:zsh|bash|sh)\s+-lc\s+(['\"])(.*)\1$", re.DOTALL)
+_COMMAND_SEPARATOR = re.compile(r"&&|\|\||;|\||\n")
+
+
+def _command_segments(command: str) -> list[str]:
+    """Split a Codex shell command into the command lines it executes."""
+    match = _SHELL_WRAPPER.match(command.strip())
+    inner = match.group(2) if match else command
+    return _COMMAND_SEPARATOR.split(inner)
+
+
+def _starts_with_read_command(command: str) -> bool:
+    token = command.lstrip().split(None, 1)
+    return bool(token) and token[0] in _READ_COMMANDS
+
+
+def command_matches_check(command: str, check: str) -> bool:
+    normalized_command = " ".join(command.split())
+    normalized_check = " ".join(check.split())
+    tail = normalized_check.split("&&", 1)[-1].strip()
+    matches = normalized_check in normalized_command or (len(tail) >= 12 and tail in normalized_command)
+    if not matches:
+        return False
+    check_starts_with_read = _starts_with_read_command(normalized_check)
+    for segment in _command_segments(command):
+        normalized_segment = " ".join(segment.split())
+        if normalized_check not in normalized_segment and (len(tail) < 12 or tail not in normalized_segment):
+            continue
+        if not _starts_with_read_command(segment) or check_starts_with_read:
+            return True
+    return False
 
 
 def _is_cross_harness_policy_denial(output: str) -> bool:
@@ -249,6 +284,15 @@ def summary_item_text(value: object) -> str:
 
 
 def render_summary(summary: dict, limit: int) -> str:
+    checks = summary.get("checks", [])
+    if not checks:
+        checks_text = "none declared"
+    else:
+        checks_text = "; ".join(
+            f"{summary_item_text(item.get('check', item))}: {item.get('status', 'unknown')}"
+            if isinstance(item, dict) else summary_item_text(item)
+            for item in checks
+        )
     lines = [
         f"status: {summary['status']}",
         f"run_dir: {summary['run_dir']}",
@@ -258,9 +302,17 @@ def render_summary(summary: dict, limit: int) -> str:
         f"effort: {summary['effort']}",
         f"changed_files: {', '.join(summary_item_text(item) for item in summary.get('changed_files', [])) or 'none'}",
         f"tests: {'; '.join(summary_item_text(item) for item in summary.get('tests', [])) or 'not reported'}",
+        f"checks: {checks_text}",
+        f"unrelated_failed_commands: {summary.get('unrelated_failed_command_count', 0)}",
     ]
     if summary.get("work_completed"):
         lines.append(f"work_completed: {summary['work_completed']}")
+    for reversion in summary.get("self_reversions", []):
+        if isinstance(reversion, dict):
+            lines.append(
+                f"self_reversion: {reversion.get('target', 'unknown')} "
+                f"({reversion.get('source', 'git')})"
+            )
     for item in summary.get("diff_summary", []):
         if item.get("removed_preexisting_change"):
             lines.append(f"diff: {item['file']} (pre-existing change removed during run)")

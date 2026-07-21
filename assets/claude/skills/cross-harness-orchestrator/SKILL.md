@@ -58,6 +58,10 @@ required `--role`, `--kind`, `--cwd`, and `--goal` values, one to three required
 ```
 
 Use an absolute repository path for `--cwd`.
+Always pass at least one exact `--check` command for `test`, `implementation`,
+and `debug` tasks; the executor's reported success is verified against the last
+matching command execution. Write each check as an executable command line, not
+prose: prose cannot be matched to an execution and is treated as `not_run`.
 The command returns the absolute task-file path. Do not include chat history,
 discarded approaches, chain-of-thought, secrets, or credential-file content.
 Then invoke only:

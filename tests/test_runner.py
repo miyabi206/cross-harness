@@ -11,7 +11,7 @@ import unittest
 
 from cross_harness.errors import AuthError, DirtyWorktreeError, HarnessError, SupervisorDiedError
 from cross_harness.config import default_config
-from cross_harness.runner import _claude_command, _claude_sandbox_profile, _codex_command, _contain_claude_write_command, _escalated_role, _invoke_safe, _tee, _write_baseline, _write_claude_final_from_events, delegate, retry, start_detached_delegate, wait_for_run
+from cross_harness.runner import _claude_command, _claude_sandbox_profile, _codex_command, _contain_claude_write_command, _escalated_role, _invoke_safe, _self_reversions, _tee, _write_baseline, _write_claude_final_from_events, delegate, retry, start_detached_delegate, wait_for_run
 from cross_harness.runner import finalize_run
 from cross_harness.summarize import parse_events
 
@@ -87,7 +87,8 @@ class RunnerTests(unittest.TestCase):
         invoke.side_effect = self.fake_invoke
         summary = delegate("tester", "test", self.task, self.repo, home=self.home)
         run = Path(summary["run_dir"])
-        self.assertEqual("success", summary["status"])
+        self.assertEqual("partial", summary["status"])
+        self.assertIn("no checks declared", summary["error"])
         self.assertTrue((run / "task.md").exists())
         self.assertTrue((run / "events.jsonl").exists())
         self.assertTrue((run / "summary.txt").exists())
@@ -107,7 +108,8 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("1", environment["CROSS_HARNESS_WRITE"])
         self.assertEqual("claude", environment["CROSS_HARNESS_PARENT"])
         self.assertEqual(environment["CROSS_HARNESS_PARENT"], execution["parent_harness"])
-        self.assertEqual("success", summary["status"])
+        self.assertEqual("partial", summary["status"])
+        self.assertIn("no checks declared", summary["error"])
 
     @patch("cross_harness.runner.verify_codex_chatgpt")
     @patch("cross_harness.runner.verify_codex_config_ownership")
@@ -282,6 +284,7 @@ class RunnerTests(unittest.TestCase):
     def test_read_only_failed_command_overrides_reported_success_and_preserves_string_test(self):
         run = self.root / "read-only-command-failure-run"
         run.mkdir()
+        (run / "task.md").write_text("# Checks\n- uv run pytest -q\n")
         (run / "events.jsonl").write_text(json.dumps({
             "type": "item.completed",
             "item": {
@@ -302,7 +305,8 @@ class RunnerTests(unittest.TestCase):
         summary = finalize_run(run, "tester", role, "test", self.repo, 0, 1)
 
         self.assertEqual("failed", summary["status"])
-        self.assertIn("read-only inspection command failed", summary["error"])
+        self.assertIn("declared check failed: uv run pytest -q (exit 1)", summary["error"])
+        self.assertEqual([{"check": "uv run pytest -q", "status": "failed", "exit_code": 1}], summary["checks"])
         self.assertEqual(["14 failed, 100 passed"], summary["tests"])
         self.assertIn("tests: 14 failed, 100 passed", (run / "summary.txt").read_text())
 
@@ -328,7 +332,8 @@ class RunnerTests(unittest.TestCase):
 
         summary = finalize_run(run, "tester", role, "test", self.repo, 0, 1)
 
-        self.assertEqual("success", summary["status"])
+        self.assertEqual("partial", summary["status"])
+        self.assertIn("no checks declared", summary["error"])
 
     def test_read_only_successful_command_does_not_override_reported_success(self):
         run = self.root / "read-only-command-success-run"
@@ -369,16 +374,17 @@ class RunnerTests(unittest.TestCase):
     def test_write_role_failed_command_does_not_override_reported_success(self):
         run = self.root / "write-command-failure-run"
         run.mkdir()
-        (run / "events.jsonl").write_text(json.dumps({
+        (run / "task.md").write_text("# Checks\n- scripts/test.sh\n")
+        (run / "events.jsonl").write_text("".join(json.dumps({
             "type": "item.completed",
             "item": {
-                "type": "command_execution",
-                "command": "uv run pytest -q",
-                "status": "failed",
-                "exit_code": 1,
-                "aggregated_output": "failure before fix",
+                "type": "command_execution", "command": command, "status": status,
+                "exit_code": exit_code, "aggregated_output": output,
             },
-        }) + "\n")
+        }) + "\n" for command, status, exit_code, output in (
+            ("scripts/test.sh", "completed", 0, "passed"),
+            ("uv run pytest -q", "failed", 1, "failure before fix"),
+        )))
         (run / "stderr.log").write_text("")
         (run / "final.json").write_text(json.dumps({
             "status": "success", "work_completed": "implemented", "changed_files": [],
@@ -389,6 +395,220 @@ class RunnerTests(unittest.TestCase):
         summary = finalize_run(run, "implementer", role, "implementation", self.repo, 0, 1)
 
         self.assertEqual("success", summary["status"])
+        self.assertEqual(1, summary["unrelated_failed_command_count"])
+
+    def test_last_declared_check_execution_controls_the_result(self):
+        run = self.root / "last-check-execution-run"
+        run.mkdir()
+        (run / "task.md").write_text("# Checks\n- scripts/test.sh\n")
+        (run / "events.jsonl").write_text("".join(json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution", "command": "scripts/test.sh", "status": status,
+                "exit_code": exit_code,
+            },
+        }) + "\n" for status, exit_code in (("completed", 0), ("failed", 2))))
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "done", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-luna", "effort": "low", "output_limit_chars": 8000, "write": False}
+
+        summary = finalize_run(run, "tester", role, "test", self.repo, 0, 1)
+
+        self.assertEqual("failed", summary["status"])
+        self.assertEqual(2, summary["checks"][0]["exit_code"])
+
+    def test_declared_check_failure_overrides_success_for_write_role(self):
+        run = self.root / "write-declared-check-failure-run"
+        run.mkdir()
+        (run / "task.md").write_text("# Checks\n- scripts/test.sh\n")
+        (run / "events.jsonl").write_text(json.dumps({
+            "type": "item.completed",
+            "item": {"type": "command_execution", "command": "scripts/test.sh", "status": "failed", "exit_code": 2},
+        }) + "\n")
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "implemented", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-terra", "effort": "medium", "output_limit_chars": 8000, "write": True}
+
+        summary = finalize_run(run, "implementer", role, "implementation", self.repo, 0, 1)
+
+        self.assertEqual("failed", summary["status"])
+        self.assertIn("declared check failed: scripts/test.sh (exit 2)", summary["error"])
+
+    def test_unrun_declared_check_downgrades_success_to_partial(self):
+        run = self.root / "unrun-declared-check-run"
+        run.mkdir()
+        (run / "task.md").write_text("# Checks\n- scripts/test.sh\n")
+        (run / "events.jsonl").write_text("")
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "done", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-luna", "effort": "low", "output_limit_chars": 8000, "write": False}
+
+        summary = finalize_run(run, "tester", role, "test", self.repo, 0, 1)
+
+        self.assertEqual("partial", summary["status"])
+        self.assertEqual("not_run", summary["checks"][0]["status"])
+
+    def test_policy_denied_declared_check_is_not_run(self):
+        run = self.root / "policy-denied-declared-check-run"
+        run.mkdir()
+        (run / "task.md").write_text("# Checks\n- scripts/test.sh\n")
+        (run / "events.jsonl").write_text(json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution", "command": "scripts/test.sh", "status": "failed", "exit_code": 1,
+                "aggregated_output": "PreToolUse:Bash hook error: [/Users/example/.local/bin/cross-harness hook claude-pre-tool-use]: cross-harness: nested executor launch from delegated Claude is blocked",
+            },
+        }) + "\n")
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "done", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-luna", "effort": "low", "output_limit_chars": 8000, "write": False}
+
+        summary = finalize_run(run, "tester", role, "test", self.repo, 0, 1)
+
+        self.assertEqual("partial", summary["status"])
+        self.assertEqual(0, summary["unrelated_failed_command_count"])
+
+    def test_write_role_git_restore_downgrades_success_to_partial(self):
+        run = self.root / "git-restore-run"
+        run.mkdir()
+        (run / "events.jsonl").write_text(json.dumps({
+            "type": "item.completed",
+            "item": {"type": "command_execution", "command": "git restore README.md", "status": "completed", "exit_code": 0},
+        }) + "\n")
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "done", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-terra", "effort": "medium", "output_limit_chars": 8000, "write": True}
+
+        summary = finalize_run(run, "implementer", role, "implementation", self.repo, 0, 1)
+
+        self.assertEqual("partial", summary["status"])
+        self.assertEqual("README.md", summary["self_reversions"][0]["target"])
+        self.assertIn("tracked files restored from Git: README.md", summary["error"])
+
+    def test_check_with_missing_exit_code_is_not_run(self):
+        run = self.root / "missing-check-exit-run"
+        run.mkdir()
+        (run / "task.md").write_text("# Checks\n- scripts/test.sh\n")
+        (run / "events.jsonl").write_text(json.dumps({
+            "type": "item.completed",
+            "item": {"type": "command_execution", "command": "scripts/test.sh", "exit_code": None},
+        }) + "\n")
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "done", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-luna", "effort": "low", "output_limit_chars": 8000, "write": False}
+
+        summary = finalize_run(run, "tester", role, "test", self.repo, 0, 1)
+
+        self.assertEqual("partial", summary["status"])
+        self.assertEqual("not_run", summary["checks"][0]["status"])
+
+    def test_reading_check_text_does_not_override_a_failed_check_execution(self):
+        run = self.root / "read-check-text-run"
+        run.mkdir()
+        (run / "task.md").write_text("# Checks\n- scripts/test.sh\n")
+        events = [
+            {"command": '/bin/zsh -lc "scripts/test.sh"', "status": "failed", "exit_code": 1},
+            {"command": '/bin/zsh -lc "cat scripts/test.sh"', "status": "completed", "exit_code": 0},
+        ]
+        (run / "events.jsonl").write_text("".join(json.dumps({
+            "type": "item.completed", "item": {"type": "command_execution", **event},
+        }) + "\n" for event in events))
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "done", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-luna", "effort": "low", "output_limit_chars": 8000, "write": False}
+
+        summary = finalize_run(run, "tester", role, "test", self.repo, 0, 1)
+
+        self.assertEqual("failed", summary["status"])
+        self.assertEqual(1, summary["checks"][0]["exit_code"])
+
+    def test_execution_kind_without_declared_checks_is_unverified_partial(self):
+        run = self.root / "undeclared-checks-run"
+        run.mkdir()
+        (run / "events.jsonl").write_text("")
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "done", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-luna", "effort": "low", "output_limit_chars": 8000, "write": False}
+
+        summary = finalize_run(run, "tester", role, "test", self.repo, 0, 1)
+
+        self.assertEqual("partial", summary["status"])
+        self.assertIn("no checks declared; outcome could not be verified", summary["error"])
+        self.assertIn("task create --check", summary["error"])
+
+    def test_stash_pop_and_apply_are_not_self_reversions(self):
+        events = [
+            {"command": "git stash pop", "exit_code": 0},
+            {"command": "git stash apply", "exit_code": 0},
+        ]
+
+        self.assertEqual([], _self_reversions(self.repo, events))
+
+    def test_self_reversion_error_is_retained_for_failed_status(self):
+        run = self.root / "failed-with-reversion-run"
+        run.mkdir()
+        (run / "task.md").write_text("# Checks\n- scripts/test.sh\n")
+        (run / "events.jsonl").write_text(json.dumps({
+            "type": "item.completed",
+            "item": {"type": "command_execution", "command": "git restore README.md", "exit_code": 0},
+        }) + "\n")
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "failed", "work_completed": "failed", "changed_files": [],
+            "tests": [], "error": "check failed", "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-terra", "effort": "medium", "output_limit_chars": 8000, "write": True}
+
+        summary = finalize_run(run, "implementer", role, "implementation", self.repo, 0, 1)
+
+        self.assertEqual("failed", summary["status"])
+        self.assertIn("tracked files restored from Git: README.md", summary["error"])
+
+    def test_self_reversions_detects_multiline_git_c_show_redirect_by_basename(self):
+        report = self.repo / "mics/j1/j1_report.pdf"
+        report.parent.mkdir(parents=True)
+        report.write_bytes(b"original pdf\n")
+        git(self.repo, "add", "mics/j1/j1_report.pdf")
+        git(self.repo, "commit", "-m", "track report")
+        command = '''/bin/zsh -lc "git show HEAD:j1_report.aux >/dev/null 2>&1 || true
+git -C /Users/itoutaisei/uec/Latex show HEAD:mics/j1/j1_report.aux > j1_report.aux
+git -C /Users/itoutaisei/uec/Latex show HEAD:mics/j1/j1_report.log > j1_report.log
+git -C /Users/itoutaisei/uec/Latex show HEAD:mics/j1/j1_report.out > j1_report.out
+git -C /Users/itoutaisei/uec/Latex show HEAD:mics/j1/j1_report.pdf > j1_report.pdf
+git -C /Users/itoutaisei/uec/Latex show HEAD:mics/j1/j1_report.synctex.gz > j1_report.synctex.gz"'''
+        events = [{"command": command, "exit_code": 0}]
+
+        reversions = _self_reversions(self.repo, events)
+
+        self.assertIn({
+            "command": command,
+            "source": "git show HEAD redirect",
+            "target": "j1_report.pdf",
+        }, reversions)
 
     def test_task_file_with_credential_material_is_rejected(self):
         self.task.write_text("OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz123456\n")
@@ -958,7 +1178,7 @@ class RunnerTests(unittest.TestCase):
         summary = wait_for_run(run_dir, 5)
         self.assertIsNotNone(summary)
         assert summary is not None
-        self.assertEqual("success", summary["status"])
+        self.assertEqual("partial", summary["status"])
         self.assertTrue((run_dir / "events.jsonl").is_file())
         self.assertTrue((run_dir / "state.json").is_file())
         self.assertNotIn("ModuleNotFoundError", (run_dir / "supervisor.stderr.log").read_text())
@@ -1042,7 +1262,7 @@ class RunnerTests(unittest.TestCase):
         summary = wait_for_run(run_dir, 5)
         self.assertIsNotNone(summary)
         assert summary is not None
-        self.assertEqual("success", summary["status"])
+        self.assertEqual("partial", summary["status"])
         self.assertTrue((run_dir / "final.json").is_file())
 
     @patch("cross_harness.runner.failure_signature", return_value="same-signature")

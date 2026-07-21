@@ -1,4 +1,6 @@
 from pathlib import Path
+from contextlib import redirect_stderr
+from io import StringIO
 import tempfile
 import unittest
 
@@ -48,6 +50,17 @@ class TaskFileTests(unittest.TestCase):
             path = create_task_file("reviewer", "review", repo, "Review changes", ["Review is complete"], home=home)
             self.assertTrue(path.is_file())
             self.assertIn("role=reviewer", path.read_text())
+
+    def test_task_creation_warns_when_execution_kind_has_no_check(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder) / "home"
+            repo = Path(folder) / "repo"
+            home.mkdir()
+            repo.mkdir()
+            stderr = StringIO()
+            with redirect_stderr(stderr):
+                create_task_file("tester", "test", repo, "Run tests", ["done"], home=home)
+            self.assertIn("warning: no checks declared for test task", stderr.getvalue())
 
 
 if __name__ == "__main__":
