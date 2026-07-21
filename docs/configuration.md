@@ -20,6 +20,18 @@ is in `schema/harness.schema.json`; the executable validation is implemented in
 `dirty_worktree_policy`. It cannot select a model, authentication method, or
 sandbox. The most specific matching project path wins.
 
+## Dirty worktrees
+
+`dirty_worktree_policy` defaults to `"stop"`, which blocks write roles when
+the repository has uncommitted changes. `"isolate"` runs the write role in a
+detached worktree instead. `"allow_delegated"` is an explicit opt-in that
+permits only unchanged dirty files recorded by a previous write delegation;
+any unrecorded, deleted, un-fingerprintable, or modified file still blocks the
+run. It may be set globally or in a project override. Do not edit the working
+tree while a delegated write run is executing: a concurrent user edit can be
+observed as that run's delta and recorded as delegated, so this policy depends
+on that operational discipline.
+
 ## Roles
 
 Every role has `harness`, `model`, `effort`, `max_parallel`, `retries`,

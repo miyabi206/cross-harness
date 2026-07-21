@@ -91,6 +91,114 @@ def _dirty(cwd: Path) -> list[str]:
     return [line for line in result.stdout.splitlines() if line]
 
 
+def _delegated_changes_path(runtime_root: Path) -> Path:
+    return runtime_root / "delegated-changes.json"
+
+
+def _load_delegated_changes(runtime_root: Path) -> dict[str, dict[str, str]] | None:
+    """Load the trusted delegated-change fingerprints, failing closed on bad data."""
+    path = _delegated_changes_path(runtime_root)
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    records: dict[str, dict[str, str]] = {}
+    for root, changes in raw.items():
+        if not isinstance(root, str) or not Path(root).is_absolute() or not isinstance(changes, dict):
+            return None
+        if not all(isinstance(name, str) and isinstance(fingerprint, str) for name, fingerprint in changes.items()):
+            return None
+        records[root] = changes
+    return records
+
+
+def _delegated_changes_match(
+    runtime_root: Path, root: Path, dirty: list[str], current: list[dict]
+) -> bool:
+    records = _load_delegated_changes(runtime_root)
+    if records is None:
+        return False
+    recorded = records.get(str(root.resolve()))
+    if not isinstance(recorded, dict):
+        return False
+    # Diff details must account for every porcelain entry. This also rejects
+    # submodules and other status entries for which we cannot fingerprint a file.
+    if len(current) < len(dirty):
+        return False
+    current_fingerprints: dict[str, str] = {}
+    for item in current:
+        name = item.get("file")
+        fingerprint = item.get("fingerprint")
+        # Deleted paths and any un-fingerprintable entries are never trusted.
+        if not isinstance(name, str) or not isinstance(fingerprint, str):
+            return False
+        current_fingerprints[name] = fingerprint
+    return current_fingerprints == recorded
+
+
+def _record_delegated_changes(
+    runtime_root: Path, run_dir: Path, cwd: Path, current: list[dict], execution_delta: list[dict]
+) -> None:
+    """Record only this run's changes and still-current trusted changes."""
+    records = _load_delegated_changes(runtime_root) or {}
+    root = str(_git_root(cwd))
+    current_fingerprints = {
+        item["file"]: item["fingerprint"]
+        for item in current
+        if isinstance(item.get("file"), str) and isinstance(item.get("fingerprint"), str)
+    }
+    recorded = records.get(root, {})
+    trusted = {
+        name: fingerprint
+        for name, fingerprint in recorded.items()
+        if current_fingerprints.get(name) == fingerprint
+    }
+    generated = {
+        item["file"]: item["fingerprint"]
+        for item in execution_delta
+        if isinstance(item.get("file"), str) and isinstance(item.get("fingerprint"), str)
+    }
+    records[root] = trusted | generated
+    atomic_write(_delegated_changes_path(runtime_root), dump_json(records))
+
+
+def _prepare_write_execution(
+    config: dict,
+    role_name: str,
+    role: dict,
+    kind: str,
+    root: Path,
+    runtime_root: Path,
+    run_dir: Path,
+    *,
+    attempts: int = 0,
+    thread_id: str | None = None,
+    signatures: list[str] | None = None,
+) -> Path:
+    """Apply the shared write-worktree policy and return the execution root."""
+    project = project_config(config, root)
+    policy = project.get("dirty_worktree_policy", config["dirty_worktree_policy"])
+    dirty = _dirty(root)
+    if not role["write"] or not dirty:
+        return root
+    _, current, _ = _diff_details(root)
+    allowed = policy == "allow_delegated" and _delegated_changes_match(runtime_root, root, dirty, current)
+    if policy != "isolate" and not allowed:
+        reason = "write delegation blocked by pre-existing changes:\n- " + "\n- ".join(dirty[:20])
+        finalize_blocked_run(
+            run_dir, role_name, role, kind, root, reason, "dirty_worktree",
+            attempts=attempts, thread_id=thread_id, signatures=signatures,
+        )
+        raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
+    if policy == "isolate":
+        return _create_isolated_worktree(root, run_dir)
+    return root
+
+
 def _diff_details(cwd: Path) -> tuple[str, list[dict], list[str]]:
     stat_result = _git(cwd, ["diff", "HEAD", "--stat", "--", "."])
     if stat_result.returncode:
@@ -615,16 +723,9 @@ def delegate(
     run_task = run_dir / "task.md"
     if task_file.resolve() != run_task.resolve():
         shutil.copy2(task_file, run_task)
-    project = project_config(config, root)
-    policy = project.get("dirty_worktree_policy", config["dirty_worktree_policy"])
-    dirty = _dirty(root)
-    execution_root = root
-    if role["write"] and dirty:
-        if policy == "stop":
-            reason = "write delegation blocked by pre-existing changes:\n- " + "\n- ".join(dirty[:20])
-            finalize_blocked_run(run_dir, role_name, role, kind, root, reason, "dirty_worktree")
-            raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
-        execution_root = _create_isolated_worktree(root, run_dir)
+    execution_root = _prepare_write_execution(
+        config, role_name, role, kind, root, runtime_root, run_dir,
+    )
     _write_baseline(run_dir, execution_root)
     try:
         if role["harness"] == "codex":
@@ -663,7 +764,10 @@ def delegate(
     exit_code = _invoke_safe(command, task, environment, execution_root, run_dir, role["timeout_seconds"])
     if role["harness"] == "claude":
         _write_claude_final_from_events(run_dir)
-    return finalize_run(run_dir, role_name, role, kind, execution_root, exit_code, attempt=1)
+    return finalize_run(
+        run_dir, role_name, role, kind, execution_root, exit_code, attempt=1,
+        runtime_root=runtime_root,
+    )
 
 
 def start_detached_delegate(
@@ -913,7 +1017,17 @@ def finalize_blocked_run(
     return summary
 
 
-def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path, exit_code: int, attempt: int) -> dict:
+def finalize_run(
+    run_dir: Path,
+    role_name: str,
+    role: dict,
+    kind: str,
+    cwd: Path,
+    exit_code: int,
+    attempt: int,
+    *,
+    runtime_root: Path | None = None,
+) -> dict:
     parsed = parse_events(run_dir / "events.jsonl")
     declared_checks = _declared_checks(run_dir)
     check_results = _check_results(declared_checks, parsed.get("executions", []))
@@ -1002,6 +1116,14 @@ def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path
         status = "failed"
         readonly_error = "read-only role modified the worktree"
         combined_error = f"{combined_error}\n{readonly_error}".strip()
+    if (
+        runtime_root is not None
+        and role.get("write")
+        and status == "success"
+        and not (run_dir / "ISOLATED_WORKTREE").exists()
+        and cwd.resolve() == _git_root(cwd)
+    ):
+        _record_delegated_changes(runtime_root, run_dir, cwd, current_diff_summary, diff_summary)
     atomic_write(run_dir / "diff-stat.txt", diff_stat)
     reported_changed = final.get("changed_files") if isinstance(final.get("changed_files"), list) else []
     reported_changed = [summary_item_text(name) for name in reported_changed]
@@ -1128,16 +1250,22 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         raise HarnessError("task file is empty")
     if contains_secret(task):
         raise HarnessError("task file appears to contain credential material; refusing delegation")
-    retry_root = _new_run_dir(Path(config["runtime_root"]))
+    runtime_root = Path(config["runtime_root"])
+    source_root = _git_root(Path(state["cwd"]))
+    retry_root = _new_run_dir(runtime_root)
     shutil.copy2(task_file, retry_root / "task.md")
-    _write_baseline(retry_root, Path(state["cwd"]))
+    execution_root = _prepare_write_execution(
+        config, role_name, role, state["kind"], source_root, runtime_root, retry_root,
+        attempts=state["attempts"], thread_id=state["thread_id"], signatures=state.get("signatures", []),
+    )
+    _write_baseline(retry_root, execution_root)
     try:
         if role["harness"] == "codex":
-            verify_codex_config_ownership(paths.home, _git_root(Path(state["cwd"])), Path(state["cwd"]))
-            executor, cached = verify_codex_chatgpt(Path(config["runtime_root"]), paths.home, config["auth_cache_hours"])
+            verify_codex_config_ownership(paths.home, source_root, execution_root)
+            executor, cached = verify_codex_chatgpt(runtime_root, paths.home, config["auth_cache_hours"])
         elif role["harness"] == "claude":
-            verify_claude_config_ownership(paths.home, _git_root(Path(state["cwd"])))
-            executor, cached = verify_claude_subscription(Path(config["runtime_root"]), paths.home, config["auth_cache_hours"])
+            verify_claude_config_ownership(paths.home, source_root)
+            executor, cached = verify_claude_subscription(runtime_root, paths.home, config["auth_cache_hours"])
         else:
             raise ConfigError(f"unsupported harness: {role['harness']}")
     except AuthError as exc:
@@ -1146,7 +1274,7 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
             state["role"],
             role,
             state["kind"],
-            Path(state["cwd"]),
+            execution_root,
             str(exc),
             "authentication",
             attempts=state["attempts"],
@@ -1164,17 +1292,17 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
     else:
         environment.pop("CROSS_HARNESS_WRITE", None)
     command = _command(
-        executor, role_name, role, Path(state["cwd"]), retry_root, paths.claude / "agents", state["thread_id"]
+        executor, role_name, role, execution_root, retry_root, paths.claude / "agents", state["thread_id"]
     )
     command, sandbox_exec = _contain_claude_write_command(
-        command, role, Path(state["cwd"]), retry_root, paths.home
+        command, role, execution_root, retry_root, paths.home
     )
     _write_execution_record(
         retry_root,
         state["role"],
         role,
         state["kind"],
-        Path(state["cwd"]),
+        execution_root,
         config["parent_harness"],
     )
     atomic_write(retry_root / "command.json", dump_json({
@@ -1183,10 +1311,13 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         "resume": state["thread_id"],
         "sandbox_exec": sandbox_exec,
     }))
-    exit_code = _invoke_safe(command, task, environment, Path(state["cwd"]), retry_root, role["timeout_seconds"])
+    exit_code = _invoke_safe(command, task, environment, execution_root, retry_root, role["timeout_seconds"])
     if role["harness"] == "claude":
         _write_claude_final_from_events(retry_root)
-    summary = finalize_run(retry_root, state["role"], role, state["kind"], Path(state["cwd"]), exit_code, state["attempts"] + 1)
+    summary = finalize_run(
+        retry_root, state["role"], role, state["kind"], execution_root, exit_code, state["attempts"] + 1,
+        runtime_root=runtime_root,
+    )
     new_state = json.loads((retry_root / "state.json").read_text(encoding="utf-8"))
     new_state["signatures"] = [*state.get("signatures", []), *new_state.get("signatures", [])]
     identical = summary.get("failure_signature") and new_state["signatures"].count(summary["failure_signature"]) >= 2
@@ -1194,27 +1325,32 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         new_state["escalated"] = True
         atomic_write(retry_root / "state.json", dump_json(new_state))
         escalation = _escalated_role(role, config)
-        escalation_root = _new_run_dir(Path(config["runtime_root"]))
+        escalation_root = _new_run_dir(runtime_root)
         shutil.copy2(task_file, escalation_root / "task.md")
-        _write_baseline(escalation_root, Path(state["cwd"]))
+        escalation_execution_root = _prepare_write_execution(
+            config, role_name, escalation, state["kind"], source_root, runtime_root, escalation_root,
+            attempts=new_state["attempts"], thread_id=summary.get("thread_id"),
+            signatures=new_state.get("signatures", []),
+        )
+        _write_baseline(escalation_root, escalation_execution_root)
         command = _command(
             executor,
             role_name,
             escalation,
-            Path(state["cwd"]),
+            escalation_execution_root,
             escalation_root,
             paths.claude / "agents",
             summary.get("thread_id") or state["thread_id"],
         )
         command, sandbox_exec = _contain_claude_write_command(
-            command, escalation, Path(state["cwd"]), escalation_root, paths.home
+            command, escalation, escalation_execution_root, escalation_root, paths.home
         )
         _write_execution_record(
             escalation_root,
             state["role"],
             escalation,
             state["kind"],
-            Path(state["cwd"]),
+            escalation_execution_root,
             config["parent_harness"],
         )
         atomic_write(escalation_root / "command.json", dump_json({
@@ -1223,10 +1359,13 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
             "previous_run": str(retry_root),
             "sandbox_exec": sandbox_exec,
         }))
-        code = _invoke_safe(command, task, environment | {"CROSS_HARNESS_RUN_DIR": str(escalation_root)}, Path(state["cwd"]), escalation_root, escalation["timeout_seconds"])
+        code = _invoke_safe(command, task, environment | {"CROSS_HARNESS_RUN_DIR": str(escalation_root)}, escalation_execution_root, escalation_root, escalation["timeout_seconds"])
         if escalation["harness"] == "claude":
             _write_claude_final_from_events(escalation_root)
-        escalated_summary = finalize_run(escalation_root, state["role"], escalation, state["kind"], Path(state["cwd"]), code, new_state["attempts"] + 1)
+        escalated_summary = finalize_run(
+            escalation_root, state["role"], escalation, state["kind"], escalation_execution_root,
+            code, new_state["attempts"] + 1, runtime_root=runtime_root,
+        )
         escalated_state = json.loads((escalation_root / "state.json").read_text(encoding="utf-8"))
         escalated_state["escalated"] = True
         escalated_state["signatures"] = [*new_state["signatures"], *escalated_state.get("signatures", [])]

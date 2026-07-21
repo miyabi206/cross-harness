@@ -10,6 +10,7 @@ import time
 import unittest
 
 from cross_harness.errors import AuthError, DirtyWorktreeError, HarnessError, SupervisorDiedError
+from cross_harness.files import sha256
 from cross_harness.config import default_config
 from cross_harness.runner import _claude_command, _claude_sandbox_profile, _codex_command, _contain_claude_write_command, _escalated_role, _filtered_executor_stderr, _invoke_safe, _self_reversions, _tee, _write_baseline, _write_claude_final_from_events, delegate, retry, start_detached_delegate, wait_for_run
 from cross_harness.runner import finalize_run
@@ -1038,6 +1039,159 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:mics/j1/j1_report.synctex.gz > j1_r
         with self.assertRaisesRegex(HarnessError, "task file appears to contain credential material; refusing delegation"):
             retry(previous, secret_task, home=self.home)
         self.assertFalse(runtime_runs.exists())
+
+    @patch("cross_harness.runner.verify_codex_chatgpt")
+    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_retry_write_role_blocks_dirty_stop_policy_before_executor(self, invoke, ownership, verify):
+        previous = self.root / "retry-dirty-stop"
+        previous.mkdir()
+        (previous / "state.json").write_text(json.dumps({
+            "role": "implementer", "kind": "implementation", "cwd": str(self.repo / "."),
+            "thread_id": "session-1", "attempts": 1, "signatures": [], "escalated": False,
+            "status": "failed", "model": "gpt-5.6-terra", "effort": "high",
+        }))
+        (self.repo / "user-change.txt").write_text("mine\n")
+
+        with self.assertRaises(DirtyWorktreeError):
+            retry(previous, self.task, home=self.home)
+
+        invoke.assert_not_called()
+        verify.assert_not_called()
+        ownership.assert_not_called()
+        blocked_runs = list((self.home / ".local/state/cross-harness/runs").iterdir())
+        state = json.loads((blocked_runs[0] / "state.json").read_text())
+        self.assertEqual("dirty_worktree", state["blocked_category"])
+
+    @patch("cross_harness.runner.verify_codex_chatgpt")
+    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_allow_delegated_retry_accepts_recorded_changes_and_rejects_other_changes(self, invoke, ownership, verify):
+        config = self.root / "allow-delegated.toml"
+        default = (Path(__file__).resolve().parents[1] / "config/default.toml").read_text()
+        config.write_text(default.replace('dirty_worktree_policy = "stop"', 'dirty_worktree_policy = "allow_delegated"', 1))
+        self.task.write_text("# Goal\nMake a delegated change.\n\n# Checks\n- fixture\n")
+        verify.return_value = (Path("/usr/bin/true"), False)
+
+        def complete(command, task, env, cwd, run_dir, timeout):
+            if not (self.repo / "delegated.txt").exists():
+                (self.repo / "delegated.txt").write_text("delegated\n")
+            (run_dir / "events.jsonl").write_text(
+                '{"type":"item.completed","item":{"type":"command_execution","command":"fixture","status":"completed","exit_code":0}}\n'
+                '{"type":"turn.completed","usage":{}}\n'
+            )
+            (run_dir / "stderr.log").write_text("")
+            (run_dir / "final.json").write_text(json.dumps({
+                "status": "success", "work_completed": "done", "changed_files": [],
+                "tests": [], "error": None, "next_decision": None,
+            }))
+            return 0
+
+        invoke.side_effect = complete
+        first = delegate("implementer", "implementation", self.task, self.repo, config_path=config, home=self.home)
+        runtime_root = self.home / ".local/state/cross-harness"
+        records = json.loads((runtime_root / "delegated-changes.json").read_text())
+        self.assertIn("delegated.txt", records[str(self.repo.resolve())])
+
+        summary = retry(Path(first["run_dir"]), self.task, config_path=config, home=self.home)
+        self.assertEqual("success", summary["status"])
+        self.assertEqual(2, invoke.call_count)
+
+        (self.repo / "user-change.txt").write_text("mine\n")
+        with self.assertRaises(DirtyWorktreeError):
+            retry(Path(summary["run_dir"]), self.task, config_path=config, home=self.home)
+        self.assertEqual(2, invoke.call_count)
+
+    def test_finalize_records_only_run_delta_and_unchanged_trusted_changes(self):
+        runtime_root = self.root / "explicit-runtime"
+        run = self.root / "external-run"
+        run.mkdir()
+        (self.repo / "trusted.txt").write_text("trusted\n")
+        (self.repo / "user-change.txt").write_text("user\n")
+        _write_baseline(run, self.repo)
+        (self.repo / "delegated.txt").write_text("delegated\n")
+        records_path = runtime_root / "delegated-changes.json"
+        records_path.parent.mkdir(parents=True)
+        records_path.write_text(json.dumps({
+            str(self.repo.resolve()): {"trusted.txt": sha256(self.repo / "trusted.txt")}
+        }))
+        (run / "events.jsonl").write_text('{"type":"turn.completed","usage":{}}\n')
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "done", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-terra", "effort": "high", "output_limit_chars": 8000, "write": True}
+
+        summary = finalize_run(
+            run, "implementer", role, "review", self.repo, 0, 1, runtime_root=runtime_root
+        )
+
+        self.assertEqual("success", summary["status"])
+        records = json.loads((runtime_root / "delegated-changes.json").read_text())
+        self.assertEqual(
+            {"trusted.txt", "delegated.txt"}, set(records[str(self.repo.resolve())])
+        )
+
+    def test_finalize_does_not_record_partial_or_isolated_write_runs(self):
+        runtime_root = self.root / "runtime"
+        records_path = runtime_root / "delegated-changes.json"
+        records_path.parent.mkdir(parents=True)
+        initial = {str(self.repo.resolve()): {"prior.txt": "fingerprint"}}
+        records_path.write_text(json.dumps(initial))
+        role = {"model": "gpt-5.6-terra", "effort": "high", "output_limit_chars": 8000, "write": True}
+
+        for name, status, isolated in (("partial", "partial", False), ("isolated", "success", True)):
+            run = self.root / name
+            run.mkdir()
+            _write_baseline(run, self.repo)
+            (self.repo / f"{name}.txt").write_text(name + "\n")
+            (run / "events.jsonl").write_text('{"type":"turn.completed","usage":{}}\n')
+            (run / "stderr.log").write_text("")
+            (run / "final.json").write_text(json.dumps({
+                "status": status, "work_completed": "", "changed_files": [],
+                "tests": [], "error": None, "next_decision": None,
+            }))
+            if isolated:
+                (run / "ISOLATED_WORKTREE").write_text(str(self.repo) + "\n")
+            finalize_run(run, "implementer", role, "review", self.repo, 0, 1, runtime_root=runtime_root)
+
+        self.assertEqual(initial, json.loads(records_path.read_text()))
+
+    @patch("cross_harness.runner.failure_signature", return_value="same-signature")
+    @patch("cross_harness.runner.verify_codex_chatgpt")
+    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_escalation_write_role_rechecks_dirty_stop_policy(self, invoke, ownership, verify, signature):
+        previous = self.root / "retry-escalation-dirty"
+        previous.mkdir()
+        (previous / "state.json").write_text(json.dumps({
+            "role": "implementer", "kind": "implementation", "cwd": str(self.repo),
+            "thread_id": "session-1", "attempts": 1, "signatures": ["same-signature"],
+            "escalated": False, "status": "failed", "model": "gpt-5.6-terra", "effort": "high",
+        }))
+        verify.return_value = (Path("/usr/bin/true"), False)
+
+        def fail_with_change(command, task, env, cwd, run_dir, timeout):
+            (self.repo / "delegated.txt").write_text("delegated\n")
+            (run_dir / "events.jsonl").write_text('{"type":"turn.failed","error":{"message":"failed"}}\n')
+            (run_dir / "stderr.log").write_text("failed")
+            (run_dir / "final.json").write_text(json.dumps({
+                "status": "failed", "work_completed": "", "changed_files": [],
+                "tests": [], "error": "failed", "next_decision": None,
+            }))
+            return 1
+
+        invoke.side_effect = fail_with_change
+        with self.assertRaises(DirtyWorktreeError):
+            retry(previous, self.task, home=self.home)
+        self.assertEqual(1, invoke.call_count)
+        blocked = [
+            path for path in (self.home / ".local/state/cross-harness/runs").iterdir()
+            if (path / "BLOCKED").exists()
+        ]
+        self.assertEqual(1, len(blocked))
+        self.assertEqual("dirty_worktree", json.loads((blocked[0] / "state.json").read_text())["blocked_category"])
 
     @patch("cross_harness.runner.verify_claude_config_ownership")
     @patch("cross_harness.runner.verify_claude_subscription")
