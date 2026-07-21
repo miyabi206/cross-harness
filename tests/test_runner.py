@@ -45,7 +45,7 @@ class RunnerTests(unittest.TestCase):
         target = self.root / "streamed-events.jsonl"
         reader = os.fdopen(reader_fd, "rb")
         writer = os.fdopen(writer_fd, "wb")
-        thread = threading.Thread(target=_tee, args=(reader, target))
+        thread = threading.Thread(target=_tee, args=(reader, target), daemon=True)
         thread.start()
         try:
             payload = b'{"type":"turn.started"}\n'

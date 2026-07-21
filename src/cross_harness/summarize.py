@@ -37,7 +37,10 @@ def _is_cross_harness_policy_denial(output: str) -> bool:
 
 
 def parse_events(path: Path) -> dict:
-    result = {"thread_id": None, "usage": {}, "errors": [], "commands": [], "blocked_category": None}
+    result = {
+        "thread_id": None, "usage": {}, "errors": [], "commands": [],
+        "executions": [], "blocked_category": None,
+    }
     claude_commands: dict[str, str] = {}
     if not path.exists():
         return result
@@ -77,8 +80,15 @@ def parse_events(path: Path) -> dict:
             # ``item.completed`` event.  The former has status=in_progress
             # and no exit code, so it must not be treated as a failure.
             if kind == "item.completed" and isinstance(item, dict) and item.get("type") == "command_execution":
+                full_output = str(item.get("aggregated_output", item.get("output", "")))
+                execution = {
+                    "command": item.get("command", ""),
+                    "exit_code": item.get("exit_code"),
+                }
+                if _is_cross_harness_policy_denial(full_output):
+                    execution["policy_denied"] = True
+                result["executions"].append(execution)
                 if item.get("status") not in {None, "completed", "success"} or item.get("exit_code") not in {None, 0}:
-                    full_output = str(item.get("aggregated_output", item.get("output", "")))
                     output = full_output[-4000:]
                     command = {
                         "command": item.get("command", ""),
@@ -93,7 +103,7 @@ def parse_events(path: Path) -> dict:
 
 
 def _parse_claude_tool_events(event: dict, commands: dict[str, str], result: dict) -> None:
-    """Record failed Claude Bash tool results as command failures."""
+    """Record Claude Bash executions and retain failed results as commands."""
     message = event.get("message")
     if not isinstance(message, dict):
         return
@@ -113,17 +123,23 @@ def _parse_claude_tool_events(event: dict, commands: dict[str, str], result: dic
     if event.get("type") != "user":
         return
     for block in content:
-        if not isinstance(block, dict) or block.get("type") != "tool_result" or block.get("is_error") is not True:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
             continue
         text = _tool_result_text(block)
         tool_id = block.get("tool_use_id")
         command = commands.get(tool_id) if isinstance(tool_id, str) else None
         if command is None:
             continue
-        command_result = {"command": command, "exit_code": 1, "output": text[-4000:]}
+        exit_code = 1 if block.get("is_error") is True else 0
+        execution = {"command": command, "exit_code": exit_code}
         if _is_cross_harness_policy_denial(text):
-            command_result["policy_denied"] = True
-        result["commands"].append(command_result)
+            execution["policy_denied"] = True
+        result["executions"].append(execution)
+        if exit_code != 0:
+            command_result = {"command": command, "exit_code": exit_code, "output": text[-4000:]}
+            if execution.get("policy_denied"):
+                command_result["policy_denied"] = True
+            result["commands"].append(command_result)
 
 
 def _tool_result_text(block: dict) -> str:

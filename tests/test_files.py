@@ -25,6 +25,10 @@ class FileTests(unittest.TestCase):
         first = failure_signature(1, parsed)
         second = failure_signature(1, {"errors": ["test failed at 99.8s address 0xdef999"], "commands": []})
         self.assertEqual(first, second)
+        self.assertIsNone(failure_signature(0, {
+            "errors": [], "commands": [],
+            "executions": [{"command": "uv run pytest -q", "exit_code": 1}],
+        }))
 
     def test_parse_events_reads_claude_stream_result(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -50,7 +54,33 @@ class FileTests(unittest.TestCase):
         self.assertEqual([{
             "command": "uv run pytest -q", "exit_code": 1, "output": "2 tests failed",
         }], parsed["commands"])
+        self.assertEqual([{
+            "command": "uv run pytest -q", "exit_code": 1,
+        }], parsed["executions"])
         self.assertIsNotNone(failure_signature(0, parsed))
+
+    def test_parse_events_records_all_completed_bash_executions_in_order(self):
+        with tempfile.TemporaryDirectory() as folder:
+            events = Path(folder) / "events.jsonl"
+            events.write_text(
+                '{"type":"item.started","item":{"type":"command_execution","command":"ignored"}}\n'
+                '{"type":"item.completed","item":{"type":"command_execution","command":"codex success","exit_code":0,"status":"completed","aggregated_output":"ok"}}\n'
+                '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"bash-1","name":"Bash","input":{"command":"claude success"}},{"type":"tool_use","id":"bash-2","name":"Bash","input":{"command":"claude failure"}},{"type":"tool_use","id":"other-1","name":"Read","input":{}}]}}\n'
+                '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"bash-1","is_error":false,"content":"ok"}]}}\n'
+                '{"type":"item.completed","item":{"type":"command_execution","command":"codex failure","exit_code":7,"status":"failed","aggregated_output":"failed"}}\n'
+                '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"bash-2","is_error":true,"content":"failed"},{"type":"tool_result","tool_use_id":"missing","is_error":false,"content":"ignored"}]}}\n'
+            )
+            parsed = parse_events(events)
+        self.assertEqual([
+            {"command": "codex success", "exit_code": 0},
+            {"command": "claude success", "exit_code": 0},
+            {"command": "codex failure", "exit_code": 7},
+            {"command": "claude failure", "exit_code": 1},
+        ], parsed["executions"])
+        self.assertEqual([
+            {"command": "codex failure", "exit_code": 7, "output": "failed"},
+            {"command": "claude failure", "exit_code": 1, "output": "failed"},
+        ], parsed["commands"])
 
     def test_parse_events_marks_cross_harness_hook_rejection_as_policy_denied(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -61,6 +91,7 @@ class FileTests(unittest.TestCase):
             )
             parsed = parse_events(events)
         self.assertTrue(parsed["commands"][0]["policy_denied"])
+        self.assertTrue(parsed["executions"][0]["policy_denied"])
 
     def test_parse_events_does_not_mark_quoted_hook_rejection_as_policy_denied(self):
         with tempfile.TemporaryDirectory() as folder:
