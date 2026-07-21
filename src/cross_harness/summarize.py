@@ -322,6 +322,8 @@ def render_summary(summary: dict, limit: int) -> str:
             )
     if summary.get("self_reversion_check") == "unavailable":
         lines.append("self_reversion_check: unavailable")
+    if summary.get("diff_check") == "unavailable":
+        lines.append("diff_check: unavailable")
     for item in summary.get("diff_summary", []):
         if item.get("removed_preexisting_change"):
             lines.append(f"diff: {item['file']} (pre-existing change removed during run)")

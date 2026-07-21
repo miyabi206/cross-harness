@@ -751,6 +751,64 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
                     json.loads((run / "summary.json").read_text())["self_reversion_check"],
                 )
 
+    def test_finalize_run_marks_diff_check_unavailable_when_all_git_calls_fail(self):
+        role = {"model": "gpt-5.6-terra", "effort": "medium", "output_limit_chars": 8000, "write": True}
+
+        for failure in ("timeout", "oserror"):
+            with self.subTest(failure=failure):
+                run = self.root / f"diff-check-{failure}-run"
+                run.mkdir()
+                (run / "events.jsonl").write_text("")
+                (run / "stderr.log").write_text("")
+                (run / "final.json").write_text(json.dumps({
+                    "status": "success", "work_completed": "done", "changed_files": [],
+                    "tests": [], "error": None, "next_decision": None,
+                }))
+
+                def failing_git(cwd, args, timeout=30):
+                    if failure == "timeout":
+                        raise subprocess.TimeoutExpired(["git", *args], timeout)
+                    raise OSError("git executable unavailable")
+
+                with patch("cross_harness.runner._git", side_effect=failing_git):
+                    summary = finalize_run(run, "implementer", role, "implementation", self.repo, 0, 1)
+
+                self.assertEqual("unavailable", summary["diff_check"])
+                self.assertEqual([], summary["changed_files"])
+                self.assertEqual([], summary["diff_summary"])
+                self.assertTrue((run / "summary.txt").exists())
+                self.assertTrue((run / "summary.json").exists())
+                self.assertIn("diff_check: unavailable", (run / "summary.txt").read_text())
+                self.assertEqual(
+                    "unavailable",
+                    json.loads((run / "summary.json").read_text())["diff_check"],
+                )
+
+    def test_finalize_run_survives_delegated_change_recording_git_failure(self):
+        runtime_root = self.root / "runtime"
+        run = self.root / "record-failure-run"
+        run.mkdir()
+        (run / "events.jsonl").write_text("")
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "done", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-terra", "effort": "medium", "output_limit_chars": 8000, "write": True}
+
+        with patch("cross_harness.runner._record_delegated_changes", side_effect=OSError("git unavailable")):
+            summary = finalize_run(
+                run, "implementer", role, "review", self.repo, 0, 1, runtime_root=runtime_root
+            )
+
+        self.assertEqual("unavailable", summary["diff_check"])
+        self.assertEqual([], summary["changed_files"])
+        self.assertEqual([], summary["diff_summary"])
+        self.assertFalse((runtime_root / "delegated-changes.json").exists())
+        self.assertTrue((run / "summary.txt").exists())
+        self.assertTrue((run / "summary.json").exists())
+        self.assertIn("diff_check: unavailable", (run / "summary.txt").read_text())
+
     def test_task_file_with_credential_material_is_rejected(self):
         self.task.write_text("OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz123456\n")
         with self.assertRaises(HarnessError):

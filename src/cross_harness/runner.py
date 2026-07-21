@@ -1146,23 +1146,44 @@ def finalize_run(
         blocked_category = "executor_reported"
     if reversion_error and reversion_error not in combined_error:
         combined_error = f"{combined_error}\n{reversion_error}".strip()
-    diff_stat, current_diff_summary, _ = _diff_details(cwd)
-    diff_summary, baseline_names = _execution_delta(run_dir, current_diff_summary)
-    detected_changed = [item["file"] for item in diff_summary]
-    if not diff_summary:
+    diff_check_unavailable = False
+    try:
+        diff_stat, current_diff_summary, _ = _diff_details(cwd)
+    except (subprocess.TimeoutExpired, OSError):
+        diff_check_unavailable = True
         diff_stat = ""
+        current_diff_summary = []
+        diff_summary = []
+        baseline_names: set[str] = set()
+    else:
+        diff_summary, baseline_names = _execution_delta(run_dir, current_diff_summary)
+        if not diff_summary:
+            diff_stat = ""
+    detected_changed = [item["file"] for item in diff_summary]
     if role.get("write") is False and diff_summary and status != "blocked":
         status = "failed"
         readonly_error = "read-only role modified the worktree"
         combined_error = f"{combined_error}\n{readonly_error}".strip()
-    if (
+    should_record_delegated_changes = (
         runtime_root is not None
         and role.get("write")
         and status == "success"
         and not (run_dir / "ISOLATED_WORKTREE").exists()
-        and cwd.resolve() == _git_root(cwd)
-    ):
-        _record_delegated_changes(runtime_root, run_dir, cwd, current_diff_summary, diff_summary)
+    )
+    if should_record_delegated_changes and not diff_check_unavailable:
+        try:
+            at_git_root = cwd.resolve() == _git_root(cwd)
+            if at_git_root:
+                _record_delegated_changes(runtime_root, run_dir, cwd, current_diff_summary, diff_summary)
+        except (subprocess.TimeoutExpired, OSError):
+            # A failed root lookup or delegated-change fingerprint cannot be
+            # trusted as a diff result, so do not report inferred changes.
+            diff_check_unavailable = True
+            diff_stat = ""
+            current_diff_summary = []
+            diff_summary = []
+            detected_changed = []
+            baseline_names = set()
     atomic_write(run_dir / "diff-stat.txt", diff_stat)
     reported_changed = final.get("changed_files") if isinstance(final.get("changed_files"), list) else []
     reported_changed = [summary_item_text(name) for name in reported_changed]
@@ -1211,6 +1232,8 @@ def finalize_run(
     }
     if self_reversion_check_unavailable:
         summary["self_reversion_check"] = "unavailable"
+    if diff_check_unavailable:
+        summary["diff_check"] = "unavailable"
     state = {
         "role": role_name,
         "kind": kind,
