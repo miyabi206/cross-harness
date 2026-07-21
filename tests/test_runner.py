@@ -1281,6 +1281,45 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
         verify.assert_not_called()
         ownership.assert_not_called()
 
+    def test_retry_blocks_when_previous_diff_check_was_unavailable(self):
+        previous = self._failed_write_run("failed-diff-check", "delegated.txt", "delegated\n")
+        summary_path = previous / "summary.json"
+        previous_summary = json.loads(summary_path.read_text())
+        previous_summary["diff_check"] = "unavailable"
+        summary_path.write_text(json.dumps(previous_summary))
+
+        with patch.dict(os.environ, {"CROSS_HARNESS_ACTIVE": ""}):
+            with self.assertRaisesRegex(DirtyWorktreeError, "previous run diff could not be obtained"):
+                retry(previous, self.task, home=self.home)
+
+        blocked_runs = list((self.home / ".local/state/cross-harness/runs").iterdir())
+        blocked_state = json.loads((blocked_runs[0] / "state.json").read_text())
+        self.assertEqual("dirty_worktree", blocked_state["blocked_category"])
+        self.assertIn("previous run diff could not be obtained", blocked_state["blocked_reason"])
+
+    def test_retry_records_git_inspection_failures_before_raising(self):
+        previous = self._failed_write_run("failed-git-inspection", "delegated.txt", "delegated\n")
+        role = default_config()["roles"]["implementer"]
+
+        for index, (target, failure) in enumerate((
+            ("_dirty", HarnessError("could not inspect Git worktree")),
+            ("_diff_details", subprocess.TimeoutExpired(["git", "diff"], 30)),
+            ("_diff_details", OSError("git executable unavailable")),
+        )):
+            with self.subTest(target=target):
+                retry_run = self.root / f"blocked-{index}-{target}"
+                retry_run.mkdir()
+                with patch.object(runner, target, side_effect=failure):
+                    with self.assertRaisesRegex(DirtyWorktreeError, "could not inspect Git worktree changes"):
+                        runner._prepare_retry_execution(
+                            default_config(), "implementer", role, "implementation", self.repo,
+                            retry_run, previous, attempts=1, thread_id="session-1", signatures=[],
+                        )
+                state = json.loads((retry_run / "state.json").read_text())
+                self.assertEqual("blocked", state["status"])
+                self.assertEqual("dirty_worktree", state["blocked_category"])
+                self.assertIn("could not inspect Git worktree changes", state["blocked_reason"])
+
     @patch("cross_harness.runner.verify_codex_chatgpt")
     @patch("cross_harness.runner.verify_codex_config_ownership")
     @patch("cross_harness.runner._invoke_safe")

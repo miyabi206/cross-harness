@@ -132,7 +132,7 @@ def _p2() -> int:
 
 
 def _p3() -> int:
-    """Exercise retry artifacts against Git and inspect saved artifact shape read-only."""
+    """Exercise retry artifacts against Git and their saved retry permissions read-only."""
     runs_root = Path.home() / ".local/state/cross-harness/runs"
     checked = 0
     skipped = 0
@@ -172,6 +172,20 @@ def _p3() -> int:
                     mismatches.append(run_dir.name)
                     break
             else:
+                allowed, _ = runner._recorded_retry_changes(run_dir)
+                if allowed is None:
+                    if summary.get("diff_check") == "unavailable":
+                        skipped += 1
+                        continue
+                    mismatches.append(run_dir.name)
+                    continue
+                changed = any(
+                    item.get("removed_preexisting_change") is not True
+                    for item in summary["diff_summary"]
+                )
+                if changed and not allowed:
+                    mismatches.append(run_dir.name)
+                    continue
                 checked += 1
     else:
         skipped += 1

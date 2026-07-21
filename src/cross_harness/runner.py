@@ -199,31 +199,35 @@ def _prepare_write_execution(
     return root
 
 
-def _recorded_retry_changes(previous_run: Path) -> set[tuple[str, str | None]] | None:
-    """Return the fail-closed set of changes a retry may continue from."""
+def _recorded_retry_changes(
+    previous_run: Path,
+) -> tuple[set[tuple[str, str | None]] | None, str | None]:
+    """Return retry changes, or the reason their recorded diff cannot be trusted."""
     allowed: set[tuple[str, str | None]] = set()
     for name in ("baseline.json", "summary.json"):
         path = previous_run / name
         if not path.is_file():
-            return None
+            return None, "previous run diff records are missing or invalid"
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
-            return None
+            return None, "previous run diff records are missing or invalid"
+        if name == "summary.json" and isinstance(record, dict) and record.get("diff_check") == "unavailable":
+            return None, "previous run diff could not be obtained (diff_check: unavailable)"
         diff_summary = record.get("diff_summary") if isinstance(record, dict) else None
         if not isinstance(diff_summary, list):
-            return None
+            return None, "previous run diff records are missing or invalid"
         for item in diff_summary:
             if not isinstance(item, dict):
-                return None
+                return None, "previous run diff records are missing or invalid"
             if item.get("removed_preexisting_change") is True:
                 continue
             file_name = item.get("file")
             fingerprint = item.get("fingerprint")
             if not isinstance(file_name, str) or not isinstance(fingerprint, (str, type(None))):
-                return None
+                return None, "previous run diff records are missing or invalid"
             allowed.add((file_name, fingerprint))
-    return allowed
+    return allowed, None
 
 
 def _reusable_isolated_worktree(root: Path, previous_run: Path) -> Path | None:
@@ -284,16 +288,24 @@ def _prepare_retry_execution(
     else:
         execution_root = root
 
-    allowed = _recorded_retry_changes(previous_run)
+    allowed, record_error = _recorded_retry_changes(previous_run)
     if allowed is None:
-        reason = "retry blocked: previous run diff records are missing or invalid"
+        reason = f"retry blocked: {record_error}"
         finalize_blocked_run(
             run_dir, role_name, role, kind, execution_root, reason, "dirty_worktree",
             attempts=attempts, thread_id=thread_id, signatures=signatures,
         )
         raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
-    dirty = _dirty(execution_root)
-    _, current, _ = _diff_details(execution_root)
+    try:
+        dirty = _dirty(execution_root)
+        _, current, _ = _diff_details(execution_root)
+    except (subprocess.TimeoutExpired, OSError, HarnessError):
+        reason = "retry blocked: could not inspect Git worktree changes to verify the previous run's recorded diff"
+        finalize_blocked_run(
+            run_dir, role_name, role, kind, execution_root, reason, "dirty_worktree",
+            attempts=attempts, thread_id=thread_id, signatures=signatures,
+        )
+        raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
     current_changes: set[tuple[str, str | None]] = set()
     valid_current = len(current) >= len(dirty)
     for item in current:
