@@ -9,6 +9,7 @@ import threading
 import time
 import unittest
 
+import cross_harness.runner as runner
 from cross_harness.errors import AuthError, DirtyWorktreeError, HarnessError, SupervisorDiedError
 from cross_harness.files import sha256
 from cross_harness.config import default_config
@@ -678,6 +679,77 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:mics/j1/j1_report.synctex.gz > j1_r
             "source": "git show HEAD redirect",
             "target": "j1_report.pdf",
         }, reversions)
+
+    def test_self_reversions_loads_tracked_files_at_most_once_per_finalize_run(self):
+        for name in ("first.txt", "second.txt"):
+            path = self.repo / "reports" / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(name + "\n")
+        git(self.repo, "add", "reports")
+        git(self.repo, "commit", "-m", "track reports")
+        command = '''/bin/zsh -lc "printf 'checking reports\\n'
+git -C /Users/itoutaisei/uec/Latex show HEAD:reports/first.txt > first.txt
+git -C /Users/itoutaisei/uec/Latex show HEAD:reports/second.txt > second.txt"'''
+        events = [{"command": command, "exit_code": 0}]
+        original_git = runner._git
+        full_ls_files_calls = 0
+
+        def counting_git(cwd, args, timeout=30):
+            nonlocal full_ls_files_calls
+            if args == ["ls-files"]:
+                full_ls_files_calls += 1
+            return original_git(cwd, args, timeout)
+
+        with patch("cross_harness.runner._git", side_effect=counting_git):
+            reversions = _self_reversions(self.repo, events)
+
+        self.assertEqual(1, full_ls_files_calls)
+        self.assertEqual(["first.txt", "second.txt"], [item["target"] for item in reversions])
+
+    def test_finalize_run_marks_self_reversion_check_unavailable_when_git_fails(self):
+        command = '''/bin/zsh -lc "printf 'before check\\n'
+git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
+        role = {"model": "gpt-5.6-terra", "effort": "medium", "output_limit_chars": 8000, "write": True}
+        original_git = runner._git
+
+        for failure in ("timeout", "oserror"):
+            with self.subTest(failure=failure):
+                run = self.root / f"self-reversion-{failure}-run"
+                run.mkdir()
+                (run / "events.jsonl").write_text(json.dumps({
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution", "command": command,
+                        "status": "completed", "exit_code": 0,
+                    },
+                }) + "\n")
+                (run / "stderr.log").write_text("")
+                (run / "final.json").write_text(json.dumps({
+                    "status": "success", "work_completed": "done", "changed_files": [],
+                    "tests": [], "error": None, "next_decision": None,
+                }))
+                failed = False
+
+                def failing_git(cwd, args, timeout=30):
+                    nonlocal failed
+                    if not failed and args[0] == "ls-files":
+                        failed = True
+                        if failure == "timeout":
+                            raise subprocess.TimeoutExpired(["git", *args], timeout)
+                        raise OSError("git executable unavailable")
+                    return original_git(cwd, args, timeout)
+
+                with patch("cross_harness.runner._git", side_effect=failing_git):
+                    summary = finalize_run(run, "implementer", role, "implementation", self.repo, 0, 1)
+
+                self.assertEqual("unavailable", summary["self_reversion_check"])
+                self.assertTrue((run / "summary.txt").exists())
+                self.assertTrue((run / "summary.json").exists())
+                self.assertIn("self_reversion_check: unavailable", (run / "summary.txt").read_text())
+                self.assertEqual(
+                    "unavailable",
+                    json.loads((run / "summary.json").read_text())["self_reversion_check"],
+                )
 
     def test_task_file_with_credential_material_is_rejected(self):
         self.task.write_text("OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz123456\n")

@@ -344,7 +344,11 @@ def _check_results(checks: list[str], executions: list[dict]) -> list[dict]:
     return results
 
 
-def _tracked_path(cwd: Path, value: str) -> str | None:
+def _tracked_path(
+    cwd: Path,
+    value: str,
+    tracked_basenames: dict[str, set[str]] | None = None,
+) -> str | None:
     path = value.strip().strip("'\"")
     if not path or path.startswith("-") or path == "/dev/null":
         return None
@@ -354,8 +358,17 @@ def _tracked_path(cwd: Path, value: str) -> str | None:
     basename = Path(path).name
     if not basename:
         return None
-    tracked = _git(cwd, ["ls-files"])
-    if any(Path(candidate).name == basename for candidate in tracked.stdout.splitlines()):
+    if tracked_basenames is None:
+        tracked = _git(cwd, ["ls-files"])
+        basenames = {Path(candidate).name for candidate in tracked.stdout.splitlines()}
+    else:
+        if "values" not in tracked_basenames:
+            tracked = _git(cwd, ["ls-files"])
+            tracked_basenames["values"] = {
+                Path(candidate).name for candidate in tracked.stdout.splitlines()
+            }
+        basenames = tracked_basenames["values"]
+    if basename in basenames:
         return path
     return None
 
@@ -363,18 +376,19 @@ def _tracked_path(cwd: Path, value: str) -> str | None:
 def _self_reversions(cwd: Path, executions: list[dict]) -> list[dict]:
     """Return successful Git commands that can restore tracked worktree state."""
     reversions: list[dict] = []
+    tracked_basenames: dict[str, set[str]] = {}
     for execution in executions:
         if execution.get("policy_denied") or execution.get("exit_code") not in {None, 0}:
             continue
         command = str(execution.get("command", ""))
         targets: list[tuple[str, str]] = []
         for match in _GIT_SHOW_HEAD_REDIRECT.finditer(command):
-            target = _tracked_path(cwd, match.group(1))
+            target = _tracked_path(cwd, match.group(1), tracked_basenames)
             if target:
                 targets.append(("git show HEAD redirect", target))
         for match in _GIT_CHECKOUT_PATHSPEC.finditer(command):
             for value in match.group(1).split():
-                target = _tracked_path(cwd, value)
+                target = _tracked_path(cwd, value, tracked_basenames)
                 if target:
                     targets.append(("git checkout", target))
         for match in _GIT_RESTORE.finditer(command):
@@ -382,14 +396,14 @@ def _self_reversions(cwd: Path, executions: list[dict]) -> list[dict]:
             if "--" in values:
                 values = values.split("--", 1)[1]
             for value in values.split():
-                target = _tracked_path(cwd, value)
+                target = _tracked_path(cwd, value, tracked_basenames)
                 if target:
                     targets.append(("git restore", target))
         for match in _GIT_STASH.finditer(command):
             values = match.group(1)
             if "--" in values:
                 for value in values.split("--", 1)[1].split():
-                    target = _tracked_path(cwd, value)
+                    target = _tracked_path(cwd, value, tracked_basenames)
                     if target:
                         targets.append(("git stash", target))
             elif re.match(r"\s*(?:$|push\b|save\b)", values):
@@ -1057,7 +1071,13 @@ def finalize_run(
         and execution.get("exit_code") not in {None, 0}
         and not any(command_matches_check(str(execution.get("command", "")), check) for check in declared_checks)
     )
-    self_reversions = _self_reversions(cwd, parsed.get("executions", [])) if role.get("write") else []
+    self_reversions: list[dict] = []
+    self_reversion_check_unavailable = False
+    if role.get("write"):
+        try:
+            self_reversions = _self_reversions(cwd, parsed.get("executions", []))
+        except (subprocess.TimeoutExpired, OSError):
+            self_reversion_check_unavailable = True
     final = load_final(run_dir / "final.json") or {}
     stderr = (run_dir / "stderr.log").read_text(encoding="utf-8", errors="replace") if (run_dir / "stderr.log").exists() else ""
     filtered_stderr = _filtered_executor_stderr(stderr)
@@ -1189,6 +1209,8 @@ def finalize_run(
         "baseline_file": str(run_dir / "baseline.json"),
         "cwd": str(cwd),
     }
+    if self_reversion_check_unavailable:
+        summary["self_reversion_check"] = "unavailable"
     state = {
         "role": role_name,
         "kind": kind,
