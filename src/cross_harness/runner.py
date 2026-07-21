@@ -527,10 +527,22 @@ def _claude_command(
         execution_root = cwd.resolve()
         scope = f"//{execution_root.as_posix().lstrip('/')}/**"
         allowed_tools = f"{allowed_tools},Edit({scope}),Write({scope})"
+    agent_path = claude_agents / f"cross-harness-{role_name}.md"
+    agent_instruction = ""
+    if agent_path.is_file():
+        agent_instruction = agent_path.read_text(encoding="utf-8")
+        agent_instruction = re.sub(
+            r"\A---[ \t]*\r?\n.*?\r?\n---[ \t]*(?:\r?\n|\Z)",
+            "",
+            agent_instruction,
+            count=1,
+            flags=re.DOTALL,
+        ).strip()
     result_instruction = (
         CLAUDE_EXECUTOR_CHARTER
         + "\n\n"
-        "When the task is complete, respond with only a JSON object conforming to "
+        + (agent_instruction + "\n\n" if agent_instruction else "")
+        + "When the task is complete, respond with only a JSON object conforming to "
         f"{schema}. It must contain exactly: status (one of success, failed, blocked, "
         "partial), work_completed (string), changed_files (array of strings), tests "
         "(array of strings), error (string or null), and next_decision (string or null). "
@@ -542,11 +554,6 @@ def _claude_command(
     command = [
         str(claude), "-p",
         *(["--resume", resume] if resume else []),
-        *(
-            ["--agent", f"cross-harness-{role_name}"]
-            if (claude_agents / f"cross-harness-{role_name}.md").is_file()
-            else []
-        ),
         "--model", role["model"],
         "--effort", role["effort"],
         "--output-format", "stream-json",
@@ -663,6 +670,18 @@ def _write_claude_final_from_events(run_dir: Path) -> None:
     fenced = re.fullmatch(r"```[^\r\n]*\r?\n(.*?)\r?\n?```", result_text, flags=re.DOTALL)
     if fenced:
         result_text = fenced.group(1).strip()
+    else:
+        # Claude can prepend prose even when its final response is a fenced JSON
+        # object. Only recover a trailing fence after rejecting the entire result
+        # as JSON, preserving the existing handling for complete fenced messages.
+        try:
+            json.loads(result_text)
+        except json.JSONDecodeError:
+            trailing_fence = re.search(
+                r"```[^\r\n]*\r?\n(.*?)\r?\n?```\s*\Z", result_text, flags=re.DOTALL
+            )
+            if trailing_fence:
+                result_text = trailing_fence.group(1).strip()
     try:
         final = json.loads(result_text)
     except json.JSONDecodeError:

@@ -693,7 +693,10 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:mics/j1/j1_report.synctex.gz > j1_r
         run = self.root / "claude-run"
         agents = self.home / ".claude/agents"
         agents.mkdir(parents=True)
-        (agents / "cross-harness-reviewer.md").write_text("---\nname: cross-harness-reviewer\n---\n")
+        (agents / "cross-harness-reviewer.md").write_text(
+            "---\nname: cross-harness-reviewer\ndescription: Ignore this metadata\n"
+            "tools: Read\nmodel: opus\neffort: low\n---\nReview the supplied diff only.\n"
+        )
         read_only = {
             "harness": "claude", "model": "sonnet", "effort": "high", "write": False,
         }
@@ -702,7 +705,7 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:mics/j1/j1_report.synctex.gz > j1_r
         self.assertEqual("stream-json", command[command.index("--output-format") + 1])
         self.assertIn("--verbose", command)
         self.assertEqual("manual", command[command.index("--permission-mode") + 1])
-        self.assertEqual("cross-harness-reviewer", command[command.index("--agent") + 1])
+        self.assertNotIn("--agent", command)
         self.assertEqual("Bash,Read,Grep,Glob", command[command.index("--allowedTools") + 1])
         claude_schema = json.loads(command[command.index("--json-schema") + 1])
         self.assertNotIn("$schema", claude_schema)
@@ -726,6 +729,11 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:mics/j1/j1_report.synctex.gz > j1_r
         self.assertIn("only a JSON object", instruction)
         self.assertIn("Do not write the result to a file", instruction)
         self.assertNotIn(str(run / "final.json"), instruction)
+        self.assertIn("Review the supplied diff only.", instruction)
+        self.assertNotIn("description: Ignore this metadata", instruction)
+        self.assertNotIn("tools: Read", instruction)
+        self.assertNotIn("model: opus", instruction)
+        self.assertNotIn("effort: low", instruction)
 
         resumed = _claude_command(Path("/usr/local/bin/claude"), "reviewer", read_only, self.repo, run, agents, "session-1")
         self.assertEqual("session-1", resumed[resumed.index("--resume") + 1])
@@ -749,9 +757,7 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:mics/j1/j1_report.synctex.gz > j1_r
         security_command = _claude_command(
             Path("/usr/local/bin/claude"), "security_reviewer", read_only, self.repo, run, agents
         )
-        self.assertEqual(
-            "cross-harness-security_reviewer", security_command[security_command.index("--agent") + 1]
-        )
+        self.assertNotIn("--agent", security_command)
 
     def test_claude_command_without_installed_agent_uses_executor_charter(self):
         run = self.root / "claude-uninstalled-agent-run"
@@ -824,6 +830,22 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:mics/j1/j1_report.synctex.gz > j1_r
         }
         (run / "events.jsonl").write_text(json.dumps({
             "type": "result", "result": f"```json\n{json.dumps(result)}\n```",
+        }) + "\n")
+
+        _write_claude_final_from_events(run)
+
+        self.assertEqual(result, json.loads((run / "final.json").read_text()))
+
+    def test_claude_result_prose_followed_by_code_fence_creates_final_json(self):
+        run = self.root / "claude-prose-fenced-result"
+        run.mkdir()
+        result = {
+            "status": "partial", "work_completed": "reviewed", "changed_files": [],
+            "tests": [], "error": None, "next_decision": "follow up",
+        }
+        (run / "events.jsonl").write_text(json.dumps({
+            "type": "result",
+            "result": f"I completed the review.\n\n```json\n{json.dumps(result)}\n```",
         }) + "\n")
 
         _write_claude_final_from_events(run)
