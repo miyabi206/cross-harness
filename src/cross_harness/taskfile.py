@@ -6,7 +6,7 @@ import re
 import sys
 import uuid
 
-from .config import load_config
+from .config import delegation_kind_error, load_config
 from .errors import ConfigError, HarnessError
 from .files import atomic_write
 from .paths import user_paths
@@ -44,7 +44,9 @@ def create_task_file(
         raise ConfigError(f"unknown role: {role}")
     role_config = config["roles"][role]
     if kind not in config["delegate_kinds"] or kind not in role_config["delegate_kinds"]:
-        raise ConfigError(f"delegation kind {kind!r} is not allowed for {role}")
+        raise ConfigError(delegation_kind_error(
+            kind, role, config["delegate_kinds"], role_config["delegate_kinds"]
+        ))
     if not cwd.is_dir():
         raise HarnessError(f"working directory not found: {cwd}")
     if not goal.strip():

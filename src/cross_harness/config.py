@@ -50,6 +50,15 @@ DELEGATE_KINDS = {"exploration", "implementation", "test", "debug", "review", "s
 ROLE_DELEGATE_KINDS = DELEGATE_KINDS
 
 
+def delegation_kind_error(
+    kind: str, role_name: str, delegate_kinds: list[str], role_delegate_kinds: list[str]
+) -> str:
+    """Describe a kind rejected by the global or role-specific policy."""
+    allowed = sorted(set(delegate_kinds) & set(role_delegate_kinds))
+    suffix = f"; allowed kinds: {', '.join(allowed)}" if allowed else "; no delegation kinds are allowed"
+    return f"delegation kind {kind!r} is not allowed for {role_name}{suffix}"
+
+
 def load_toml(path: Path) -> dict:
     try:
         with path.open("rb") as handle:

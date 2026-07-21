@@ -11,7 +11,7 @@ import unittest
 
 from cross_harness.errors import AuthError, DirtyWorktreeError, HarnessError, SupervisorDiedError
 from cross_harness.config import default_config
-from cross_harness.runner import _claude_command, _claude_sandbox_profile, _codex_command, _contain_claude_write_command, _escalated_role, _invoke_safe, _self_reversions, _tee, _write_baseline, _write_claude_final_from_events, delegate, retry, start_detached_delegate, wait_for_run
+from cross_harness.runner import _claude_command, _claude_sandbox_profile, _codex_command, _contain_claude_write_command, _escalated_role, _filtered_executor_stderr, _invoke_safe, _self_reversions, _tee, _write_baseline, _write_claude_final_from_events, delegate, retry, start_detached_delegate, wait_for_run
 from cross_harness.runner import finalize_run
 from cross_harness.summarize import parse_events
 
@@ -178,6 +178,65 @@ class RunnerTests(unittest.TestCase):
         summary = finalize_run(run, "tester", role, "test", self.repo, 0, 1)
         self.assertEqual("failed", summary["status"])
         self.assertIn("invalid schema", summary["error"])
+
+    def test_success_ignores_benign_codex_model_cache_stderr(self):
+        run = self.root / "benign-codex-cache-stderr-run"
+        run.mkdir()
+        (run / "events.jsonl").write_text('{"type":"turn.completed","usage":{}}\n')
+        stderr = """2026-07-21T12:35:26.280306Z ERROR codex_models_manager::cache: failed to load models cache: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-21T12:36:09.559475Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-21T12:37:03.347706Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-21T12:37:30.366180Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-21T12:37:43.062416Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-21T12:37:45.115478Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-21T12:37:58.937357Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-21T12:38:01.356853Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-21T12:38:16.038313Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-21T12:38:20.977552Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-21T12:38:48.047286Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-21T12:38:51.071847Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-21T12:38:55.987904Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+"""
+        (run / "stderr.log").write_text(stderr)
+        self.assertEqual("", _filtered_executor_stderr(stderr))
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "done", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-luna", "effort": "low", "output_limit_chars": 8000}
+
+        summary = finalize_run(run, "reviewer", role, "review", self.repo, 0, 1)
+
+        self.assertEqual("success", summary["status"])
+        self.assertIsNone(summary["error"])
+
+    def test_success_stderr_rate_limit_still_blocks_after_filtering(self):
+        run = self.root / "success-stderr-rate-limit-run"
+        run.mkdir()
+        (run / "events.jsonl").write_text('{"type":"turn.completed","usage":{}}\n')
+        (run / "stderr.log").write_text(
+            "2026-07-21T12:35:26.280306Z ERROR codex_models_manager::cache: failed to load models cache: stale\n"
+            "usage limit reached\n"
+        )
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "done", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-luna", "effort": "low", "output_limit_chars": 8000}
+
+        summary = finalize_run(run, "reviewer", role, "review", self.repo, 0, 1)
+
+        self.assertEqual("blocked", summary["status"])
+        self.assertIn("rate limit detected", summary["error"])
+
+    def test_codex_cache_filter_preserves_other_modules_and_levels(self):
+        stderr = (
+            "2026-07-21T12:35:26.280306Z WARN codex_models_manager::cache: failed to load models cache: stale\n"
+            "2026-07-21T12:35:26.280306Z ERROR codex_models_manager::manager: failed to update cache TTL: stale\n"
+            "2026-07-21T12:35:26.280306Z ERROR codex_models_manager_extra::cache: failed to load models cache: stale\n"
+        )
+
+        self.assertEqual(stderr.rstrip("\n"), _filtered_executor_stderr(stderr))
 
     def test_invalid_final_status_fails_closed_and_records_reason(self):
         run = self.root / "invalid-final-status-run"

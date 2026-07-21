@@ -20,7 +20,7 @@ from .auth import (
     verify_codex_chatgpt,
     verify_codex_config_ownership,
 )
-from .config import CLAUDE_EFFORTS, CODEX_EFFORTS, load_config, project_config
+from .config import CLAUDE_EFFORTS, CODEX_EFFORTS, delegation_kind_error, load_config, project_config
 from .errors import AuthError, ConfigError, DirtyWorktreeError, HarnessError, SupervisorDiedError
 from .files import atomic_write, dump_json, sha256
 from .paths import source_root, user_paths
@@ -30,6 +30,10 @@ from .taskfile import contains_secret
 
 RATE_LIMIT = re.compile(r"rate.?limit|usage.?limit|quota|too many requests", re.IGNORECASE)
 AUTH_FAILURE = re.compile(r"unauthorized|authentication|not logged in|login required", re.IGNORECASE)
+_CODEX_BENIGN_CACHE_STDERR = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z ERROR "
+    r"codex_models_manager::(?:cache: failed to load models cache|manager: failed to renew cache TTL):.*"
+)
 _CHECKS_HEADING = re.compile(r"^#{1,6}\s+Checks\s*$", re.IGNORECASE)
 _HEADING = re.compile(r"^#{1,6}\s+")
 _CHECK_ITEM = re.compile(r"^\s*[-*+]\s+(.+?)\s*$")
@@ -60,6 +64,13 @@ JSON schema: status, work_completed, changed_files, tests, error, and
 next_decision. On failure, include exit code, cause, file, line, expected value,
 and actual value whenever those facts exist. Do not narrate intermediate work."""
 _DETACHED_SUPERVISORS: dict[int, subprocess.Popen] = {}
+
+
+def _filtered_executor_stderr(stderr: str) -> str:
+    """Remove only known benign Codex model-cache diagnostics from stderr."""
+    return "\n".join(
+        line for line in stderr.splitlines() if not _CODEX_BENIGN_CACHE_STDERR.fullmatch(line)
+    )
 
 
 def _git(cwd: Path, args: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
@@ -582,7 +593,9 @@ def delegate(
         raise ConfigError(f"unknown role: {role_name}")
     role = dict(config["roles"][role_name])
     if kind not in config["delegate_kinds"] or kind not in role["delegate_kinds"]:
-        raise ConfigError(f"delegation kind {kind!r} is not allowed for {role_name}")
+        raise ConfigError(delegation_kind_error(
+            kind, role_name, config["delegate_kinds"], role["delegate_kinds"]
+        ))
     if role_name == "security_reviewer" and not confirm_high_risk:
         raise HarnessError("security review requires --confirm-high-risk after explicit human confirmation")
     if not task_file.is_file():
@@ -671,7 +684,9 @@ def start_detached_delegate(
         raise ConfigError(f"unknown role: {role_name}")
     role = config["roles"][role_name]
     if kind not in config["delegate_kinds"] or kind not in role["delegate_kinds"]:
-        raise ConfigError(f"delegation kind {kind!r} is not allowed for {role_name}")
+        raise ConfigError(delegation_kind_error(
+            kind, role_name, config["delegate_kinds"], role["delegate_kinds"]
+        ))
     if role_name == "security_reviewer" and not confirm_high_risk:
         raise HarnessError("security review requires --confirm-high-risk after explicit human confirmation")
     if not task_file.is_file():
@@ -912,6 +927,7 @@ def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path
     self_reversions = _self_reversions(cwd, parsed.get("executions", [])) if role.get("write") else []
     final = load_final(run_dir / "final.json") or {}
     stderr = (run_dir / "stderr.log").read_text(encoding="utf-8", errors="replace") if (run_dir / "stderr.log").exists() else ""
+    filtered_stderr = _filtered_executor_stderr(stderr)
     event_failed = bool(parsed.get("errors"))
     allowed_statuses = {"success", "failed", "blocked", "partial"}
     reported_status = final.get("status")
@@ -954,7 +970,9 @@ def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path
         command_error = "\n".join(item for item in (command_error, reversion_error) if item)
         if status == "success":
             status = "partial"
-    executor_error = str(final.get("error") or "\n".join(parsed.get("errors", [])[-3:]) or stderr[-2000:] or "")
+    executor_error = str(final.get("error") or "\n".join(parsed.get("errors", [])[-3:]) or "")
+    if status != "success":
+        executor_error = executor_error or filtered_stderr[-2000:]
     combined_error = "\n".join(error for error in (status_error, command_error, executor_error) if error)
     blocked_category = parsed.get("blocked_category")
     if blocked_category == "rate_limit":
@@ -963,11 +981,11 @@ def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path
     elif blocked_category == "authentication":
         status = "blocked"
         combined_error = "authentication failure detected; no billing fallback was attempted"
-    elif RATE_LIMIT.search(combined_error):
+    elif RATE_LIMIT.search("\n".join((combined_error, filtered_stderr))):
         status = "blocked"
         blocked_category = "rate_limit"
         combined_error = "rate limit detected; no fallback or automatic waiting was attempted"
-    elif AUTH_FAILURE.search(combined_error):
+    elif AUTH_FAILURE.search("\n".join((combined_error, filtered_stderr))):
         status = "blocked"
         blocked_category = "authentication"
         combined_error = "authentication failure detected; no billing fallback was attempted"
@@ -992,7 +1010,7 @@ def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path
     unverified_changed_files = [
         name for name in reported_changed_files if name not in detected_changed
     ]
-    signature = failure_signature(exit_code, parsed, stderr)
+    signature = failure_signature(exit_code, parsed, filtered_stderr)
     reported_tests = final.get("tests", [])
     if isinstance(reported_tests, str):
         reported_tests = [reported_tests]

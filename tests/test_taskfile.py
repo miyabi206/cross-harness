@@ -4,7 +4,8 @@ from io import StringIO
 import tempfile
 import unittest
 
-from cross_harness.errors import HarnessError
+from cross_harness.config import delegation_kind_error
+from cross_harness.errors import ConfigError, HarnessError
 from cross_harness.taskfile import create_task_file
 
 
@@ -50,6 +51,28 @@ class TaskFileTests(unittest.TestCase):
             path = create_task_file("reviewer", "review", repo, "Review changes", ["Review is complete"], home=home)
             self.assertTrue(path.is_file())
             self.assertIn("role=reviewer", path.read_text())
+
+    def test_task_creation_rejected_kind_lists_allowed_kinds(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder) / "home"
+            repo = Path(folder) / "repo"
+            home.mkdir()
+            repo.mkdir()
+
+            with self.assertRaisesRegex(
+                ConfigError, "delegation kind 'review' is not allowed for tester; allowed kinds: test"
+            ):
+                create_task_file("tester", "review", repo, "Review", ["done"], home=home)
+
+    def test_rejected_kind_message_sorts_or_reports_empty_allowed_kinds(self):
+        self.assertEqual(
+            "delegation kind 'review' is not allowed for tester; allowed kinds: debug, test",
+            delegation_kind_error("review", "tester", ["test", "debug"], ["debug", "test"]),
+        )
+        self.assertEqual(
+            "delegation kind 'review' is not allowed for tester; no delegation kinds are allowed",
+            delegation_kind_error("review", "tester", ["test"], []),
+        )
 
     def test_task_creation_warns_when_execution_kind_has_no_check(self):
         with tempfile.TemporaryDirectory() as folder:
