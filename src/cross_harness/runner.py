@@ -185,6 +185,8 @@ def _prepare_write_execution(
     dirty = _dirty(root)
     if not role["write"] or not dirty:
         return root
+    if policy == "isolate":
+        return _create_isolated_worktree(root, run_dir)
     _, current, _ = _diff_details(root)
     allowed = policy == "allow_delegated" and _delegated_changes_match(runtime_root, root, dirty, current)
     if policy != "isolate" and not allowed:
@@ -194,8 +196,6 @@ def _prepare_write_execution(
             attempts=attempts, thread_id=thread_id, signatures=signatures,
         )
         raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
-    if policy == "isolate":
-        return _create_isolated_worktree(root, run_dir)
     return root
 
 
@@ -1190,13 +1190,21 @@ def finalize_run(
     parsed = parse_events(run_dir / "events.jsonl")
     declared_checks = _declared_checks(run_dir)
     check_results = _check_results(declared_checks, parsed.get("executions", []))
-    unrelated_failed_command_count = sum(
-        1
+    unrelated_failed_executions = [
+        execution
         for execution in parsed.get("executions", [])
         if not execution.get("policy_denied")
         and execution.get("exit_code") not in {None, 0}
         and not any(command_matches_check(str(execution.get("command", "")), check) for check in declared_checks)
-    )
+    ]
+    unrelated_failed_command_count = len(unrelated_failed_executions)
+    last_unrelated_failed_command = None
+    if kind in {"review", "exploration", "security_review"} and unrelated_failed_executions:
+        last_execution = unrelated_failed_executions[-1]
+        last_unrelated_failed_command = {
+            "command": str(last_execution.get("command", ""))[:500],
+            "exit_code": last_execution.get("exit_code"),
+        }
     self_reversions: list[dict] = []
     self_reversion_check_unavailable = False
     if role.get("write"):
@@ -1356,6 +1364,7 @@ def finalize_run(
         "tests": reported_tests,
         "checks": check_results,
         "unrelated_failed_command_count": unrelated_failed_command_count,
+        "last_unrelated_failed_command": last_unrelated_failed_command,
         "self_reversions": self_reversions,
         "work_completed": str(final.get("work_completed", "")),
         "error": combined_error[:4000] or None,

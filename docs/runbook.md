@@ -30,6 +30,19 @@ Run `cross-harness doctor` after either CLI upgrades, authentication changes,
 hook changes, or a reinstall. Run `cross-harness cleanup` when stale run
 directories need immediate maintenance; SessionStart also invokes it.
 
+## Verification constraints
+
+For `test`, `implementation`, and `debug` work, a task must declare an
+executable verification command. Otherwise a reported `success` is downgraded
+to `partial` and the CLI exits non-zero; automation that assumes a zero exit
+code must account for that verification requirement.
+
+Inside a delegated Claude executor, all five checks in `tests/test_hooks.py`
+fail deterministically because wrapper resolution and `PATH` differ there.
+Consequently the Claude `tester` role cannot validate the complete
+`scripts/test.sh` suite. Delegate deterministic full-suite verification to a
+Codex executor with `kind=test` instead.
+
 ## Stop conditions
 
 Stop delegation immediately for any of the following:

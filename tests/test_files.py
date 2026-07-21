@@ -41,6 +41,17 @@ class FileTests(unittest.TestCase):
             '/bin/zsh -lc "cat scripts/test.sh"', "cat scripts/test.sh",
         ))
 
+    def test_command_match_rejects_check_piped_to_another_command_without_pipefail(self):
+        check = "./scripts/test.sh"
+        self.assertFalse(command_matches_check(
+            "./scripts/test.sh 2>&1 | tail -100", check,
+        ))
+        self.assertFalse(command_matches_check("grep 'a|b' README.md", check))
+        self.assertTrue(command_matches_check(
+            "set -o pipefail; ./scripts/test.sh 2>&1 | tail -100", check,
+        ))
+        self.assertTrue(command_matches_check("tail -100 | ./scripts/test.sh", check))
+
     def test_parse_events_reads_claude_stream_result(self):
         with tempfile.TemporaryDirectory() as folder:
             events = Path(folder) / "events.jsonl"
@@ -202,6 +213,20 @@ class FileTests(unittest.TestCase):
         }
 
         self.assertIn("rate_limit_notice: overage_allowed", render_summary(summary, 10_000))
+
+    def test_summary_renders_bounded_last_unrelated_failed_command(self):
+        summary = {
+            "status": "success", "run_dir": "/tmp/run", "exit_code": 0,
+            "role": "reviewer", "model": "luna", "effort": "medium",
+            "changed_files": [], "tests": [], "unrelated_failed_command_count": 1,
+            "last_unrelated_failed_command": {"command": "x" * 600, "exit_code": 17},
+            "event_log": "/tmp/run/events.jsonl", "stderr_log": "/tmp/run/stderr.log",
+            "final_message": None,
+        }
+
+        rendered = render_summary(summary, 10_000)
+
+        self.assertIn("last_unrelated_failed_command: " + "x" * 497 + "... (exit 17)", rendered)
 
 
 if __name__ == "__main__":

@@ -30,14 +30,57 @@ _READ_COMMANDS = frozenset({
     "awk", "wc", "file", "stat", "ls", "find",
 })
 _SHELL_WRAPPER = re.compile(r"^/bin/(?:zsh|bash|sh)\s+-lc\s+(['\"])(.*)\1$", re.DOTALL)
-_COMMAND_SEPARATOR = re.compile(r"&&|\|\||;|\||\n")
+def _command_segments_with_operators(command: str) -> list[tuple[str, str | None]]:
+    """Split shell command lines, preserving unquoted terminating operators."""
+    match = _SHELL_WRAPPER.match(command.strip())
+    inner = match.group(2) if match else command
+    segments: list[tuple[str, str | None]] = []
+    start = 0
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(inner):
+        char = inner[index]
+        if escaped:
+            escaped = False
+        elif char == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = None
+        elif char in "'\"":
+            quote = char
+        elif char == "\n" or char == ";" or char == "|":
+            operator = char
+            if char == "|" and index + 1 < len(inner) and inner[index + 1] in "|&":
+                operator += inner[index + 1]
+            elif char != "|" and index + 1 < len(inner) and inner[index + 1] == "&":
+                operator += "&"
+            segments.append((inner[start:index], operator))
+            index += len(operator)
+            start = index
+            continue
+        elif char == "&" and index + 1 < len(inner) and inner[index + 1] == "&":
+            segments.append((inner[start:index], "&&"))
+            index += 2
+            start = index
+            continue
+        index += 1
+    segments.append((inner[start:], None))
+    return segments
 
 
 def _command_segments(command: str) -> list[str]:
     """Split a Codex shell command into the command lines it executes."""
-    match = _SHELL_WRAPPER.match(command.strip())
-    inner = match.group(2) if match else command
-    return _COMMAND_SEPARATOR.split(inner)
+    return [segment for segment, _ in _command_segments_with_operators(command)]
+
+
+def _pipefail_enabled_before(segments: list[tuple[str, str | None]], index: int) -> bool:
+    """Return whether this shell command enabled pipefail before a pipeline."""
+    prefix = "".join(
+        segment + (operator or "") for segment, operator in segments[:index + 1]
+    )
+    return bool(re.search(r"(?:^|[;\n]|&&)\s*set\s+-o\s+pipefail\b", prefix))
 
 
 def _starts_with_read_command(command: str) -> bool:
@@ -53,9 +96,17 @@ def command_matches_check(command: str, check: str) -> bool:
     if not matches:
         return False
     check_starts_with_read = _starts_with_read_command(normalized_check)
-    for segment in _command_segments(command):
+    segments = _command_segments_with_operators(command)
+    for index, (segment, operator) in enumerate(segments):
         normalized_segment = " ".join(segment.split())
         if normalized_check not in normalized_segment and (len(tail) < 12 or tail not in normalized_segment):
+            continue
+        if (_starts_with_read_command(segment) and not check_starts_with_read):
+            continue
+        # The shell reports the final command in a pipeline.  A check whose
+        # output is piped elsewhere is therefore not evidence of a successful
+        # check unless pipefail was explicitly enabled for this command.
+        if operator in {"|", "|&"} and not _pipefail_enabled_before(segments, index):
             continue
         if not _starts_with_read_command(segment) or check_starts_with_read:
             return True
@@ -289,6 +340,13 @@ def summary_item_text(value: object) -> str:
         return str(value)
 
 
+def _bounded_command_text(command: object, limit: int = 500) -> str:
+    text = summary_item_text(command).replace("\n", " ")
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
 def render_summary(summary: dict, limit: int) -> str:
     checks = summary.get("checks", [])
     if not checks:
@@ -312,6 +370,13 @@ def render_summary(summary: dict, limit: int) -> str:
         f"checks: {checks_text}",
         f"unrelated_failed_commands: {summary.get('unrelated_failed_command_count', 0)}",
     ]
+    last_failed_command = summary.get("last_unrelated_failed_command")
+    if isinstance(last_failed_command, dict):
+        lines.append(
+            "last_unrelated_failed_command: "
+            f"{_bounded_command_text(last_failed_command.get('command', 'unknown'))} "
+            f"(exit {last_failed_command.get('exit_code', 'unknown')})"
+        )
     unverified_changed_files = summary.get("unverified_changed_files", [])
     if unverified_changed_files:
         lines.append(

@@ -505,6 +505,50 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("success", summary["status"])
         self.assertEqual(1, summary["unrelated_failed_command_count"])
 
+    def test_read_only_summary_includes_last_unrelated_failed_command_without_status_change(self):
+        run = self.root / "read-only-command-failure-run"
+        run.mkdir()
+        (run / "events.jsonl").write_text("".join(json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution", "command": command, "status": "failed",
+                "exit_code": exit_code,
+            },
+        }) + "\n" for command, exit_code in (("false", 1), ("tool --bad argument", 7))))
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "reviewed", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-luna", "effort": "low", "output_limit_chars": 8000, "write": False}
+
+        summary = finalize_run(run, "reviewer", role, "review", self.repo, 0, 1)
+
+        self.assertEqual("success", summary["status"])
+        self.assertEqual(2, summary["unrelated_failed_command_count"])
+        self.assertEqual({"command": "tool --bad argument", "exit_code": 7}, summary["last_unrelated_failed_command"])
+        self.assertIn("last_unrelated_failed_command: tool --bad argument (exit 7)", (run / "summary.txt").read_text())
+
+    def test_isolate_policy_does_not_inspect_diff_details_before_creating_worktree(self):
+        run = self.root / "isolate-prepare-run"
+        run.mkdir()
+        (self.repo / "user-change.txt").write_text("mine\n")
+        config = default_config()
+        config["dirty_worktree_policy"] = "isolate"
+        role = config["roles"]["implementer"]
+        isolated = self.root / "isolated"
+
+        with patch.object(runner, "_diff_details") as diff_details, patch.object(
+            runner, "_create_isolated_worktree", return_value=isolated,
+        ) as create_worktree:
+            actual = runner._prepare_write_execution(
+                config, "implementer", role, "implementation", self.repo, self.home, run,
+            )
+
+        self.assertEqual(isolated, actual)
+        diff_details.assert_not_called()
+        create_worktree.assert_called_once_with(self.repo, run)
+
     def test_last_declared_check_execution_controls_the_result(self):
         run = self.root / "last-check-execution-run"
         run.mkdir()
@@ -527,6 +571,32 @@ class RunnerTests(unittest.TestCase):
 
         self.assertEqual("failed", summary["status"])
         self.assertEqual(2, summary["checks"][0]["exit_code"])
+
+    def test_piped_declared_check_does_not_mask_prior_failure(self):
+        run = self.root / "piped-check-fail-open-run"
+        run.mkdir()
+        (run / "task.md").write_text("# Checks\n- ./scripts/test.sh\n")
+        (run / "events.jsonl").write_text("".join(json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution", "command": command, "status": status,
+                "exit_code": exit_code,
+            },
+        }) + "\n" for command, status, exit_code in (
+            ("./scripts/test.sh", "failed", 1),
+            ("./scripts/test.sh 2>&1 | tail -100", "completed", 0),
+        )))
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "done", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-luna", "effort": "low", "output_limit_chars": 8000, "write": False}
+
+        summary = finalize_run(run, "tester", role, "test", self.repo, 0, 1)
+
+        self.assertEqual("failed", summary["status"])
+        self.assertEqual(1, summary["checks"][0]["exit_code"])
 
     def test_declared_check_failure_overrides_success_for_write_role(self):
         run = self.root / "write-declared-check-failure-run"
