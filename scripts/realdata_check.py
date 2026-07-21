@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 from unittest.mock import patch
 
 from cross_harness import runner
@@ -128,11 +131,86 @@ def _p2() -> int:
     return 0
 
 
+def _p3() -> int:
+    """Exercise retry artifacts against Git and inspect saved artifact shape read-only."""
+    runs_root = Path.home() / ".local/state/cross-harness/runs"
+    checked = 0
+    skipped = 0
+    mismatches: list[str] = []
+    if runs_root.is_dir():
+        for run_dir in sorted(path for path in runs_root.iterdir() if path.is_dir()):
+            baseline_path = run_dir / "baseline.json"
+            summary_path = run_dir / "summary.json"
+            if not baseline_path.is_file() or not summary_path.is_file():
+                skipped += 1
+                continue
+            try:
+                baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                mismatches.append(run_dir.name)
+                continue
+            # Blocked runs never reached finalize_run's diff collection and
+            # are intentionally fail-closed by the retry guard.
+            if isinstance(summary, dict) and summary.get("status") == "blocked":
+                skipped += 1
+                continue
+            for record in (baseline, summary):
+                details = record.get("diff_summary") if isinstance(record, dict) else None
+                if not isinstance(details, list):
+                    mismatches.append(run_dir.name)
+                    break
+                if any(
+                    not isinstance(item, dict)
+                    or not isinstance(item.get("file"), str)
+                    or (
+                        item.get("removed_preexisting_change") is not True
+                        and not isinstance(item.get("fingerprint"), (str, type(None)))
+                    )
+                    for item in details
+                ):
+                    mismatches.append(run_dir.name)
+                    break
+            else:
+                checked += 1
+    else:
+        skipped += 1
+
+    tests = (
+        "tests.test_runner.RunnerTests.test_retry_continues_failed_write_run_changes",
+        "tests.test_runner.RunnerTests.test_retry_rejects_changes_not_left_by_failed_run",
+        "tests.test_runner.RunnerTests.test_isolated_retry_reuses_failed_run_worktree",
+        "tests.test_runner.RunnerTests.test_retry_chain_accepts_each_previous_run_delta",
+    )
+    environment = dict(os.environ)
+    environment.pop("CROSS_HARNESS_ACTIVE", None)
+    result = subprocess.run(
+        [sys.executable, "-m", "unittest", *tests],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if mismatches:
+        print("P3 malformed retry diff artifacts: " + ", ".join(sorted(set(mismatches))))
+        return 1
+    if result.returncode:
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        return result.returncode
+    print(f"P3 passed: {checked} saved baseline/summary pairs matched; {skipped} skipped; 4 Git retry scenarios passed")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--unit", required=True, choices=("p1", "p2"))
+    parser.add_argument("--unit", required=True, choices=("p1", "p2", "p3"))
     args = parser.parse_args()
-    return _p1() if args.unit == "p1" else _p2()
+    if args.unit == "p1":
+        return _p1()
+    if args.unit == "p2":
+        return _p2()
+    return _p3()
 
 
 if __name__ == "__main__":

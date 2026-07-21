@@ -199,6 +199,120 @@ def _prepare_write_execution(
     return root
 
 
+def _recorded_retry_changes(previous_run: Path) -> set[tuple[str, str | None]] | None:
+    """Return the fail-closed set of changes a retry may continue from."""
+    allowed: set[tuple[str, str | None]] = set()
+    for name in ("baseline.json", "summary.json"):
+        path = previous_run / name
+        if not path.is_file():
+            return None
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        diff_summary = record.get("diff_summary") if isinstance(record, dict) else None
+        if not isinstance(diff_summary, list):
+            return None
+        for item in diff_summary:
+            if not isinstance(item, dict):
+                return None
+            if item.get("removed_preexisting_change") is True:
+                continue
+            file_name = item.get("file")
+            fingerprint = item.get("fingerprint")
+            if not isinstance(file_name, str) or not isinstance(fingerprint, (str, type(None))):
+                return None
+            allowed.add((file_name, fingerprint))
+    return allowed
+
+
+def _reusable_isolated_worktree(root: Path, previous_run: Path) -> Path | None:
+    """Validate the previous run's isolated worktree without creating another."""
+    marker = previous_run / "ISOLATED_WORKTREE"
+    try:
+        raw_path = marker.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    if not raw_path:
+        return None
+    worktree = Path(raw_path)
+    if not worktree.is_dir():
+        return None
+    try:
+        worktree = worktree.resolve()
+    except OSError:
+        return None
+    top_level = _git(worktree, ["rev-parse", "--show-toplevel"])
+    if top_level.returncode or Path(top_level.stdout.strip()).resolve() != worktree:
+        return None
+    listed = _git(root, ["worktree", "list", "--porcelain"])
+    if listed.returncode:
+        return None
+    return worktree if any(
+        line.startswith("worktree ") and Path(line[9:]).resolve() == worktree
+        for line in listed.stdout.splitlines()
+    ) else None
+
+
+def _prepare_retry_execution(
+    config: dict,
+    role_name: str,
+    role: dict,
+    kind: str,
+    root: Path,
+    run_dir: Path,
+    previous_run: Path,
+    *,
+    attempts: int,
+    thread_id: str | None,
+    signatures: list[str] | None,
+) -> Path:
+    """Prepare a retry from its predecessor's recorded worktree state."""
+    if not role["write"]:
+        return root
+
+    if (previous_run / "ISOLATED_WORKTREE").exists():
+        execution_root = _reusable_isolated_worktree(root, previous_run)
+        if execution_root is None:
+            reason = "retry blocked: missing isolated worktree"
+            finalize_blocked_run(
+                run_dir, role_name, role, kind, root, reason, "missing_isolated_worktree",
+                attempts=attempts, thread_id=thread_id, signatures=signatures,
+            )
+            raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
+        atomic_write(run_dir / "ISOLATED_WORKTREE", str(execution_root) + "\n")
+    else:
+        execution_root = root
+
+    allowed = _recorded_retry_changes(previous_run)
+    if allowed is None:
+        reason = "retry blocked: previous run diff records are missing or invalid"
+        finalize_blocked_run(
+            run_dir, role_name, role, kind, execution_root, reason, "dirty_worktree",
+            attempts=attempts, thread_id=thread_id, signatures=signatures,
+        )
+        raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
+    dirty = _dirty(execution_root)
+    _, current, _ = _diff_details(execution_root)
+    current_changes: set[tuple[str, str | None]] = set()
+    valid_current = len(current) >= len(dirty)
+    for item in current:
+        file_name = item.get("file")
+        fingerprint = item.get("fingerprint")
+        if not isinstance(file_name, str) or not isinstance(fingerprint, (str, type(None))):
+            valid_current = False
+            break
+        current_changes.add((file_name, fingerprint))
+    if not valid_current or not current_changes.issubset(allowed):
+        reason = "retry blocked by changes outside the previous run's recorded diff"
+        finalize_blocked_run(
+            run_dir, role_name, role, kind, execution_root, reason, "dirty_worktree",
+            attempts=attempts, thread_id=thread_id, signatures=signatures,
+        )
+        raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
+    return execution_root
+
+
 def _diff_details(cwd: Path) -> tuple[str, list[dict], list[str]]:
     stat_result = _git(cwd, ["diff", "HEAD", "--stat", "--", "."])
     if stat_result.returncode:
@@ -1333,8 +1447,8 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
     source_root = _git_root(Path(state["cwd"]))
     retry_root = _new_run_dir(runtime_root)
     shutil.copy2(task_file, retry_root / "task.md")
-    execution_root = _prepare_write_execution(
-        config, role_name, role, state["kind"], source_root, runtime_root, retry_root,
+    execution_root = _prepare_retry_execution(
+        config, role_name, role, state["kind"], source_root, retry_root, run_dir,
         attempts=state["attempts"], thread_id=state["thread_id"], signatures=state.get("signatures", []),
     )
     _write_baseline(retry_root, execution_root)
@@ -1406,8 +1520,8 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         escalation = _escalated_role(role, config)
         escalation_root = _new_run_dir(runtime_root)
         shutil.copy2(task_file, escalation_root / "task.md")
-        escalation_execution_root = _prepare_write_execution(
-            config, role_name, escalation, state["kind"], source_root, runtime_root, escalation_root,
+        escalation_execution_root = _prepare_retry_execution(
+            config, role_name, escalation, state["kind"], source_root, escalation_root, retry_root,
             attempts=new_state["attempts"], thread_id=summary.get("thread_id"),
             signatures=new_state.get("signatures", []),
         )

@@ -81,6 +81,38 @@ class RunnerTests(unittest.TestCase):
         }))
         return 0
 
+    def _failed_write_run(self, name: str, changed_file: str, contents: str, attempt: int = 1) -> Path:
+        """Create a real failed write-run artifact for retry guard tests."""
+        run = self.root / name
+        run.mkdir()
+        _write_baseline(run, self.repo)
+        (self.repo / changed_file).write_text(contents)
+        (run / "events.jsonl").write_text(
+            '{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000001"}\n'
+            '{"type":"turn.failed","error":{"message":"fixture failure"}}\n'
+        )
+        (run / "stderr.log").write_text("fixture failure")
+        (run / "final.json").write_text(json.dumps({
+            "status": "failed", "work_completed": "", "changed_files": [],
+            "tests": [], "error": "fixture failure", "next_decision": None,
+        }))
+        role = default_config()["roles"]["implementer"]
+        finalize_run(run, "implementer", role, "implementation", self.repo, 1, attempt)
+        return run
+
+    @staticmethod
+    def _successful_retry(command, task, env, cwd, run_dir, timeout):
+        (run_dir / "events.jsonl").write_text(
+            '{"type":"item.completed","item":{"type":"command_execution","command":"fixture","status":"completed","exit_code":0}}\n'
+            '{"type":"turn.completed","usage":{}}\n'
+        )
+        (run_dir / "stderr.log").write_text("")
+        (run_dir / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "done", "changed_files": [],
+            "tests": ["fixture"], "error": None, "next_decision": None,
+        }))
+        return 0
+
     @patch("cross_harness.runner.verify_claude_subscription")
     @patch("cross_harness.runner.verify_claude_config_ownership")
     @patch("cross_harness.runner._invoke_safe")
@@ -1224,6 +1256,97 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
     @patch("cross_harness.runner.verify_codex_chatgpt")
     @patch("cross_harness.runner.verify_codex_config_ownership")
     @patch("cross_harness.runner._invoke_safe")
+    def test_retry_continues_failed_write_run_changes(self, invoke, ownership, verify):
+        self.task.write_text("# Goal\nContinue.\n\n# Checks\n- fixture\n")
+        previous = self._failed_write_run("failed-write", "delegated.txt", "delegated\n")
+        verify.return_value = (Path("/usr/bin/true"), False)
+        invoke.side_effect = self._successful_retry
+
+        summary = retry(previous, self.task, home=self.home)
+
+        self.assertEqual("success", summary["status"])
+        self.assertEqual(1, invoke.call_count)
+
+    @patch("cross_harness.runner.verify_codex_chatgpt")
+    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_retry_rejects_changes_not_left_by_failed_run(self, invoke, ownership, verify):
+        previous = self._failed_write_run("failed-write", "delegated.txt", "delegated\n")
+        (self.repo / "user-change.txt").write_text("mine\n")
+
+        with self.assertRaises(DirtyWorktreeError):
+            retry(previous, self.task, home=self.home)
+
+        invoke.assert_not_called()
+        verify.assert_not_called()
+        ownership.assert_not_called()
+
+    @patch("cross_harness.runner.verify_codex_chatgpt")
+    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_isolated_retry_reuses_failed_run_worktree(self, invoke, ownership, verify):
+        config = self.root / "isolate.toml"
+        default = (Path(__file__).resolve().parents[1] / "config/default.toml").read_text()
+        config.write_text(default.replace('dirty_worktree_policy = "stop"', 'dirty_worktree_policy = "isolate"', 1))
+        self.task.write_text("# Goal\nContinue.\n\n# Checks\n- fixture\n")
+        (self.repo / "pre-existing.txt").write_text("outside isolated worktree\n")
+        verify.return_value = (Path("/usr/bin/true"), False)
+
+        def fail_in_isolated_worktree(command, task, env, cwd, run_dir, timeout):
+            (cwd / "delegated.txt").write_text("delegated\n")
+            (run_dir / "events.jsonl").write_text('{"type":"turn.failed","error":{"message":"fixture failure"}}\n')
+            (run_dir / "stderr.log").write_text("fixture failure")
+            (run_dir / "final.json").write_text(json.dumps({
+                "status": "failed", "work_completed": "", "changed_files": [],
+                "tests": [], "error": "fixture failure", "next_decision": None,
+            }))
+            return 1
+
+        invoke.side_effect = fail_in_isolated_worktree
+        failed = delegate("implementer", "implementation", self.task, self.repo, config_path=config, home=self.home)
+        previous = Path(failed["run_dir"])
+        worktree = Path((previous / "ISOLATED_WORKTREE").read_text().strip())
+
+        def retry_in_same_worktree(command, task, env, cwd, run_dir, timeout):
+            self.assertEqual(worktree, cwd)
+            self.assertTrue((cwd / "delegated.txt").is_file())
+            return self._successful_retry(command, task, env, cwd, run_dir, timeout)
+
+        invoke.side_effect = retry_in_same_worktree
+        summary = retry(previous, self.task, config_path=config, home=self.home)
+        retry_run = Path(summary["run_dir"])
+        self.assertEqual(str(worktree), (retry_run / "ISOLATED_WORKTREE").read_text().strip())
+        self.assertEqual(2, invoke.call_count)
+
+    @patch("cross_harness.runner.verify_codex_chatgpt")
+    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_retry_chain_accepts_each_previous_run_delta(self, invoke, ownership, verify):
+        self.task.write_text("# Goal\nContinue.\n\n# Checks\n- fixture\n")
+        previous = self._failed_write_run("first-failed-write", "one.txt", "one\n")
+        verify.return_value = (Path("/usr/bin/true"), False)
+
+        def fail_with_second_change(command, task, env, cwd, run_dir, timeout):
+            (cwd / "two.txt").write_text("two\n")
+            (run_dir / "events.jsonl").write_text('{"type":"turn.failed","error":{"message":"second fixture failure"}}\n')
+            (run_dir / "stderr.log").write_text("second fixture failure")
+            (run_dir / "final.json").write_text(json.dumps({
+                "status": "failed", "work_completed": "", "changed_files": [],
+                "tests": [], "error": "second fixture failure", "next_decision": None,
+            }))
+            return 1
+
+        invoke.side_effect = fail_with_second_change
+        second = retry(previous, self.task, home=self.home)
+        invoke.side_effect = self._successful_retry
+        third = retry(Path(second["run_dir"]), self.task, home=self.home)
+
+        self.assertEqual("success", third["status"])
+        self.assertEqual(2, invoke.call_count)
+
+    @patch("cross_harness.runner.verify_codex_chatgpt")
+    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner._invoke_safe")
     def test_allow_delegated_retry_accepts_recorded_changes_and_rejects_other_changes(self, invoke, ownership, verify):
         config = self.root / "allow-delegated.toml"
         default = (Path(__file__).resolve().parents[1] / "config/default.toml").read_text()
@@ -1320,14 +1443,8 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
     @patch("cross_harness.runner.verify_codex_chatgpt")
     @patch("cross_harness.runner.verify_codex_config_ownership")
     @patch("cross_harness.runner._invoke_safe")
-    def test_escalation_write_role_rechecks_dirty_stop_policy(self, invoke, ownership, verify, signature):
-        previous = self.root / "retry-escalation-dirty"
-        previous.mkdir()
-        (previous / "state.json").write_text(json.dumps({
-            "role": "implementer", "kind": "implementation", "cwd": str(self.repo),
-            "thread_id": "session-1", "attempts": 1, "signatures": ["same-signature"],
-            "escalated": False, "status": "failed", "model": "gpt-5.6-terra", "effort": "high",
-        }))
+    def test_escalation_continues_retry_recorded_changes(self, invoke, ownership, verify, signature):
+        previous = self._failed_write_run("retry-escalation", "existing.txt", "existing\n")
         verify.return_value = (Path("/usr/bin/true"), False)
 
         def fail_with_change(command, task, env, cwd, run_dir, timeout):
@@ -1341,15 +1458,9 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
             return 1
 
         invoke.side_effect = fail_with_change
-        with self.assertRaises(DirtyWorktreeError):
-            retry(previous, self.task, home=self.home)
-        self.assertEqual(1, invoke.call_count)
-        blocked = [
-            path for path in (self.home / ".local/state/cross-harness/runs").iterdir()
-            if (path / "BLOCKED").exists()
-        ]
-        self.assertEqual(1, len(blocked))
-        self.assertEqual("dirty_worktree", json.loads((blocked[0] / "state.json").read_text())["blocked_category"])
+        result = retry(previous, self.task, home=self.home)
+        self.assertEqual(2, invoke.call_count)
+        self.assertTrue(json.loads((Path(result["run_dir"]) / "state.json").read_text())["escalated"])
 
     @patch("cross_harness.runner.verify_claude_config_ownership")
     @patch("cross_harness.runner.verify_claude_subscription")
