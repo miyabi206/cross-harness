@@ -124,6 +124,16 @@ class FileTests(unittest.TestCase):
             parsed = parse_events(events)
         self.assertEqual("rate_limit", parsed["blocked_category"])
 
+    def test_parse_events_marks_rejected_overage_as_notice(self):
+        with tempfile.TemporaryDirectory() as folder:
+            events = Path(folder) / "events.jsonl"
+            events.write_text(
+                '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1784648400,"rateLimitType":"five_hour","overageStatus":"allowed","overageResetsAt":1784640000,"isUsingOverage":true}}\n'
+            )
+            parsed = parse_events(events)
+        self.assertIsNone(parsed["blocked_category"])
+        self.assertEqual("overage_allowed", parsed["rate_limit_notice"])
+
     def test_summary_is_bounded_and_points_to_raw_artifacts(self):
         summary = {
             "status": "failed", "run_dir": "/tmp/run", "exit_code": 1,
@@ -181,6 +191,17 @@ class FileTests(unittest.TestCase):
 
         self.assertNotIn("work_completed (executor-reported):", render_summary(summary, 10_000))
         self.assertNotIn("unverified_changed_files:", render_summary(summary, 10_000))
+
+    def test_summary_renders_overage_allowed_notice(self):
+        summary = {
+            "status": "success", "run_dir": "/tmp/run", "exit_code": 0,
+            "role": "tester", "model": "luna", "effort": "medium",
+            "changed_files": [], "tests": [], "rate_limit_notice": "overage_allowed",
+            "event_log": "/tmp/run/events.jsonl", "stderr_log": "/tmp/run/stderr.log",
+            "final_message": None,
+        }
+
+        self.assertIn("rate_limit_notice: overage_allowed", render_summary(summary, 10_000))
 
 
 if __name__ == "__main__":

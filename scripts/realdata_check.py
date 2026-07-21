@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from cross_harness import runner
-from cross_harness.summarize import parse_events
+from cross_harness.summarize import load_final, parse_events
 
 
 def _uncached_tracked_path(
@@ -68,11 +68,71 @@ def _p1() -> int:
     return 0
 
 
+def _p2() -> int:
+    runs_root = Path.home() / ".local/state/cross-harness/runs"
+    target_name = "20260721T222034-9e55a8fd"
+    if not runs_root.is_dir():
+        print(f"run directory not found: {runs_root}")
+        return 1
+
+    target_found = False
+    target_verified = False
+    non_overage_rejected_runs: list[str] = []
+    changed_decisions: list[str] = []
+    for run_dir in sorted(path for path in runs_root.iterdir() if path.is_dir()):
+        events_path = run_dir / "events.jsonl"
+        if not events_path.is_file():
+            continue
+        parsed = parse_events(events_path)
+        final = load_final(run_dir / "final.json") or {}
+        completed = final.get("status") == "success"
+        legacy_rate_limit_blocked = (
+            parsed.get("blocked_category") == "rate_limit"
+            or parsed.get("rate_limit_notice") == "overage_allowed"
+        )
+        rate_limit_blocked = (
+            parsed.get("blocked_category") == "rate_limit"
+            or (
+                parsed.get("rate_limit_notice") == "overage_allowed"
+                and not completed
+            )
+        )
+        if legacy_rate_limit_blocked and not rate_limit_blocked:
+            changed_decisions.append(run_dir.name)
+        if parsed.get("blocked_category") == "rate_limit":
+            non_overage_rejected_runs.append(run_dir.name)
+        if run_dir.name == target_name:
+            target_found = True
+            target_verified = (
+                completed
+                and parsed.get("blocked_category") is None
+                and parsed.get("rate_limit_notice") == "overage_allowed"
+                and not rate_limit_blocked
+            )
+
+    print("P2 changed rate-limit decisions: " + (", ".join(changed_decisions) or "none"))
+    if not target_found:
+        print(f"P2 target run not found: {target_name}")
+        return 1
+    if not target_verified:
+        print(f"P2 target run did not become overage_allowed: {target_name}")
+        return 1
+    if target_name not in changed_decisions:
+        print(f"P2 target run was not listed as changed: {target_name}")
+        return 1
+    non_overage_text = ", ".join(non_overage_rejected_runs) or "none present"
+    print(
+        "P2 passed: target has overage_allowed notice; rejected non-overage runs remain blocked: "
+        + non_overage_text
+    )
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--unit", required=True, choices=("p1",))
+    parser.add_argument("--unit", required=True, choices=("p1", "p2"))
     args = parser.parse_args()
-    return _p1() if args.unit == "p1" else 2
+    return _p1() if args.unit == "p1" else _p2()
 
 
 if __name__ == "__main__":

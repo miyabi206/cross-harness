@@ -74,7 +74,7 @@ def _is_cross_harness_policy_denial(output: str) -> bool:
 def parse_events(path: Path) -> dict:
     result = {
         "thread_id": None, "usage": {}, "errors": [], "commands": [],
-        "executions": [], "blocked_category": None,
+        "executions": [], "blocked_category": None, "rate_limit_notice": None,
     }
     claude_commands: dict[str, str] = {}
     if not path.exists():
@@ -95,6 +95,8 @@ def parse_events(path: Path) -> dict:
             if claude_blocked_category == "rate_limit":
                 # A rate limit always wins if an event stream contains multiple errors.
                 result["blocked_category"] = claude_blocked_category
+            elif claude_blocked_category == "overage_allowed":
+                result["rate_limit_notice"] = "overage_allowed"
             elif claude_blocked_category and result["blocked_category"] is None:
                 result["blocked_category"] = claude_blocked_category
             if kind == "thread.started":
@@ -190,7 +192,7 @@ def _tool_result_text(block: dict) -> str:
 
 
 def _claude_blocked_category(event: dict) -> str | None:
-    """Extract terminal Claude failures from stream-json's structured fields.
+    """Extract terminal Claude failures or an overage-allowed rate-limit notice.
 
     Claude emits rate limits as a dedicated event and reports error categories
     on ``result`` and ``system/api_retry`` events. Deliberately do not inspect
@@ -200,7 +202,11 @@ def _claude_blocked_category(event: dict) -> str | None:
     event_type = event.get("type")
     if event_type == "rate_limit_event":
         info = event.get("rate_limit_info")
-        return "rate_limit" if isinstance(info, dict) and info.get("status") == "rejected" else None
+        if not isinstance(info, dict) or info.get("status") != "rejected":
+            return None
+        if info.get("overageStatus") == "allowed" and info.get("isUsingOverage") is True:
+            return "overage_allowed"
+        return "rate_limit"
     if event_type == "system" and event.get("subtype") == "api_retry":
         return _claude_error_category(event.get("error"))
     if event_type != "result":
@@ -324,6 +330,8 @@ def render_summary(summary: dict, limit: int) -> str:
         lines.append("self_reversion_check: unavailable")
     if summary.get("diff_check") == "unavailable":
         lines.append("diff_check: unavailable")
+    if summary.get("rate_limit_notice") == "overage_allowed":
+        lines.append("rate_limit_notice: overage_allowed")
     for item in summary.get("diff_summary", []):
         if item.get("removed_preexisting_change"):
             lines.append(f"diff: {item['file']} (pre-existing change removed during run)")

@@ -1128,17 +1128,30 @@ def finalize_run(
         executor_error = executor_error or filtered_stderr[-2000:]
     combined_error = "\n".join(error for error in (status_error, command_error, executor_error) if error)
     blocked_category = parsed.get("blocked_category")
+    rate_limit_notice = None
+    execution_completed = exit_code == 0 and reported_status == "success"
     if blocked_category == "rate_limit":
         status = "blocked"
         combined_error = "rate limit detected; no fallback or automatic waiting was attempted"
     elif blocked_category == "authentication":
         status = "blocked"
         combined_error = "authentication failure detected; no billing fallback was attempted"
-    elif RATE_LIMIT.search("\n".join((combined_error, filtered_stderr))):
+    elif parsed.get("rate_limit_notice") == "overage_allowed":
+        if execution_completed:
+            rate_limit_notice = "overage_allowed"
+        else:
+            status = "blocked"
+            blocked_category = "rate_limit"
+            combined_error = "rate limit detected; no fallback or automatic waiting was attempted"
+    elif RATE_LIMIT.search(combined_error) or (
+        status != "success" and RATE_LIMIT.search(filtered_stderr)
+    ):
         status = "blocked"
         blocked_category = "rate_limit"
         combined_error = "rate limit detected; no fallback or automatic waiting was attempted"
-    elif AUTH_FAILURE.search("\n".join((combined_error, filtered_stderr))):
+    elif AUTH_FAILURE.search(combined_error) or (
+        status != "success" and AUTH_FAILURE.search(filtered_stderr)
+    ):
         status = "blocked"
         blocked_category = "authentication"
         combined_error = "authentication failure detected; no billing fallback was attempted"
@@ -1234,6 +1247,8 @@ def finalize_run(
         summary["self_reversion_check"] = "unavailable"
     if diff_check_unavailable:
         summary["diff_check"] = "unavailable"
+    if rate_limit_notice:
+        summary["rate_limit_notice"] = rate_limit_notice
     state = {
         "role": role_name,
         "kind": kind,

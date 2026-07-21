@@ -212,24 +212,30 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("success", summary["status"])
         self.assertIsNone(summary["error"])
 
-    def test_success_stderr_rate_limit_still_blocks_after_filtering(self):
-        run = self.root / "success-stderr-rate-limit-run"
-        run.mkdir()
-        (run / "events.jsonl").write_text('{"type":"turn.completed","usage":{}}\n')
-        (run / "stderr.log").write_text(
-            "2026-07-21T12:35:26.280306Z ERROR codex_models_manager::cache: failed to load models cache: stale\n"
-            "usage limit reached\n"
-        )
-        (run / "final.json").write_text(json.dumps({
-            "status": "success", "work_completed": "done", "changed_files": [],
-            "tests": [], "error": None, "next_decision": None,
-        }))
+    def test_success_ignores_rate_limit_and_authentication_words_in_stderr(self):
         role = {"model": "gpt-5.6-luna", "effort": "low", "output_limit_chars": 8000}
+        cases = (
+            "npm WARN unauthorized registry entry\n",
+            "df: disk quota exceeded\n",
+            "INFO authentication module loaded\n",
+        )
+        for index, stderr in enumerate(cases):
+            with self.subTest(stderr=stderr):
+                run = self.root / f"success-stderr-pattern-{index}-run"
+                run.mkdir()
+                (run / "events.jsonl").write_text('{"type":"turn.completed","usage":{}}\n')
+                (run / "stderr.log").write_text(stderr)
+                (run / "final.json").write_text(json.dumps({
+                    "status": "success", "work_completed": "done", "changed_files": [],
+                    "tests": [], "error": None, "next_decision": None,
+                }))
 
-        summary = finalize_run(run, "reviewer", role, "review", self.repo, 0, 1)
+                summary = finalize_run(run, "reviewer", role, "review", self.repo, 0, 1)
 
-        self.assertEqual("blocked", summary["status"])
-        self.assertIn("rate limit detected", summary["error"])
+                self.assertEqual("success", summary["status"])
+                self.assertIsNone(summary["error"])
+                state = json.loads((run / "state.json").read_text())
+                self.assertNotIn("blocked_category", state)
 
     def test_codex_cache_filter_preserves_other_modules_and_levels(self):
         stderr = (
@@ -1417,8 +1423,8 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
 
     def test_claude_structured_rate_limit_and_authentication_events_block_without_retry(self):
         cases = (
-            ("rate_limit", '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}\n'),
-            ("authentication", '{"type":"result","is_error":true,"subtype":"error_during_execution","error":"authentication_failed","result":"redacted"}\n'),
+            ("rate_limit", '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1784648400,"rateLimitType":"five_hour","overageStatus":"unavailable","overageResetsAt":null,"isUsingOverage":false}}\n'),
+            ("authentication", '{"type":"result","subtype":"error_during_execution","error":"authentication_failed","result":"redacted"}\n'),
         )
         role = {"harness": "claude", "model": "sonnet", "effort": "high", "output_limit_chars": 8000, "write": False}
         for category, events in cases:
@@ -1427,14 +1433,60 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
                 run.mkdir()
                 (run / "events.jsonl").write_text(events)
                 (run / "stderr.log").write_text("")
+                (run / "final.json").write_text(json.dumps({
+                    "status": "success", "work_completed": "done", "changed_files": [],
+                    "tests": [], "error": None, "next_decision": None,
+                }))
 
-                summary = finalize_run(run, "reviewer", role, "review", self.repo, 1, 1)
+                summary = finalize_run(run, "reviewer", role, "review", self.repo, 0, 1)
 
                 self.assertEqual("blocked", summary["status"])
                 state = json.loads((run / "state.json").read_text())
                 self.assertEqual(category, state["blocked_category"])
                 with self.assertRaisesRegex(HarnessError, "blocked runs cannot be retried"):
                     retry(run, self.task, home=self.home)
+
+    def test_rejected_overage_allowed_notice_does_not_block_completed_run(self):
+        run = self.root / "overage-allowed-completed-run"
+        run.mkdir()
+        (run / "events.jsonl").write_text(
+            '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1784648400,"rateLimitType":"five_hour","overageStatus":"allowed","overageResetsAt":1784640000,"isUsingOverage":true}}\n'
+        )
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "done", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+        role = {"harness": "claude", "model": "sonnet", "effort": "high", "output_limit_chars": 8000, "write": False}
+
+        summary = finalize_run(run, "reviewer", role, "review", self.repo, 0, 1)
+
+        self.assertEqual("success", summary["status"])
+        self.assertEqual("overage_allowed", summary["rate_limit_notice"])
+        self.assertIsNone(summary["error"])
+        self.assertIn("rate_limit_notice: overage_allowed", (run / "summary.txt").read_text())
+        state = json.loads((run / "state.json").read_text())
+        self.assertNotIn("blocked_category", state)
+        self.assertFalse((run / "BLOCKED").exists())
+
+    def test_rejected_overage_allowed_blocks_uncompleted_run(self):
+        run = self.root / "overage-allowed-uncompleted-run"
+        run.mkdir()
+        (run / "events.jsonl").write_text(
+            '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1784648400,"rateLimitType":"five_hour","overageStatus":"allowed","overageResetsAt":1784640000,"isUsingOverage":true}}\n'
+        )
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "failed", "work_completed": "", "changed_files": [],
+            "tests": [], "error": "interrupted", "next_decision": None,
+        }))
+        role = {"harness": "claude", "model": "sonnet", "effort": "high", "output_limit_chars": 8000, "write": False}
+
+        summary = finalize_run(run, "reviewer", role, "review", self.repo, 1, 1)
+
+        self.assertEqual("blocked", summary["status"])
+        state = json.loads((run / "state.json").read_text())
+        self.assertEqual("rate_limit", state["blocked_category"])
 
     def test_read_only_change_does_not_override_rate_limit_block(self):
         run = self.root / "read-only-rate-limit-run"
