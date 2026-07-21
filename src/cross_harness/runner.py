@@ -280,6 +280,8 @@ def _claude_command(
     resume: str | None = None,
 ) -> list[str]:
     schema = _delegation_schema()
+    claude_schema = json.loads(schema.read_text(encoding="utf-8"))
+    claude_schema.pop("$schema", None)
     allowed_tools = CLAUDE_INSPECTION_TOOLS
     if role["write"]:
         execution_root = cwd.resolve()
@@ -312,6 +314,7 @@ def _claude_command(
         "--permission-mode", "manual",
         "--allowedTools", allowed_tools,
         *([] if role["write"] else ["--disallowed-tools", "Edit", "Write", "NotebookEdit"]),
+        "--json-schema", json.dumps(claude_schema, ensure_ascii=False, separators=(",", ":")),
         "--append-system-prompt", result_instruction,
     ]
     return command
@@ -397,8 +400,9 @@ def _command(
 
 
 def _write_claude_final_from_events(run_dir: Path) -> None:
-    """Persist Claude's final result event when it contains a JSON object."""
+    """Persist Claude's final result event as JSON, or its raw text as a fallback."""
     final_path = run_dir / "final.json"
+    final_text_path = run_dir / "final.txt"
     events_path = run_dir / "events.jsonl"
     if final_path.exists() or not events_path.exists():
         return
@@ -414,6 +418,7 @@ def _write_claude_final_from_events(run_dir: Path) -> None:
                 result_text = value if isinstance(value, str) else None
     if result_text is None:
         return
+    result_body = result_text
     result_text = result_text.strip()
     fenced = re.fullmatch(r"```[^\r\n]*\r?\n(.*?)\r?\n?```", result_text, flags=re.DOTALL)
     if fenced:
@@ -421,9 +426,21 @@ def _write_claude_final_from_events(run_dir: Path) -> None:
     try:
         final = json.loads(result_text)
     except json.JSONDecodeError:
+        atomic_write(final_text_path, result_body)
         return
     if isinstance(final, dict):
         atomic_write(final_path, dump_json(final))
+    else:
+        atomic_write(final_text_path, result_body)
+
+
+def _final_message_path(run_dir: Path) -> str | None:
+    """Return the existing final response artifact, preferring structured output."""
+    for name in ("final.json", "final.txt"):
+        path = run_dir / name
+        if path.is_file():
+            return str(path)
+    return None
 
 
 def delegate(
@@ -736,7 +753,7 @@ def finalize_blocked_run(
         "failure_signature": None,
         "event_log": str(run_dir / "events.jsonl"),
         "stderr_log": str(run_dir / "stderr.log"),
-        "final_message": str(run_dir / "final.json"),
+        "final_message": _final_message_path(run_dir),
         "cwd": str(cwd),
     }
     state = {
@@ -849,7 +866,7 @@ def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path
         "failure_signature": signature,
         "event_log": str(run_dir / "events.jsonl"),
         "stderr_log": str(run_dir / "stderr.log"),
-        "final_message": str(run_dir / "final.json"),
+        "final_message": _final_message_path(run_dir),
         "diff_stat_file": str(run_dir / "diff-stat.txt"),
         "baseline_file": str(run_dir / "baseline.json"),
         "cwd": str(cwd),
@@ -869,7 +886,9 @@ def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path
     if blocked_category:
         state["blocked_category"] = blocked_category
         state["blocked_reason"] = combined_error
-    raw_paths = (run_dir / "events.jsonl", run_dir / "stderr.log", run_dir / "final.json")
+    raw_paths = (
+        run_dir / "events.jsonl", run_dir / "stderr.log", run_dir / "final.json", run_dir / "final.txt",
+    )
     summary["raw_artifact_bytes"] = sum(path.stat().st_size for path in raw_paths if path.exists())
     summary["summary_bytes"] = 0
     summary["compression_percent"] = 0.0

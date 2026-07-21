@@ -109,6 +109,31 @@ class FileTests(unittest.TestCase):
         self.assertIn('changed_files: {"a": "file", "z": 1}, 42', rendered)
         self.assertIn('tests: {"command": "uv run pytest -q", "result": "passed"}; 7', rendered)
 
+    def test_summary_renders_nonempty_work_completed_and_missing_final_message(self):
+        summary = {
+            "status": "success", "run_dir": "/tmp/run", "exit_code": 0,
+            "role": "tester", "model": "luna", "effort": "medium",
+            "changed_files": [], "tests": [], "work_completed": "Implemented the change.",
+            "event_log": "/tmp/run/events.jsonl", "stderr_log": "/tmp/run/stderr.log",
+            "final_message": None,
+        }
+
+        rendered = render_summary(summary, 10_000)
+
+        self.assertIn("work_completed: Implemented the change.", rendered)
+        self.assertIn("final_message: not available", rendered)
+
+    def test_summary_omits_empty_work_completed(self):
+        summary = {
+            "status": "success", "run_dir": "/tmp/run", "exit_code": 0,
+            "role": "tester", "model": "luna", "effort": "medium",
+            "changed_files": [], "tests": [], "work_completed": "",
+            "event_log": "/tmp/run/events.jsonl", "stderr_log": "/tmp/run/stderr.log",
+            "final_message": None,
+        }
+
+        self.assertNotIn("work_completed:", render_summary(summary, 10_000))
+
 
 if __name__ == "__main__":
     unittest.main()

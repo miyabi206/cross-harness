@@ -415,6 +415,10 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("manual", command[command.index("--permission-mode") + 1])
         self.assertEqual("cross-harness-reviewer", command[command.index("--agent") + 1])
         self.assertEqual("Bash,Read,Grep,Glob", command[command.index("--allowedTools") + 1])
+        claude_schema = json.loads(command[command.index("--json-schema") + 1])
+        self.assertNotIn("$schema", claude_schema)
+        self.assertFalse(claude_schema["additionalProperties"])
+        self.assertEqual(["string", "null"], claude_schema["properties"]["error"]["type"])
         disallowed_index = command.index("--disallowed-tools")
         self.assertEqual(["Edit", "Write", "NotebookEdit"], command[disallowed_index + 1:disallowed_index + 4])
         self.assertEqual("sonnet", command[command.index("--model") + 1])
@@ -546,10 +550,23 @@ class RunnerTests(unittest.TestCase):
         _write_claude_final_from_events(run)
 
         self.assertFalse((run / "final.json").exists())
+        self.assertEqual("not JSON", (run / "final.txt").read_text())
         role = {"model": "sonnet", "effort": "high", "output_limit_chars": 8000, "write": False}
         summary = finalize_run(run, "reviewer", role, "review", self.repo, 0, 1)
         self.assertEqual("success", summary["status"])
         self.assertEqual("", summary["work_completed"])
+        self.assertEqual(str(run / "final.txt"), summary["final_message"])
+
+    def test_finalize_run_has_no_final_message_without_final_artifact(self):
+        run = self.root / "no-final-artifact"
+        run.mkdir()
+        (run / "events.jsonl").write_text("")
+        (run / "stderr.log").write_text("")
+
+        role = {"model": "sonnet", "effort": "high", "output_limit_chars": 8000, "write": False}
+        summary = finalize_run(run, "reviewer", role, "review", self.repo, 0, 1)
+
+        self.assertIsNone(summary["final_message"])
 
     @patch("cross_harness.runner.verify_claude_config_ownership")
     @patch("cross_harness.runner.verify_claude_subscription")
