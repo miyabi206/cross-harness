@@ -180,10 +180,11 @@ def _new_run_dir(runtime_root: Path) -> Path:
 def _tee(pipe, target: Path) -> None:
     with target.open("wb") as handle:
         while True:
-            block = pipe.read(65536)
+            block = pipe.read1(65536)
             if not block:
                 break
             handle.write(block)
+            handle.flush()
 
 
 def _invoke_safe(command: list[str], task: str, env: dict[str, str], cwd: Path, run_dir: Path, timeout: int) -> int:

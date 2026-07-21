@@ -162,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.confirm_high_risk,
             )
             print(run_dir, flush=True)
+            print("watch progress: cross-harness watch", file=sys.stderr, flush=True)
             summary = wait_for_run(run_dir, args.timeout_seconds)
             if summary is None:
                 return 4

@@ -14,6 +14,18 @@
 4. At each phase boundary, migrate to a new session when context use reaches
    the configured threshold (70 percent by default).
 
+## Watching a delegated run
+
+When a detached `cross-harness delegate` starts, its first stdout line is the
+run directory. To follow the newest active run from another terminal, use:
+
+```sh
+cross-harness watch
+```
+
+Use `cross-harness watch --all` to include lifecycle events. Stop watching with
+Ctrl-C; it does not stop the delegated run.
+
 Run `cross-harness doctor` after either CLI upgrades, authentication changes,
 hook changes, or a reinstall. Run `cross-harness cleanup` when stale run
 directories need immediate maintenance; SessionStart also invokes it.

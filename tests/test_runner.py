@@ -5,12 +5,13 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
 from cross_harness.errors import AuthError, DirtyWorktreeError, HarnessError, SupervisorDiedError
 from cross_harness.config import default_config
-from cross_harness.runner import _claude_command, _claude_sandbox_profile, _codex_command, _contain_claude_write_command, _escalated_role, _invoke_safe, _write_baseline, _write_claude_final_from_events, delegate, retry, start_detached_delegate, wait_for_run
+from cross_harness.runner import _claude_command, _claude_sandbox_profile, _codex_command, _contain_claude_write_command, _escalated_role, _invoke_safe, _tee, _write_baseline, _write_claude_final_from_events, delegate, retry, start_detached_delegate, wait_for_run
 from cross_harness.runner import finalize_run
 from cross_harness.summarize import parse_events
 
@@ -38,6 +39,29 @@ class RunnerTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_tee_writes_and_flushes_small_block_before_pipe_closes(self):
+        reader_fd, writer_fd = os.pipe()
+        target = self.root / "streamed-events.jsonl"
+        reader = os.fdopen(reader_fd, "rb")
+        writer = os.fdopen(writer_fd, "wb")
+        thread = threading.Thread(target=_tee, args=(reader, target))
+        thread.start()
+        try:
+            payload = b'{"type":"turn.started"}\n'
+            writer.write(payload)
+            writer.flush()
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                if target.exists() and target.read_bytes() == payload:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(payload, target.read_bytes())
+        finally:
+            writer.close()
+            thread.join(timeout=1)
+            reader.close()
+        self.assertFalse(thread.is_alive())
 
     def fake_invoke(self, command, task, env, cwd, run_dir, timeout):
         self.assertEqual("1", env["CROSS_HARNESS_ACTIVE"])
