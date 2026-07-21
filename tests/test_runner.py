@@ -215,7 +215,9 @@ class RunnerTests(unittest.TestCase):
         expected_test = '{"command": "uv run pytest -q", "result": "passed"}'
         expected_changed = ['{"a": "result", "z": 1}', "3"]
         self.assertEqual([expected_test], summary["tests"])
-        self.assertEqual(expected_changed, summary["changed_files"])
+        self.assertEqual([], summary["changed_files"])
+        self.assertEqual(expected_changed, summary["reported_changed_files"])
+        self.assertEqual(expected_changed, summary["unverified_changed_files"])
         self.assertTrue((run / "summary.txt").exists())
         self.assertTrue((run / "summary.json").exists())
         self.assertIn(expected_test, (run / "summary.txt").read_text())
@@ -252,7 +254,8 @@ class RunnerTests(unittest.TestCase):
         (run / "events.jsonl").write_text('{"type":"turn.completed","usage":{}}\n')
         (run / "stderr.log").write_text("")
         (run / "final.json").write_text(json.dumps({
-            "status": "success", "work_completed": "changed", "changed_files": [],
+            "status": "success", "work_completed": "changed",
+            "changed_files": ["README.md", "new.txt", "reported-only.txt"],
             "tests": [], "error": None, "next_decision": None,
         }))
         role = {"model": "gpt-5.6-terra", "effort": "medium", "output_limit_chars": 8000}
@@ -260,6 +263,12 @@ class RunnerTests(unittest.TestCase):
         by_file = {item["file"]: item for item in summary["diff_summary"]}
         self.assertEqual("1", by_file["README.md"]["added"])
         self.assertTrue(by_file["new.txt"]["untracked"])
+        self.assertEqual(["README.md", "new.txt"], summary["changed_files"])
+        self.assertEqual(
+            ["README.md", "new.txt", "reported-only.txt"],
+            summary["reported_changed_files"],
+        )
+        self.assertEqual(["reported-only.txt"], summary["unverified_changed_files"])
         self.assertIn("diff_stat", (run / "summary.txt").read_text())
 
     def test_read_only_role_changes_fail_after_execution(self):
@@ -308,7 +317,7 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("declared check failed: uv run pytest -q (exit 1)", summary["error"])
         self.assertEqual([{"check": "uv run pytest -q", "status": "failed", "exit_code": 1}], summary["checks"])
         self.assertEqual(["14 failed, 100 passed"], summary["tests"])
-        self.assertIn("tests: 14 failed, 100 passed", (run / "summary.txt").read_text())
+        self.assertIn("tests (executor-reported): 14 failed, 100 passed", (run / "summary.txt").read_text())
 
     def test_read_only_cross_harness_hook_rejection_does_not_override_success(self):
         run = self.root / "read-only-policy-denial-run"
@@ -733,7 +742,9 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:mics/j1/j1_report.synctex.gz > j1_r
         self.assertEqual("success", summary["status"])
         self.assertEqual("session-1", summary["thread_id"])
         self.assertEqual("reviewed", summary["work_completed"])
-        self.assertEqual(["README.md"], summary["changed_files"])
+        self.assertEqual([], summary["changed_files"])
+        self.assertEqual(["README.md"], summary["reported_changed_files"])
+        self.assertEqual(["README.md"], summary["unverified_changed_files"])
         self.assertEqual(["review"], summary["tests"])
         self.assertEqual("ship it", summary["next_decision"])
         self.assertTrue((run / "final.json").exists())

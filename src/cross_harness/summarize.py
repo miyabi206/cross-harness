@@ -301,12 +301,19 @@ def render_summary(summary: dict, limit: int) -> str:
         f"model: {summary['model']}",
         f"effort: {summary['effort']}",
         f"changed_files: {', '.join(summary_item_text(item) for item in summary.get('changed_files', [])) or 'none'}",
-        f"tests: {'; '.join(summary_item_text(item) for item in summary.get('tests', [])) or 'not reported'}",
+        f"reported_changed_files: {', '.join(summary_item_text(item) for item in summary.get('reported_changed_files', [])) or 'none'}",
+        f"tests (executor-reported): {'; '.join(summary_item_text(item) for item in summary.get('tests', [])) or 'not reported'}",
         f"checks: {checks_text}",
         f"unrelated_failed_commands: {summary.get('unrelated_failed_command_count', 0)}",
     ]
+    unverified_changed_files = summary.get("unverified_changed_files", [])
+    if unverified_changed_files:
+        lines.append(
+            "unverified_changed_files: "
+            + ", ".join(summary_item_text(item) for item in unverified_changed_files)
+        )
     if summary.get("work_completed"):
-        lines.append(f"work_completed: {summary['work_completed']}")
+        lines.append(f"work_completed (executor-reported): {summary['work_completed']}")
     for reversion in summary.get("self_reversions", []):
         if isinstance(reversion, dict):
             lines.append(

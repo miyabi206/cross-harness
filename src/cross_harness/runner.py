@@ -988,7 +988,10 @@ def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path
     reported_changed = final.get("changed_files") if isinstance(final.get("changed_files"), list) else []
     reported_changed = [summary_item_text(name) for name in reported_changed]
     filtered_reported = [name for name in reported_changed if name not in baseline_names or name in detected_changed]
-    changed = list(dict.fromkeys([*detected_changed, *filtered_reported]))
+    reported_changed_files = list(dict.fromkeys(filtered_reported))
+    unverified_changed_files = [
+        name for name in reported_changed_files if name not in detected_changed
+    ]
     signature = failure_signature(exit_code, parsed, stderr)
     reported_tests = final.get("tests", [])
     if isinstance(reported_tests, str):
@@ -1007,7 +1010,9 @@ def finalize_run(run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path
         "effort": role["effort"],
         "attempt": attempt,
         "thread_id": parsed.get("thread_id"),
-        "changed_files": changed,
+        "changed_files": detected_changed,
+        "reported_changed_files": reported_changed_files,
+        "unverified_changed_files": unverified_changed_files,
         "diff_summary": diff_summary,
         "tests": reported_tests,
         "checks": check_results,
