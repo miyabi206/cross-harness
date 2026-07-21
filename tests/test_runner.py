@@ -1816,6 +1816,7 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
         clean_interpreter.chmod(0o755)
         environment = {
             "PATH": f"{fake_bin}{os.pathsep}/usr/bin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1",
             "CROSS_HARNESS_TEST_PYTHON": sys.executable,
             "TEST_FAKE_CLAUDE": str(fake_claude),
         }
@@ -1884,6 +1885,7 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
         environment.update({
             "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
             "PYTHONPATH": os.pathsep.join([str(injector), str(Path(__file__).resolve().parents[1] / "src")]),
+            "PYTHONDONTWRITEBYTECODE": "1",
             "TEST_FAKE_CLAUDE": str(fake_claude),
         })
         command = [

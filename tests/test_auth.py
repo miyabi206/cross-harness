@@ -26,6 +26,11 @@ class AuthTests(unittest.TestCase):
         self.assertNotIn("CROSS_HARNESS_ACTIVE", env)
         self.assertEqual("/tmp/home", env["HOME"])
 
+    def test_child_environment_always_disables_bytecode_writes(self):
+        with patch.dict("os.environ", {"PATH": "/bin", "PYTHONDONTWRITEBYTECODE": "0"}, clear=True):
+            env = sanitized_environment(Path("/tmp/home"), {"PYTHONDONTWRITEBYTECODE": "0"})
+        self.assertEqual("1", env["PYTHONDONTWRITEBYTECODE"])
+
     def test_project_provider_override_is_rejected(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

@@ -38,6 +38,7 @@ def sanitized_environment(home: Path, extra: dict[str, str] | None = None) -> di
     result.setdefault("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
     if extra:
         result.update(extra)
+    result["PYTHONDONTWRITEBYTECODE"] = "1"
     return result
 
 
