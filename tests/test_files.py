@@ -152,6 +152,7 @@ class FileTests(unittest.TestCase):
             "changed_files": [], "tests": [], "error": "x" * 5000,
             "next_decision": None, "event_log": "/tmp/run/events.jsonl",
             "stderr_log": "/tmp/run/stderr.log", "final_message": "/tmp/run/final.json",
+            "final_text": "/tmp/run/final.txt",
         }
         rendered = render_summary(summary, 1000)
         self.assertLessEqual(len(rendered), 1000)
@@ -168,6 +169,7 @@ class FileTests(unittest.TestCase):
             "tests": [{"result": "passed", "command": "uv run pytest -q"}, 7],
             "event_log": "/tmp/run/events.jsonl", "stderr_log": "/tmp/run/stderr.log",
             "final_message": "/tmp/run/final.json",
+            "final_text": "/tmp/run/final.txt",
         }
 
         rendered = render_summary(summary, 10_000)
@@ -186,12 +188,14 @@ class FileTests(unittest.TestCase):
             "changed_files": [], "tests": [], "work_completed": "Implemented the change.",
             "event_log": "/tmp/run/events.jsonl", "stderr_log": "/tmp/run/stderr.log",
             "final_message": None,
+            "final_text": "/tmp/run/final.txt",
         }
 
         rendered = render_summary(summary, 10_000)
 
         self.assertIn("work_completed (executor-reported): Implemented the change.", rendered)
         self.assertIn("final_message: not available", rendered)
+        self.assertIn("final_text: /tmp/run/final.txt", rendered)
 
     def test_summary_omits_empty_work_completed(self):
         summary = {
@@ -200,6 +204,7 @@ class FileTests(unittest.TestCase):
             "changed_files": [], "tests": [], "work_completed": "",
             "event_log": "/tmp/run/events.jsonl", "stderr_log": "/tmp/run/stderr.log",
             "final_message": None,
+            "final_text": None,
         }
 
         self.assertNotIn("work_completed (executor-reported):", render_summary(summary, 10_000))
@@ -219,6 +224,7 @@ class FileTests(unittest.TestCase):
             "changed_files": [], "tests": [], "rate_limit_notice": "overage_allowed",
             "event_log": "/tmp/run/events.jsonl", "stderr_log": "/tmp/run/stderr.log",
             "final_message": None,
+            "final_text": None,
         }
 
         self.assertIn("rate_limit_notice: overage_allowed", render_summary(summary, 10_000))
@@ -231,6 +237,7 @@ class FileTests(unittest.TestCase):
             "last_unrelated_failed_command": {"command": "x" * 600, "exit_code": 17},
             "event_log": "/tmp/run/events.jsonl", "stderr_log": "/tmp/run/stderr.log",
             "final_message": None,
+            "final_text": None,
         }
 
         rendered = render_summary(summary, 10_000)

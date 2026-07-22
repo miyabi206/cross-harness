@@ -786,51 +786,84 @@ def _command(
     raise ConfigError(f"unsupported harness: {role['harness']}")
 
 
+def _last_claude_assistant_text(events_path: Path) -> str | None:
+    """Return the last non-blank Claude assistant text block, if readable."""
+    last_text: str | None = None
+    try:
+        with events_path.open(encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    return None
+                if event.get("type") != "assistant":
+                    continue
+                content = event.get("content")
+                if not isinstance(content, list):
+                    message = event.get("message")
+                    content = message.get("content") if isinstance(message, dict) else None
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    text = block.get("text") if isinstance(block, dict) and block.get("type") == "text" else None
+                    if isinstance(text, str) and text.strip():
+                        last_text = text
+    except OSError:
+        return None
+    return last_text
+
+
 def _write_claude_final_from_events(run_dir: Path) -> None:
-    """Persist Claude's final result event as JSON, or its raw text as a fallback."""
+    """Persist Claude's structured result and its last substantive text separately."""
     final_path = run_dir / "final.json"
     final_text_path = run_dir / "final.txt"
     events_path = run_dir / "events.jsonl"
-    if final_path.exists() or not events_path.exists():
-        return
     result_text: str | None = None
-    with events_path.open(encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") == "result":
-                value = event.get("result")
-                result_text = value if isinstance(value, str) else None
-    if result_text is None:
-        return
-    result_body = result_text
-    result_text = result_text.strip()
-    fenced = re.fullmatch(r"```[^\r\n]*\r?\n(.*?)\r?\n?```", result_text, flags=re.DOTALL)
-    if fenced:
-        result_text = fenced.group(1).strip()
-    else:
-        # Claude can prepend prose even when its final response is a fenced JSON
-        # object. Only recover a trailing fence after rejecting the entire result
-        # as JSON, preserving the existing handling for complete fenced messages.
+    if not final_path.exists():
         try:
-            json.loads(result_text)
-        except json.JSONDecodeError:
-            trailing_fence = re.search(
-                r"```[^\r\n]*\r?\n(.*?)\r?\n?```\s*\Z", result_text, flags=re.DOTALL
-            )
-            if trailing_fence:
-                result_text = trailing_fence.group(1).strip()
-    try:
-        final = json.loads(result_text)
-    except json.JSONDecodeError:
-        atomic_write(final_text_path, result_body)
-        return
-    if isinstance(final, dict):
-        atomic_write(final_path, dump_json(final))
-    else:
-        atomic_write(final_text_path, result_body)
+            with events_path.open(encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        return
+                    if event.get("type") == "result":
+                        value = event.get("result")
+                        result_text = value if isinstance(value, str) else None
+        except OSError:
+            return
+        if result_text is not None:
+            result_body = result_text
+            result_text = result_text.strip()
+            fenced = re.fullmatch(r"```[^\r\n]*\r?\n(.*?)\r?\n?```", result_text, flags=re.DOTALL)
+            if fenced:
+                result_text = fenced.group(1).strip()
+            else:
+                # Claude can prepend prose even when its final response is a fenced JSON
+                # object. Only recover a trailing fence after rejecting the entire result
+                # as JSON, preserving the existing handling for complete fenced messages.
+                try:
+                    json.loads(result_text)
+                except json.JSONDecodeError:
+                    trailing_fence = re.search(
+                        r"```[^\r\n]*\r?\n(.*?)\r?\n?```\s*\Z", result_text, flags=re.DOTALL
+                    )
+                    if trailing_fence:
+                        result_text = trailing_fence.group(1).strip()
+            try:
+                final = json.loads(result_text)
+            except json.JSONDecodeError:
+                if not final_text_path.exists():
+                    atomic_write(final_text_path, result_body)
+            else:
+                if isinstance(final, dict):
+                    atomic_write(final_path, dump_json(final))
+                elif not final_text_path.exists():
+                    atomic_write(final_text_path, result_body)
+    if not final_text_path.exists():
+        text = _last_claude_assistant_text(events_path)
+        if text is not None:
+            atomic_write(final_text_path, text)
 
 
 def _final_message_path(run_dir: Path) -> str | None:
@@ -840,6 +873,12 @@ def _final_message_path(run_dir: Path) -> str | None:
         if path.is_file():
             return str(path)
     return None
+
+
+def _final_text_path(run_dir: Path) -> str | None:
+    """Return Claude's retained assistant text artifact when it exists."""
+    path = run_dir / "final.txt"
+    return str(path) if path.is_file() else None
 
 
 def delegate(
@@ -1153,6 +1192,7 @@ def finalize_blocked_run(
         "event_log": str(run_dir / "events.jsonl"),
         "stderr_log": str(run_dir / "stderr.log"),
         "final_message": _final_message_path(run_dir),
+        "final_text": _final_text_path(run_dir),
         "cwd": str(cwd),
     }
     state = {
@@ -1386,6 +1426,7 @@ def finalize_run(
         "event_log": str(run_dir / "events.jsonl"),
         "stderr_log": str(run_dir / "stderr.log"),
         "final_message": _final_message_path(run_dir),
+        "final_text": _final_text_path(run_dir),
         "diff_stat_file": str(run_dir / "diff-stat.txt"),
         "baseline_file": str(run_dir / "baseline.json"),
         "cwd": str(cwd),

@@ -5,6 +5,10 @@ description: Orchestrate code changes by planning in Claude, delegating implemen
 
 # Cross-harness orchestrator
 
+Do not pipe cross-harness wrapper commands or declaration-check commands into
+other commands. Pipelines do not provide accepted check exit-code evidence, and
+wrapper argument scanning can reject the resulting invocation.
+
 ## Normalize once
 
 After classification and minimum repository inspection, show only:

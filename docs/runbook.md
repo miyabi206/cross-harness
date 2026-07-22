@@ -103,6 +103,10 @@ updates the managed runtime and user assets in place. If a managed file has
 drifted, it lists every changed path and makes no changes; review and merge the
 change, or use `install --force` only when overwriting that drift is intended.
 Use `install --dry-run` to review the update operations without writing files.
+For both `install` and `uninstall`, a deleted managed file is also drift. This
+is intentional: use `--force` for the exact managed result, or
+`--preserve-user-changes` to remove managed entries while retaining later user
+changes.
 
 To stop automatic activation while retaining artifacts, remove or disable the
 three cross-harness entries in Claude settings and the Codex recursion hook only
@@ -124,6 +128,11 @@ certificates.
 
 After rollback, compare the home setting files with the backup manifest, run
 `codex login status` and `claude auth status`, then restart both clients.
+
+Do not pipe cross-harness wrapper commands or declaration-check commands into
+other commands. A pipeline reports its final command's exit code, so it is not
+accepted as check evidence; for wrapper calls, the piped argument text is also
+scanned as an executor-launch pattern and can reject an otherwise valid task.
 
 ## Codex hook trust
 

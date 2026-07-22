@@ -281,9 +281,52 @@ def _p4() -> int:
     return 0
 
 
+def _p5() -> int:
+    """Verify Claude assistant-text extraction against saved runs without writes."""
+    runs_root = Path.home() / ".local/state/cross-harness/runs"
+    target_name = "20260722T023205-b8883cfb"
+    if not runs_root.is_dir():
+        print(f"run directory not found: {runs_root}")
+        return 1
+
+    extracted = 0
+    target_text: str | None = None
+    target_final: dict | None = None
+    for run_dir in sorted(path for path in runs_root.iterdir() if path.is_dir()):
+        execution_path = run_dir / "execution.json"
+        events_path = run_dir / "events.jsonl"
+        if not execution_path.is_file() or not events_path.is_file():
+            continue
+        try:
+            execution = json.loads(execution_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(execution, dict) or execution.get("harness") != "claude":
+            continue
+        text = runner._last_claude_assistant_text(events_path)
+        if text is not None:
+            extracted += 1
+        if run_dir.name == target_name:
+            target_text = text
+            target_final = load_final(run_dir / "final.json")
+
+    if target_text is None:
+        print(f"P5 target text was not extracted: {target_name}")
+        return 1
+    work_completed = target_final.get("work_completed") if isinstance(target_final, dict) else None
+    if not isinstance(work_completed, str) or len(target_text) <= len(work_completed):
+        print(f"P5 target text was not substantially longer than work_completed: {target_name}")
+        return 1
+    if "No hole where a should-be-blocked change passes" not in target_text:
+        print(f"P5 target text did not contain the expected review content: {target_name}")
+        return 1
+    print(f"P5 passed: extracted substantive assistant text from {extracted} Claude runs")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--unit", required=True, choices=("p1", "p2", "p3", "p4"))
+    parser.add_argument("--unit", required=True, choices=("p1", "p2", "p3", "p4", "p5"))
     args = parser.parse_args()
     if args.unit == "p1":
         return _p1()
@@ -291,7 +334,9 @@ def main() -> int:
         return _p2()
     if args.unit == "p3":
         return _p3()
-    return _p4()
+    if args.unit == "p4":
+        return _p4()
+    return _p5()
 
 
 if __name__ == "__main__":

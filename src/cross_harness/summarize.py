@@ -440,6 +440,7 @@ def render_summary(summary: dict, limit: int) -> str:
         f"event_log: {summary['event_log']}",
         f"stderr_log: {summary['stderr_log']}",
         f"final_message: {summary.get('final_message') or 'not available'}",
+        f"final_text: {summary.get('final_text') or 'not available'}",
         f"diff_stat: {summary.get('diff_stat_file', 'not available')}",
         f"baseline: {summary.get('baseline_file', 'not available')}",
     ])

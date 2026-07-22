@@ -1138,6 +1138,68 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
 
         self.assertEqual(result, json.loads((run / "final.json").read_text()))
 
+    def test_claude_structured_result_also_retains_last_assistant_text(self):
+        run = self.root / "claude-structured-result-with-text"
+        run.mkdir()
+        result = {
+            "status": "success", "work_completed": "test", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }
+        (run / "events.jsonl").write_text(
+            json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "thinking", "thinking": "ignore"},
+                {"type": "text", "text": "first review"},
+                {"type": "tool_use", "name": "Bash"},
+                {"type": "text", "text": "final substantive review"},
+            ]}}) + "\n" + json.dumps({"type": "result", "result": json.dumps(result)}) + "\n"
+        )
+
+        _write_claude_final_from_events(run)
+
+        self.assertEqual(result, json.loads((run / "final.json").read_text()))
+        self.assertEqual("final substantive review", (run / "final.txt").read_text())
+
+    def test_existing_claude_final_json_still_retains_assistant_text(self):
+        run = self.root / "claude-existing-structured-result"
+        run.mkdir()
+        result = {
+            "status": "success", "work_completed": "placeholder", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }
+        (run / "final.json").write_text(json.dumps(result))
+        (run / "events.jsonl").write_text(json.dumps({
+            "type": "assistant", "content": [
+                {"type": "thinking", "thinking": "ignore"},
+                {"type": "text", "text": "retained review text"},
+            ],
+        }) + "\n")
+
+        _write_claude_final_from_events(run)
+
+        self.assertEqual(result, json.loads((run / "final.json").read_text()))
+        self.assertEqual("retained review text", (run / "final.txt").read_text())
+
+    def test_claude_assistant_text_does_not_replace_json_fallback(self):
+        run = self.root / "claude-json-fallback"
+        run.mkdir()
+        (run / "events.jsonl").write_text(
+            json.dumps({"type": "assistant", "content": [{"type": "text", "text": "assistant review"}]})
+            + "\n" + json.dumps({"type": "result", "result": "not JSON"}) + "\n"
+        )
+
+        _write_claude_final_from_events(run)
+
+        self.assertEqual("not JSON", (run / "final.txt").read_text())
+
+    def test_claude_final_extraction_ignores_unreadable_or_invalid_events(self):
+        run = self.root / "claude-invalid-events"
+        run.mkdir()
+        (run / "events.jsonl").write_text('{not json}\n')
+
+        _write_claude_final_from_events(run)
+
+        self.assertFalse((run / "final.txt").exists())
+
     def test_unparseable_claude_result_does_not_create_final_json(self):
         run = self.root / "claude-invalid-result"
         run.mkdir()
@@ -1155,6 +1217,7 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
         self.assertEqual("success", summary["status"])
         self.assertEqual("", summary["work_completed"])
         self.assertEqual(str(run / "final.txt"), summary["final_message"])
+        self.assertEqual(str(run / "final.txt"), summary["final_text"])
 
     def test_finalize_run_has_no_final_message_without_final_artifact(self):
         run = self.root / "no-final-artifact"
@@ -1166,6 +1229,7 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
         summary = finalize_run(run, "reviewer", role, "review", self.repo, 0, 1)
 
         self.assertIsNone(summary["final_message"])
+        self.assertIsNone(summary["final_text"])
 
     @patch("cross_harness.runner.verify_claude_config_ownership")
     @patch("cross_harness.runner.verify_claude_subscription")
