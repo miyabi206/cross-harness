@@ -84,6 +84,19 @@ isolated worktree before the run's seven-day retention window.
 
 ## Disable, uninstall, and restore
 
+To update an existing installation after changing this repository, run:
+
+```sh
+~/.local/bin/cross-harness install
+```
+
+Install first verifies the recorded installed hashes and symlink targets. It
+backs up the current settings, preserves the personal configuration, and then
+updates the managed runtime and user assets in place. If a managed file has
+drifted, it lists every changed path and makes no changes; review and merge the
+change, or use `install --force` only when overwriting that drift is intended.
+Use `install --dry-run` to review the update operations without writing files.
+
 To stop automatic activation while retaining artifacts, remove or disable the
 three cross-harness entries in Claude settings and the Codex recursion hook only
 after taking a backup. The supported exact rollback is:

@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from cross_harness.files import MARKER_START
-from cross_harness.errors import ConfigError
+from cross_harness.errors import ConfigError, HarnessError
 from cross_harness.installer import install, uninstall
 from cross_harness.paths import source_root
 
@@ -143,6 +143,73 @@ class InstallerTests(unittest.TestCase):
             actions = install(home, source_root(), dry_run=True)
             self.assertEqual(5, len(actions))
             self.assertEqual([], list(home.iterdir()))
+
+    def test_install_updates_existing_installation_and_preserves_personal_config(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            install(home, repo)
+            config = home / ".config/cross-harness/config.toml"
+            config.write_text("# personal setting\n" + config.read_text(encoding="utf-8"), encoding="utf-8")
+            source = repo / "assets/claude/agents/explorer.md"
+            source.write_text(source.read_text(encoding="utf-8") + "\nupdated agent\n", encoding="utf-8")
+
+            actions = install(home, repo)
+
+            installed = home / ".claude/agents/cross-harness-explorer.md"
+            self.assertEqual(5, len(actions))
+            self.assertTrue(actions[1].startswith("update runtime"))
+            self.assertIn("updated agent", installed.read_text(encoding="utf-8"))
+            self.assertTrue(config.read_text(encoding="utf-8").startswith("# personal setting\n"))
+            manifest = json.loads((home / ".local/state/cross-harness/install-manifest.json").read_text(encoding="utf-8"))
+            record = next(record for record in manifest["records"] if record["path"] == str(installed.resolve()))
+            self.assertIn("installed_hash", record)
+            uninstall(home)
+            self.assertFalse((home / ".local/share/cross-harness/current").exists())
+            self.assertTrue(config.read_text(encoding="utf-8").startswith("# personal setting\n"))
+
+    def test_install_rejects_drift_without_writing_unless_forced(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            install(home, repo)
+            installed = home / ".claude/agents/cross-harness-explorer.md"
+            installed.write_text("user drift\n", encoding="utf-8")
+            manifest_path = home / ".local/state/cross-harness/install-manifest.json"
+            manifest_before = manifest_path.read_text(encoding="utf-8")
+
+            with self.assertRaises(HarnessError) as raised:
+                install(home, repo)
+
+            self.assertIn(str(installed.resolve()), str(raised.exception))
+            self.assertEqual("user drift\n", installed.read_text(encoding="utf-8"))
+            self.assertEqual(manifest_before, manifest_path.read_text(encoding="utf-8"))
+            install(home, repo, force=True)
+            self.assertNotEqual("user drift\n", installed.read_text(encoding="utf-8"))
+
+    def test_install_dry_run_reports_update_without_writing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            install(home, repo)
+            installed = home / ".claude/agents/cross-harness-explorer.md"
+            before = installed.read_text(encoding="utf-8")
+            (repo / "assets/claude/agents/explorer.md").write_text("new agent\n", encoding="utf-8")
+
+            actions = install(home, repo, dry_run=True)
+
+            self.assertEqual(5, len(actions))
+            self.assertTrue(actions[1].startswith("update runtime"))
+            self.assertEqual(before, installed.read_text(encoding="utf-8"))
 
     def test_uninstall_preserves_and_backs_up_generated_personal_config_with_force_or_surgical_mode(self):
         for options in ({"force": True}, {"preserve_user_changes": True}):

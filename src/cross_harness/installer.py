@@ -29,8 +29,9 @@ def _record(path: Path, paths: UserPaths, backup_root: Path) -> dict:
     if path.is_file() and not path.is_symlink():
         relative = path.relative_to(paths.home)
         backup = backup_root / relative
-        backup.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, backup)
+        if not backup.exists():
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, backup)
         record["backup"] = str(backup)
         record["before_hash"] = sha256(path)
     elif path.is_symlink():
@@ -38,7 +39,8 @@ def _record(path: Path, paths: UserPaths, backup_root: Path) -> dict:
     elif path.is_dir():
         relative = path.relative_to(paths.home)
         backup = backup_root / relative
-        shutil.copytree(path, backup, symlinks=True)
+        if not backup.exists():
+            shutil.copytree(path, backup, symlinks=True)
         record["backup"] = str(backup)
     return record
 
@@ -249,20 +251,63 @@ def _remove_codex_config(path: Path) -> None:
     atomic_write(path, text + "\n" if text else "")
 
 
-def install(home: Path | None = None, repo: Path | None = None, dry_run: bool = False) -> list[str]:
+def _installed_drift(records: list[dict], paths: UserPaths, preserve_personal_config: bool = False) -> list[str]:
+    """Return installed paths that no longer match their manifest records."""
+    drift: list[str] = []
+    for record in records:
+        path = Path(record["path"])
+        if preserve_personal_config and _is_personal_config_record(record, paths):
+            continue
+        if "installed_hash" in record:
+            if path.is_symlink() or not path.is_file() or sha256(path) != record["installed_hash"]:
+                drift.append(str(path))
+        if "installed_symlink" in record:
+            if not path.is_symlink() or os.readlink(path) != record["installed_symlink"]:
+                drift.append(str(path))
+    return drift
+
+
+def _backup_root(repo: Path) -> Path:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    root = repo / ".local/backups" / timestamp
+    suffix = 1
+    while root.exists():
+        root = repo / ".local/backups" / f"{timestamp}-{suffix}"
+        suffix += 1
+    return root
+
+
+def _install(
+    home: Path | None = None,
+    repo: Path | None = None,
+    dry_run: bool = False,
+    force: bool = False,
+    failure_state: dict[str, object] | None = None,
+) -> list[str]:
     paths = user_paths(home)
     repo = (repo or source_root()).resolve()
     manifest_path = _manifest_path(paths)
+    previous_manifest: dict | None = None
+    previous_records: dict[str, dict] = {}
     if manifest_path.exists():
-        raise HarnessError("cross-harness is already installed; uninstall it before reinstalling")
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    backup_root = repo / ".local/backups" / timestamp
+        previous_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        records = previous_manifest.get("records", [])
+        if not isinstance(records, list):
+            raise HarnessError(f"invalid install manifest records: {manifest_path}")
+        previous_records = {str(record["path"]): record for record in records if isinstance(record, dict) and "path" in record}
+        if not force:
+            drift = _installed_drift(records, paths, preserve_personal_config=True)
+            if drift:
+                raise HarnessError("installed files changed; refusing to overwrite:\n- " + "\n- ".join(drift))
+    backup_root = _backup_root(repo)
+    if failure_state is not None:
+        failure_state["backup_root"] = backup_root
     actions = [
         f"backup settings to {backup_root}",
-        f"copy runtime to {paths.install_root}",
-        f"install executable {paths.executable}",
-        f"install personal config {paths.config}",
-        "merge Claude and Codex user assets",
+        f"{'update' if previous_manifest else 'copy'} runtime to {paths.install_root}",
+        f"{'update' if previous_manifest else 'install'} executable {paths.executable}",
+        f"{'preserve' if previous_manifest else 'install'} personal config {paths.config}",
+        f"{'refresh' if previous_manifest else 'merge'} Claude and Codex user assets",
     ]
     config: dict | None = None
     if paths.config.exists() or paths.config.is_symlink():
@@ -278,10 +323,22 @@ def install(home: Path | None = None, repo: Path | None = None, dry_run: bool = 
 
     backup_root.mkdir(parents=True, exist_ok=False)
     create_backup(backup_root, paths)
+    if failure_state is not None:
+        failure_state["changes_started"] = True
     records: list[dict] = []
 
-    runtime_record = _record(paths.install_root, paths, backup_root)
-    runtime_record["management"] = "owned"
+    def begin_record(path: Path, management: str) -> dict:
+        previous = previous_records.get(str(path))
+        if previous is not None:
+            record = previous.copy()
+        else:
+            record = _record(path, paths, backup_root)
+        record["management"] = management
+        record.pop("installed_hash", None)
+        record.pop("installed_symlink", None)
+        return record
+
+    runtime_record = begin_record(paths.install_root, "owned")
     paths.install_root.parent.mkdir(parents=True, exist_ok=True)
     if paths.install_root.exists():
         shutil.rmtree(paths.install_root)
@@ -293,8 +350,7 @@ def install(home: Path | None = None, repo: Path | None = None, dry_run: bool = 
     os.chmod(paths.install_root / "bin/cross-harness", 0o755)
     records.append(runtime_record)
 
-    executable_record = _record(paths.executable, paths, backup_root)
-    executable_record["management"] = "owned"
+    executable_record = begin_record(paths.executable, "owned")
     paths.executable.parent.mkdir(parents=True, exist_ok=True)
     if paths.executable.exists() or paths.executable.is_symlink():
         paths.executable.unlink()
@@ -303,21 +359,21 @@ def install(home: Path | None = None, repo: Path | None = None, dry_run: bool = 
     records.append(executable_record)
 
     if config is None:
-        _write_text(
-            paths.config,
-            (repo / "config/default.toml").read_text(encoding="utf-8"),
-            paths,
-            backup_root,
-            records,
-            management="personal_config",
-        )
+        config_record = begin_record(paths.config, "personal_config")
+        atomic_write(paths.config, (repo / "config/default.toml").read_text(encoding="utf-8"))
+        _finish_record(config_record, paths.config)
+        records.append(config_record)
         config = load_config(paths.config, paths.home)
     else:
-        config_record = _record(paths.config, paths, backup_root)
-        config_record["management"] = "personal_config"
+        config_record = begin_record(paths.config, "personal_config")
+        _finish_record(config_record, paths.config)
         records.append(config_record)
 
     shared = repo / "assets/shared/safety.md"
+    if previous_manifest:
+        for path in (paths.claude / "CLAUDE.md", paths.codex / "AGENTS.md"):
+            if path.is_file():
+                atomic_write(path, remove_marker(path.read_text(encoding="utf-8")))
     _merge_markdown(paths.claude / "CLAUDE.md", [repo / "assets/claude/CLAUDE.md", shared], paths, backup_root, records, paths.executable)
     _merge_markdown(paths.codex / "AGENTS.md", [repo / "assets/codex/AGENTS.md", shared], paths, backup_root, records, paths.executable)
 
@@ -329,6 +385,10 @@ def install(home: Path | None = None, repo: Path | None = None, dry_run: bool = 
     merged_config = _merge_codex_config(codex_config)
     if merged_config is not None:
         _write_text(codex_config, merged_config, paths, backup_root, records, management="codex_config")
+    elif str(codex_config) in previous_records:
+        config_record = begin_record(codex_config, "codex_config")
+        _finish_record(config_record, codex_config)
+        records.append(config_record)
 
     copies = (
         (repo / "assets/claude/skills/cross-harness-orchestrator", paths.claude / "skills/cross-harness-orchestrator"),
@@ -363,6 +423,26 @@ def install(home: Path | None = None, repo: Path | None = None, dry_run: bool = 
         _finish_record(record, destination)
         records.append(record)
 
+    # A reinstall keeps the original pre-install backups.  The operations
+    # above necessarily make fresh snapshots while applying the update; use
+    # the prior records for paths that were already managed so uninstall still
+    # restores the user's pre-install state rather than the previous runtime.
+    if previous_records:
+        current_paths = {record["path"] for record in records}
+        for previous in previous_records.values():
+            if previous["path"] not in current_paths:
+                _restore_record(previous)
+        for index, record in enumerate(records):
+            previous = previous_records.get(record["path"])
+            if previous is None:
+                continue
+            refreshed = previous.copy()
+            refreshed["management"] = record.get("management", "owned")
+            refreshed.pop("installed_hash", None)
+            refreshed.pop("installed_symlink", None)
+            _finish_record(refreshed, Path(refreshed["path"]))
+            records[index] = refreshed
+
     manifest = {
         "version": 1,
         "installed_at": datetime.now(timezone.utc).isoformat(),
@@ -372,6 +452,28 @@ def install(home: Path | None = None, repo: Path | None = None, dry_run: bool = 
     }
     atomic_write(manifest_path, dump_json(manifest))
     return actions
+
+
+def install(
+    home: Path | None = None,
+    repo: Path | None = None,
+    dry_run: bool = False,
+    force: bool = False,
+) -> list[str]:
+    """Install or update managed assets, preserving a usable failure report."""
+    was_update = _manifest_path(user_paths(home)).exists()
+    failure_state: dict[str, object] = {"changes_started": False}
+    try:
+        return _install(home, repo, dry_run, force, failure_state)
+    except Exception as exc:
+        if was_update and failure_state["changes_started"]:
+            backup_root = failure_state["backup_root"]
+            raise HarnessError(
+                "install update failed after managed files may have changed; "
+                f"current settings backup: {backup_root}. The previous install manifest was retained. "
+                f"Cause: {exc}"
+            ) from exc
+        raise
 
 
 def _original_json(record: dict) -> dict:
@@ -492,13 +594,7 @@ def uninstall(
         if runtime_root != safe_root:
             raise HarnessError(f"refusing to purge non-default runtime root: {runtime_root}")
     if not force and not preserve_user_changes:
-        drift = []
-        for record in records:
-            path = Path(record["path"])
-            if "installed_hash" in record and path.is_file() and sha256(path) != record["installed_hash"]:
-                drift.append(str(path))
-            if "installed_symlink" in record and path.is_symlink() and os.readlink(path) != record["installed_symlink"]:
-                drift.append(str(path))
+        drift = _installed_drift(records, paths)
         if drift:
             raise HarnessError("installed files changed; refusing to overwrite:\n- " + "\n- ".join(drift))
 

@@ -36,6 +36,7 @@ def parser() -> argparse.ArgumentParser:
     install_parser = commands.add_parser("install", help="back up and install user assets")
     install_parser.add_argument("--repo", type=Path, default=source_root())
     install_parser.add_argument("--dry-run", action="store_true")
+    install_parser.add_argument("--force", action="store_true", help="overwrite changed installed files")
 
     uninstall_parser = commands.add_parser("uninstall", help="restore the pre-install state")
     uninstall_parser.add_argument("--force", action="store_true")
@@ -133,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
                 copied = create_backup(args.backup, user_paths(home))
                 print(f"backed up {len(copied)} setting files to {args.backup}")
         elif args.command == "install":
-            for action in install(home, args.repo, args.dry_run):
+            for action in install(home, args.repo, args.dry_run, args.force):
                 print(action)
         elif args.command == "uninstall":
             restored = uninstall(home, args.force, args.preserve_user_changes, args.purge_runtime)
