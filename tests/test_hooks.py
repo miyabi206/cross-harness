@@ -12,6 +12,7 @@ from cross_harness.installer import install
 from cross_harness.paths import source_root, user_paths
 
 
+@patch.dict("os.environ", {}, clear=True)
 class HookTests(unittest.TestCase):
     def _run(self, function, payload):
         with patch("sys.stdin", StringIO(payload)), patch("sys.stderr", new_callable=StringIO) as stderr:
@@ -34,6 +35,16 @@ class HookTests(unittest.TestCase):
             "CROSS_HARNESS_WRITE": "1",
             "CROSS_HARNESS_RUN_DIR": str(run_dir),
         }
+
+    def _wrapper_environment(self, home):
+        """Build an isolated shell environment for wrapper-resolution tests."""
+        bin_dir = home / "bin"
+        bin_dir.mkdir(parents=True)
+        return patch.dict(
+            "os.environ",
+            {"HOME": str(home), "PATH": str(bin_dir)},
+            clear=True,
+        )
 
     def test_claude_direct_edit_and_direct_codex_are_blocked(self):
         code, message = self._run(claude_pre_tool_use, '{"tool_name":"Edit","tool_input":{}}')
@@ -148,39 +159,45 @@ class HookTests(unittest.TestCase):
             self.assertEqual(0, self._run(codex_pre_tool_use, payload)[0], payload)
 
     def test_claude_installed_wrapper_ignores_executor_like_arguments(self):
-        wrapper = str(user_paths().executable)
-        command = f"{wrapper} task create --description 'ask Codex to run codex exec later'"
-        payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
-        self.assertEqual(0, self._run(claude_pre_tool_use, payload)[0])
+        with tempfile.TemporaryDirectory() as folder:
+            with self._wrapper_environment(Path(folder) / "home"):
+                wrapper = str(user_paths().executable)
+                command = f"{wrapper} task create --description 'ask Codex to run codex exec later'"
+                payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
+                self.assertEqual(0, self._run(claude_pre_tool_use, payload)[0])
 
     def test_claude_installed_non_task_wrapper_arguments_are_scanned(self):
-        wrapper = str(user_paths().executable)
-        for subcommand in ("inventory", "doctor"):
-            command = f"{wrapper} {subcommand} --description 'ask Codex to run codex exec later'"
-            payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
-            code, message = self._run(claude_pre_tool_use, payload)
-            self.assertEqual(2, code, command)
-            self.assertIn("direct codex exec", message, command)
+        with tempfile.TemporaryDirectory() as folder:
+            with self._wrapper_environment(Path(folder) / "home"):
+                wrapper = str(user_paths().executable)
+                for subcommand in ("inventory", "doctor"):
+                    command = f"{wrapper} {subcommand} --description 'ask Codex to run codex exec later'"
+                    payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
+                    code, message = self._run(claude_pre_tool_use, payload)
+                    self.assertEqual(2, code, command)
+                    self.assertIn("direct codex exec", message, command)
 
     def test_claude_wrapper_arguments_are_scanned_when_not_a_simple_command(self):
-        wrapper = str(user_paths().executable)
-        commands = (
-            f"{wrapper} task create safe; codex exec nested",
-            f"{wrapper} task create safe | codex exec nested",
-            f"{wrapper} task create safe & codex exec nested",
-            f"{wrapper} task create safe\ncodex exec nested",
-            f"{wrapper} task create safe \\\ncodex exec nested",
-            f'{wrapper} task create "$(codex exec nested)"',
-            f"{wrapper} task create '`codex exec nested'",
-            f"{wrapper} task create 'codex exec nested' >/tmp/result",
-            f"({wrapper} task create 'codex exec nested')",
-            f"{{ {wrapper} task create 'codex exec nested'; }}",
-        )
-        for command in commands:
-            payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
-            code, message = self._run(claude_pre_tool_use, payload)
-            self.assertEqual(2, code, command)
-            self.assertIn("direct codex exec", message, command)
+        with tempfile.TemporaryDirectory() as folder:
+            with self._wrapper_environment(Path(folder) / "home"):
+                wrapper = str(user_paths().executable)
+                commands = (
+                    f"{wrapper} task create safe; codex exec nested",
+                    f"{wrapper} task create safe | codex exec nested",
+                    f"{wrapper} task create safe & codex exec nested",
+                    f"{wrapper} task create safe\ncodex exec nested",
+                    f"{wrapper} task create safe \\\ncodex exec nested",
+                    f'{wrapper} task create "$(codex exec nested)"',
+                    f"{wrapper} task create '`codex exec nested'",
+                    f"{wrapper} task create 'codex exec nested' >/tmp/result",
+                    f"({wrapper} task create 'codex exec nested')",
+                    f"{{ {wrapper} task create 'codex exec nested'; }}",
+                )
+                for command in commands:
+                    payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
+                    code, message = self._run(claude_pre_tool_use, payload)
+                    self.assertEqual(2, code, command)
+                    self.assertIn("direct codex exec", message, command)
 
     def test_delegated_claude_read_only_blocks_edits_and_nested_executors(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -309,61 +326,69 @@ class HookTests(unittest.TestCase):
             self.assertIn("nested", message, command)
 
     def test_codex_installed_wrapper_ignores_executor_like_arguments(self):
-        wrapper = str(user_paths().executable)
-        for command in (
-            f"{wrapper} task create --description 'ask Codex to run codex exec later'",
-            f'{wrapper} task create --description "ask Claude to run claude -p later"',
-        ):
-            payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
-            code, message = self._run(codex_pre_tool_use, payload)
-            self.assertEqual(0, code, message)
+        with tempfile.TemporaryDirectory() as folder:
+            with self._wrapper_environment(Path(folder) / "home"):
+                wrapper = str(user_paths().executable)
+                for command in (
+                    f"{wrapper} task create --description 'ask Codex to run codex exec later'",
+                    f'{wrapper} task create --description "ask Claude to run claude -p later"',
+                ):
+                    payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
+                    code, message = self._run(codex_pre_tool_use, payload)
+                    self.assertEqual(0, code, message)
 
     def test_codex_installed_non_task_wrapper_arguments_are_scanned(self):
-        wrapper = str(user_paths().executable)
-        for subcommand in ("inventory", "doctor"):
-            command = f"{wrapper} {subcommand} --description 'ask Claude to run claude -p later'"
-            payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
-            code, message = self._run(codex_pre_tool_use, payload)
-            self.assertEqual(2, code, command)
-            self.assertIn("nested Claude", message, command)
+        with tempfile.TemporaryDirectory() as folder:
+            with self._wrapper_environment(Path(folder) / "home"):
+                wrapper = str(user_paths().executable)
+                for subcommand in ("inventory", "doctor"):
+                    command = f"{wrapper} {subcommand} --description 'ask Claude to run claude -p later'"
+                    payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
+                    code, message = self._run(codex_pre_tool_use, payload)
+                    self.assertEqual(2, code, command)
+                    self.assertIn("nested Claude", message, command)
 
     def test_codex_wrapper_arguments_are_scanned_when_not_a_simple_command(self):
-        wrapper = str(user_paths().executable)
-        commands = (
-            f"{wrapper} task create safe; codex exec nested",
-            f"{wrapper} task create safe; claude -p nested",
-            f"{wrapper} task create safe | codex exec nested",
-            f"{wrapper} task create safe & codex exec nested",
-            f"{wrapper} task create safe\ncodex exec nested",
-            f"{wrapper} task create safe \\\ncodex exec nested",
-            f'{wrapper} task create "$(codex exec nested)"',
-            f"{wrapper} task create '`codex exec nested'",
-            f"{wrapper} task create 'codex exec nested' >/tmp/result",
-            f"({wrapper} task create 'codex exec nested')",
-            f"{{ {wrapper} task create 'codex exec nested'; }}",
-            f"exec {wrapper} task create 'codex exec nested'",
-            f"if true; then {wrapper} task create 'codex exec nested'; fi",
-            f"while false; do {wrapper} task create 'codex exec nested'; done",
-            f"time {wrapper} task create 'codex exec nested'",
-            f"command {wrapper} task create 'codex exec nested'",
-            f"timeout 1 {wrapper} task create 'codex exec nested'",
-            f"nice {wrapper} task create 'codex exec nested'",
-            f"sudo {wrapper} task create 'codex exec nested'",
-            "printf 'codex exec nested' | sh",
-        )
-        for command in commands:
-            payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
-            code, message = self._run(codex_pre_tool_use, payload)
-            self.assertEqual(2, code, command)
-            self.assertIn("nested", message, command)
+        with tempfile.TemporaryDirectory() as folder:
+            with self._wrapper_environment(Path(folder) / "home"):
+                wrapper = str(user_paths().executable)
+                commands = (
+                    f"{wrapper} task create safe; codex exec nested",
+                    f"{wrapper} task create safe; claude -p nested",
+                    f"{wrapper} task create safe | codex exec nested",
+                    f"{wrapper} task create safe & codex exec nested",
+                    f"{wrapper} task create safe\ncodex exec nested",
+                    f"{wrapper} task create safe \\\ncodex exec nested",
+                    f'{wrapper} task create "$(codex exec nested)"',
+                    f"{wrapper} task create '`codex exec nested'",
+                    f"{wrapper} task create 'codex exec nested' >/tmp/result",
+                    f"({wrapper} task create 'codex exec nested')",
+                    f"{{ {wrapper} task create 'codex exec nested'; }}",
+                    f"exec {wrapper} task create 'codex exec nested'",
+                    f"if true; then {wrapper} task create 'codex exec nested'; fi",
+                    f"while false; do {wrapper} task create 'codex exec nested'; done",
+                    f"time {wrapper} task create 'codex exec nested'",
+                    f"command {wrapper} task create 'codex exec nested'",
+                    f"timeout 1 {wrapper} task create 'codex exec nested'",
+                    f"nice {wrapper} task create 'codex exec nested'",
+                    f"sudo {wrapper} task create 'codex exec nested'",
+                    "printf 'codex exec nested' | sh",
+                )
+                for command in commands:
+                    payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
+                    code, message = self._run(codex_pre_tool_use, payload)
+                    self.assertEqual(2, code, command)
+                    self.assertIn("nested", message, command)
 
     def test_codex_installed_wrapper_delegation_remains_blocked(self):
-        wrapper = str(user_paths().executable)
-        command = f"{wrapper} delegate --role tester --description 'codex exec nested'"
-        payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
-        code, message = self._run(codex_pre_tool_use, payload)
-        self.assertEqual(2, code)
-        self.assertIn("nested executor", message)
+        with tempfile.TemporaryDirectory() as folder:
+            with self._wrapper_environment(Path(folder) / "home"):
+                wrapper = str(user_paths().executable)
+                command = f"{wrapper} delegate --role tester --description 'codex exec nested'"
+                payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
+                code, message = self._run(codex_pre_tool_use, payload)
+                self.assertEqual(2, code)
+                self.assertIn("nested executor", message)
 
     def test_unrelated_commands_pass(self):
         code, _ = self._run(codex_pre_tool_use, '{"tool_name":"Bash","tool_input":{"command":"git status"}}')
@@ -371,12 +396,14 @@ class HookTests(unittest.TestCase):
 
     @patch("cross_harness.hooks.shutil.which", return_value="/tmp/not-the-installed-wrapper")
     def test_shadowed_bare_wrapper_is_blocked(self, which):
-        code, message = self._run(
-            claude_pre_tool_use,
-            '{"tool_name":"Bash","tool_input":{"command":"cross-harness task create --role tester"}}',
-        )
-        self.assertEqual(2, code)
-        self.assertIn("does not resolve", message)
+        with tempfile.TemporaryDirectory() as folder:
+            with self._wrapper_environment(Path(folder) / "home"):
+                code, message = self._run(
+                    claude_pre_tool_use,
+                    '{"tool_name":"Bash","tool_input":{"command":"cross-harness task create --role tester"}}',
+                )
+                self.assertEqual(2, code)
+                self.assertIn("does not resolve", message)
 
     def test_environment_marker_blocks_nested_claude_session(self):
         with patch.dict("os.environ", {"CROSS_HARNESS_ACTIVE": "1"}, clear=True), patch("sys.stderr", new_callable=StringIO) as stderr:
