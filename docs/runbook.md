@@ -30,6 +30,24 @@ Run `cross-harness doctor` after either CLI upgrades, authentication changes,
 hook changes, or a reinstall. Run `cross-harness cleanup` when stale run
 directories need immediate maintenance; SessionStart also invokes it.
 
+## Orchestrator action record
+
+The non-delegated Claude `PreToolUse` hook appends one JSON object per `Edit`,
+`Write`, and `Bash` invocation to
+`<runtime_root>/orchestrator-actions.jsonl`. Each row has an UTC timestamp,
+tool name, final `allowed` or `denied` decision, target (`file_path` for
+`Edit`/`Write`, full command string for `Bash`), and hook `cwd`. This covers
+every orchestrator Bash call; it does not attempt to infer whether a command
+writes files. Delegated Claude executions are deliberately excluded because
+their run records and executor logs are the authoritative record.
+
+If a recorded target or cwd matches the credential detector, the row instead
+contains only timestamp, tool name, decision, and `redacted: true`. Inspect
+the file as JSON Lines (one object per line); it is stored only under the
+runtime root. The active file rolls at 5 MiB into up to four numbered older
+files, dropping the oldest archive first, so recent action records remain
+available without unbounded growth.
+
 ## Verification constraints
 
 For `test`, `implementation`, and `debug` work, a task must declare an

@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from io import StringIO
 from unittest.mock import patch
 from pathlib import Path
@@ -14,10 +15,78 @@ from cross_harness.paths import source_root, user_paths
 
 @patch.dict("os.environ", {}, clear=True)
 class HookTests(unittest.TestCase):
-    def _run(self, function, payload):
-        with patch("sys.stdin", StringIO(payload)), patch("sys.stderr", new_callable=StringIO) as stderr:
+    def _run(self, function, payload, *, record=False):
+        recorder = nullcontext() if record else patch("cross_harness.hooks._record_orchestrator_action")
+        with recorder, patch("sys.stdin", StringIO(payload)), patch("sys.stderr", new_callable=StringIO) as stderr:
             code = function()
             return code, stderr.getvalue()
+
+    def test_orchestrator_action_log_records_edit_write_and_all_bash_calls(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runtime_root = root / "runtime"
+            cwd = root / "project"
+            cwd.mkdir()
+            config = {"runtime_root": str(runtime_root), "mode": "on", "projects": {}}
+            requests = (
+                {"cwd": str(cwd), "tool_name": "Edit", "tool_input": {"file_path": str(root / "edit.py")}},
+                {"cwd": str(cwd), "tool_name": "Write", "tool_input": {"file_path": str(root / "write.py")}},
+                {"cwd": str(cwd), "tool_name": "Bash", "tool_input": {"command": "printf audit"}},
+            )
+            with patch("cross_harness.hooks.load_config", return_value=config):
+                for request in requests:
+                    self._run(claude_pre_tool_use, json.dumps(request), record=True)
+            entries = [json.loads(line) for line in (runtime_root / "orchestrator-actions.jsonl").read_text().splitlines()]
+        self.assertEqual(["Edit", "Write", "Bash"], [entry["tool_name"] for entry in entries])
+        self.assertEqual(["denied", "denied", "allowed"], [entry["decision"] for entry in entries])
+        self.assertEqual([str(root / "edit.py"), str(root / "write.py"), "printf audit"], [entry["target"] for entry in entries])
+        self.assertTrue(all(entry["cwd"] == str(cwd) and entry["timestamp"] for entry in entries))
+
+    def test_orchestrator_action_log_redacts_secrets_and_skips_delegated_execution(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runtime_root = root / "runtime"
+            config = {"runtime_root": str(runtime_root), "mode": "on", "projects": {}}
+            secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+            payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": f"printf {secret}"}})
+            with patch("cross_harness.hooks.load_config", return_value=config):
+                self._run(claude_pre_tool_use, payload, record=True)
+            entry = json.loads((runtime_root / "orchestrator-actions.jsonl").read_text())
+            self.assertTrue(entry["redacted"])
+            self.assertEqual({"timestamp", "tool_name", "decision", "redacted"}, set(entry))
+            self.assertNotIn(secret, json.dumps(entry))
+
+            environment = self._execution_environment(runtime_root, write=True)
+            with patch("cross_harness.hooks.load_config", return_value=config), patch.dict("os.environ", environment, clear=True):
+                self._run(claude_pre_tool_use, '{"tool_name":"Bash","tool_input":{"command":"printf delegated"}}', record=True)
+            self.assertEqual(1, len((runtime_root / "orchestrator-actions.jsonl").read_text().splitlines()))
+
+    def test_orchestrator_action_log_rotates_to_keep_recent_records_bounded(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runtime_root = Path(folder) / "runtime"
+            config = {"runtime_root": str(runtime_root), "mode": "on", "projects": {}}
+            with patch("cross_harness.hooks.load_config", return_value=config), patch(
+                "cross_harness.hooks.ORCHESTRATOR_ACTIONS_MAX_BYTES", 1
+            ):
+                self._run(claude_pre_tool_use, '{"tool_name":"Bash","tool_input":{"command":"printf first"}}', record=True)
+                self._run(claude_pre_tool_use, '{"tool_name":"Bash","tool_input":{"command":"printf second"}}', record=True)
+            current = (runtime_root / "orchestrator-actions.jsonl").read_text()
+            archive = (runtime_root / "orchestrator-actions.1.jsonl").read_text()
+        self.assertIn("printf second", current)
+        self.assertIn("printf first", archive)
+
+    def test_orchestrator_action_log_failures_do_not_change_the_decision(self):
+        payload = '{"tool_name":"Bash","tool_input":{"command":"codex exec nested"}}'
+        with patch("cross_harness.hooks.load_config", side_effect=OSError("config unavailable")):
+            self.assertEqual(2, self._run(claude_pre_tool_use, payload, record=True)[0])
+        with patch("cross_harness.hooks.load_config", return_value={"runtime_root": "/tmp/runtime"}), patch(
+            "cross_harness.hooks.Path.mkdir", side_effect=OSError("mkdir unavailable")
+        ):
+            self.assertEqual(2, self._run(claude_pre_tool_use, payload, record=True)[0])
+        with patch("cross_harness.hooks.load_config", return_value={"runtime_root": "/tmp/runtime"}), patch(
+            "cross_harness.hooks.os.open", side_effect=OSError("write unavailable")
+        ):
+            self.assertEqual(2, self._run(claude_pre_tool_use, payload, record=True)[0])
 
     def _execution_environment(self, runtime_root, *, harness="claude", write=False, run_dir=None):
         run_dir = run_dir or runtime_root / "runs" / "delegated-claude"

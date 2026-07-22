@@ -16,6 +16,7 @@ from .files import atomic_write, dump_json
 from .maintenance import cleanup
 from .paths import user_paths
 from .installer import synchronize_claude_agent_roles
+from .taskfile import contains_secret
 
 
 SHELL_BOUNDARY = r"[;&|()\s'\"`]"
@@ -29,6 +30,8 @@ HARNESS_REDELEGATION = re.compile(
     rf"(?:^|{SHELL_BOUNDARY})(?:[^\s;&|()'\"`]*/)?cross-harness\s+(?:delegate|retry|task\s+create)(?=$|{SHELL_BOUNDARY})"
 )
 SIMPLE_WRAPPER_UNSAFE_SYNTAX = re.compile(r"[;&|()\n\r`<>{}]")
+ORCHESTRATOR_ACTIONS_MAX_BYTES = 5 * 1024 * 1024
+ORCHESTRATOR_ACTIONS_ARCHIVES = 4
 
 
 def _installed_wrapper_arguments(command: str) -> str | None:
@@ -226,6 +229,58 @@ def _delegated_claude_execution() -> dict | None:
     return record
 
 
+def _orchestrator_action_target(data: dict | None, name: str, command: str) -> str | None:
+    if name == "Bash":
+        return command
+    return _file_path(data)
+
+
+def _rotate_orchestrator_actions(path: Path) -> None:
+    """Keep a bounded set of action logs, with the newest records in the base file."""
+    oldest = path.with_name(f"{path.stem}.{ORCHESTRATOR_ACTIONS_ARCHIVES}{path.suffix}")
+    oldest.unlink(missing_ok=True)
+    for index in range(ORCHESTRATOR_ACTIONS_ARCHIVES - 1, 0, -1):
+        source = path.with_name(f"{path.stem}.{index}{path.suffix}")
+        if source.exists():
+            source.replace(path.with_name(f"{path.stem}.{index + 1}{path.suffix}"))
+    path.replace(path.with_name(f"{path.stem}.1{path.suffix}"))
+
+
+def _record_orchestrator_action(data: dict | None, name: str, command: str, allowed: bool) -> None:
+    """Best-effort, bounded audit logging that cannot affect a hook decision."""
+    if name not in {"Edit", "Write", "Bash"}:
+        return
+    try:
+        target = _orchestrator_action_target(data, name, command)
+        cwd = data.get("cwd") if isinstance(data, dict) and isinstance(data.get("cwd"), str) else None
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "tool_name": name,
+            "decision": "allowed" if allowed else "denied",
+        }
+        if any(contains_secret(value) for value in (target, cwd) if value is not None):
+            record["redacted"] = True
+        else:
+            record["target"] = target
+            record["cwd"] = cwd
+
+        config = load_config(home=user_paths().home)
+        runtime_root = Path(config["runtime_root"])
+        runtime_root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        os.chmod(runtime_root, 0o700)
+        path = runtime_root / "orchestrator-actions.jsonl"
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        if path.exists() and path.stat().st_size + len(line.encode("utf-8")) > ORCHESTRATOR_ACTIONS_MAX_BYTES:
+            _rotate_orchestrator_actions(path)
+        descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+            handle.write(line)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        return
+
+
 def claude_pre_tool_use() -> int:
     data = _input()
     tool = _tool(data)
@@ -244,24 +299,34 @@ def claude_pre_tool_use() -> int:
             return _deny("cross-harness: nested executor launch from delegated Claude is blocked")
         return 0
     if name in {"Edit", "Write"}:
+        result: int | None = None
         try:
             if _mode_is_off(load_config(home=user_paths().home), data):
-                return 0
+                result = 0
         except (OSError, RuntimeError, ValueError, TypeError, ConfigError):
             pass
-        if _orchestrator_write_path_is_allowed(_file_path(data), _cwd(data)):
-            return 0
-        return _deny("cross-harness: Claude is the orchestrator; delegate project edits through cross-harness")
+        if result is None:
+            if _orchestrator_write_path_is_allowed(_file_path(data), _cwd(data)):
+                result = 0
+            else:
+                result = _deny("cross-harness: Claude is the orchestrator; delegate project edits through cross-harness")
+        _record_orchestrator_action(data, name, command, result == 0)
+        return result
     wrapper_arguments = _installed_wrapper_arguments(command)
     executor_scan = command if wrapper_arguments is None else ""
     if name == "Bash" and _matches(CODEX_EXEC, executor_scan):
-        return _deny("cross-harness: direct codex exec is blocked; use cross-harness delegate with a task file")
-    if name == "Bash" and _matches(BARE_WRAPPER, command):
+        result = _deny("cross-harness: direct codex exec is blocked; use cross-harness delegate with a task file")
+    elif name == "Bash" and _matches(BARE_WRAPPER, command):
         expected = user_paths().executable.resolve()
         resolved = shutil.which("cross-harness")
         if not resolved or Path(resolved).resolve() != expected:
-            return _deny("cross-harness: bare wrapper command does not resolve to the installed personal executable")
-    return 0
+            result = _deny("cross-harness: bare wrapper command does not resolve to the installed personal executable")
+        else:
+            result = 0
+    else:
+        result = 0
+    _record_orchestrator_action(data, name, command, result == 0)
+    return result
 
 
 def codex_pre_tool_use() -> int:
