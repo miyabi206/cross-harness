@@ -222,3 +222,35 @@ codex 実行時に次の stderr が繰り返し出力された。
 | D10 | 対応済み。観測済み差分と実行者申告を分離して表示する。 | `3219564` fix: 要約が観測事実と自己申告を混ぜないようにする | 申告のみの項目は観測済みの変更ではなく、未検証として扱う。 |
 
 全体として、宣言検査は実行可能なコマンド行で記述する必要がある。散文で記述した検査は実行記録と突合できず `not_run` となり、run 全体は `partial` に降格する。
+
+## 第2次修正で確認された項目
+
+| # | 事象 | 判定 | 影響度 |
+|---|---|---|---|
+| R1 | retry と escalation が既定ポリシーで必ずブロックされる | バグ（`0a32cac` の副作用） | 最重大 |
+| R2 | isolate の retry が前回試行の成果を捨てる | バグ | 高 |
+| F1 | 良性の語で成功実行が blocked になる | バグ（既存の挙動） | 高 |
+| F1b | overage で完走した rate limit が blocked になる | バグ（既存の挙動） | 高 |
+| F2 | `finalize_run` が要約を書く前に落ちうる | バグ | 最重大 |
+| F3 | 検査未宣言による partial が終了コード前提の自動化を壊す | 意図した変更 | 低 |
+| F4 | read-only ロールの失敗検出が消えた | 仕様の後退 | 低 |
+| F5 | isolate 経路で不要な `_diff_details` を呼び出す | バグ（軽微） | 低 |
+| N1 | 宣言検査をパイプに繋ぐと失敗が成功として記録される | バグ（検証層の fail-open） | 最重大 |
+| N2 | 委譲された Claude 実行者の中では `tests/test_hooks.py` の5件が必ず失敗する | テストの環境依存 | 高（tester が検証役として機能しない） |
+
+## 第2次修正の対応状況と残存する制約
+
+| # | 対応状況 | 対応コミット | 残存する制約 |
+|---|---|---|---|
+| R1 | 対応済み。ガードの基準をクリーンなツリーから、直前 run の `baseline.json` と `summary.json` の `diff_summary` から作った `(ファイル名, fingerprint)` の許可集合への包含へ変更した。 | `b938717` fix: retryの基準点をクリーンなツリーから直前runの記録へ移す<br>`c49e14a` fix: retryガードのレビュー指摘2件を修正する | 直前 run の記録が欠損・破損している場合、および直前 run の finalize が git 失敗で `diff_check: unavailable` を立てた場合は fail-closed でブロックする。 |
+| R2 | 対応済み。直前 run の `ISOLATED_WORKTREE` マーカーからパスを読んで検証し、その worktree を再利用する。新しい run にも同じマーカーを書く。worktree が消えていれば新規作成せず `missing_isolated_worktree` でブロックする。 | `b938717` fix: retryの基準点をクリーンなツリーから直前runの記録へ移す | isolate かどうかは現在の設定値ではなく直前 run のマーカーの有無で決まる。 |
+| F1 | 対応済み。status が success のときは stderr への rate limit と authentication の正規表現走査を判定に使わない。構造化された `blocked_category` は従来どおり有効とする。 | `4d633f6` fix: 成功実行が良性の語やoverageで誤blockedになるのを止める | 実行者自身が申告した error 文字列に対する走査は維持している。 |
+| F1b | 対応済み。`rate_limit_event` が rejected でも `overageStatus` が allowed かつ `isUsingOverage` なら、完走した実行は blocked にせず `rate_limit_notice: overage_allowed` を要約に出す。完走していなければ従来どおり blocked とする。 | `4d633f6` fix: 成功実行が良性の語やoverageで誤blockedになるのを止める | 完走の判定は終了コード0かつ実行者申告の status が success であることに依存する。既存 run 群で判定が反転したのは `20260721T222034-9e55a8fd` の1件のみである。 |
+| F2 | 対応済み。`_self_reversions`、`_tracked_path`、`_diff_details`、`_git_root`、`_record_delegated_changes` の git 呼び出しを例外で包み、失敗時は `self_reversion_check: unavailable` と `diff_check: unavailable` を要約に出す。`_tracked_path` の全件 `git ls-files` は `finalize_run` 一回につき一度に減らした。 | `28706bd` fix: finalize_runの自己巻き戻し検査をgit失敗から保護する<br>`aa2ded5` fix: finalize_runの差分検査もgit失敗から保護する | git 情報が取れない場合は `changed_files` と `diff_summary` が空になり、実行者申告はすべて未検証として扱われる。 |
+| F3 | 対応済み（記録のみ）。`docs/runbook.md` の検証制約の節に、kind が test / implementation / debug で検査を宣言しないと success が partial に降格し CLI が非ゼロで返ることを明記した。 | `358e393` fix: 検査のパイプ誤判定を塞ぎ失敗コマンドを可視化する | 挙動そのものは変更していない。 |
+| F4 | 対応済み（可視化のみ）。read-only な kind では最後の失敗コマンドの本文と終了コードを要約に出す。status には影響させない。 | `358e393` fix: 検査のパイプ誤判定を塞ぎ失敗コマンドを可視化する | 件数と最後の1件のみで、失敗の全件は要約に出ない。 |
+| F5 | 対応済み。isolate では `_diff_details` を呼ばずに早期復帰する。 | `358e393` fix: 検査のパイプ誤判定を塞ぎ失敗コマンドを可視化する | なし。 |
+| N1 | 対応済み。検査コマンドの出力を別コマンドへパイプしている実行は検査の観測として採用しない。`set -o pipefail` が有効な場合と検査がパイプ末尾の場合は採用する。併せてコマンド分割を引用符対応にした。実例として、run `20260722T024642-e58d4c28` では失敗した `scripts/test.sh` の直後に tail へパイプした実行が行われ、passed として記録されていた。 | `358e393` fix: 検査のパイプ誤判定を塞ぎ失敗コマンドを可視化する | 判定はコマンド文字列の静的解析による。 |
+| N2 | 対応済み。テストクラス全体で `os.environ` を clear し、ラッパー解決に関わるテストは HOME と PATH を一時ディレクトリで明示的に構成した。アサーションは変更していない。修正後、tester ロール（claude、read-only）が決定的テスト一式と実データ検証の全5検査を通過することを実測で確認した。 | `f995c1a` fix: フックのテストを環境非依存にする | なし。 |
+
+第2次では併せて、`40e29cf` feat: 実績にもとづきガードレールを3点緩める により `dirty_worktree_policy` の既定を `allow_delegated` へ変更し、`executor_reported` の blocked を retry 可能にし、security_reviewer の kind=review を確認ゲートなしにした。`d386814` feat: installをその場更新できるようにする、`a81196e` feat: オーケストレータの書き込み範囲にcwdのGitルート配下を加える も実施した。加えて `f348f94` fix: 検査がリポジトリに書き込まないようにする により、`scripts/test.sh` の実行がリポジトリに書き込む36ファイルは0件になった。
