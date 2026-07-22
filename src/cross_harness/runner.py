@@ -24,7 +24,7 @@ from .config import CLAUDE_EFFORTS, CODEX_EFFORTS, delegation_kind_error, load_c
 from .errors import AuthError, ConfigError, DirtyWorktreeError, HarnessError, SupervisorDiedError
 from .files import atomic_write, dump_json, sha256
 from .paths import source_root, user_paths
-from .summarize import command_matches_check, failure_signature, load_final, parse_events, render_summary, summary_item_text
+from .summarize import command_matches_check, failure_signature, load_final, normalize_comparison_path, parse_events, render_summary, summary_item_text
 from .taskfile import contains_secret
 
 
@@ -1339,6 +1339,17 @@ def finalize_run(
     unverified_changed_files = [
         name for name in reported_changed_files if name not in detected_changed
     ]
+    # Keep unverified_changed_files' established raw comparison intact.  This
+    # complementary view uses normalized paths so reporting spelling cannot
+    # make an observed change look unreported.
+    normalized_reported_changed = {
+        normalize_comparison_path(name, cwd) for name in reported_changed_files
+    }
+    unreported_changed_files = [
+        name
+        for name in detected_changed
+        if normalize_comparison_path(name, cwd) not in normalized_reported_changed
+    ]
     signature = failure_signature(exit_code, parsed, filtered_stderr)
     reported_tests = final.get("tests", [])
     if isinstance(reported_tests, str):
@@ -1360,6 +1371,7 @@ def finalize_run(
         "changed_files": detected_changed,
         "reported_changed_files": reported_changed_files,
         "unverified_changed_files": unverified_changed_files,
+        "unreported_changed_files": unreported_changed_files,
         "diff_summary": diff_summary,
         "tests": reported_tests,
         "checks": check_results,

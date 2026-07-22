@@ -12,7 +12,7 @@ import sys
 from unittest.mock import patch
 
 from cross_harness import runner
-from cross_harness.summarize import load_final, parse_events
+from cross_harness.summarize import load_final, normalize_comparison_path, parse_events, summary_item_text
 
 
 def _uncached_tracked_path(
@@ -216,15 +216,82 @@ def _p3() -> int:
     return 0
 
 
+def _p4() -> int:
+    """Recompute unreported changes for saved runs without modifying artifacts."""
+    runs_root = Path.home() / ".local/state/cross-harness/runs"
+    if not runs_root.is_dir():
+        print(f"run directory not found: {runs_root}")
+        return 1
+
+    checked = 0
+    skipped = 0
+    unreported: list[tuple[str, list[str]]] = []
+    normalization_only = 0
+    for run_dir in sorted(path for path in runs_root.iterdir() if path.is_dir()):
+        summary_path = run_dir / "summary.json"
+        final_path = run_dir / "final.json"
+        if not summary_path.is_file() or not final_path.is_file():
+            skipped += 1
+            continue
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            final = load_final(final_path) or {}
+        except (OSError, json.JSONDecodeError):
+            skipped += 1
+            continue
+        if not isinstance(summary, dict) or not isinstance(final, dict):
+            skipped += 1
+            continue
+        observed_raw = summary.get("changed_files")
+        reported_raw = final.get("changed_files")
+        observed = observed_raw if isinstance(observed_raw, list) else []
+        reported = reported_raw if isinstance(reported_raw, list) else []
+        cwd_value = summary.get("cwd")
+        cwd = cwd_value if isinstance(cwd_value, str) else None
+        reported_text = [summary_item_text(item) for item in reported]
+        raw_reported = set(reported_text)
+        normalized_reported = {
+            normalize_comparison_path(item, cwd) for item in reported_text
+        }
+        detected = [summary_item_text(item) for item in observed]
+        raw_unreported = [item for item in detected if item not in raw_reported]
+        normalized_unreported = [
+            item
+            for item in detected
+            if normalize_comparison_path(item, cwd) not in normalized_reported
+        ]
+        # Normalization may reconcile raw spelling aliases, but must never
+        # create an unreported-change signal.  Compare the two result sets so
+        # this read-only check proves that every final signal was already a
+        # raw mismatch rather than a normalization artifact.
+        normalization_only += sum(
+            item not in raw_unreported for item in normalized_unreported
+        )
+        if normalized_unreported:
+            unreported.append((run_dir.name, normalized_unreported))
+        checked += 1
+
+    for run_name, files in unreported:
+        print(f"P4 unreported_changed_files {run_name}: {', '.join(files)}")
+    print(f"P4 normalization-only unreported detections: {normalization_only}")
+    if normalization_only:
+        print("P4 failed: normalization changed unreported-change detection")
+        return 1
+    print(f"P4 passed: {checked} readable final/summary pairs checked; {skipped} skipped")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--unit", required=True, choices=("p1", "p2", "p3"))
+    parser.add_argument("--unit", required=True, choices=("p1", "p2", "p3", "p4"))
     args = parser.parse_args()
     if args.unit == "p1":
         return _p1()
     if args.unit == "p2":
         return _p2()
-    return _p3()
+    if args.unit == "p3":
+        return _p3()
+    return _p4()
 
 
 if __name__ == "__main__":

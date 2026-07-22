@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib
 import json
+import os
 import re
 
 
@@ -340,6 +341,27 @@ def summary_item_text(value: object) -> str:
         return str(value)
 
 
+def normalize_comparison_path(value: object, cwd: Path | str | None) -> str:
+    """Normalize a reported or observed path solely for path comparison."""
+    text = summary_item_text(value)
+    # ``normpath`` intentionally preserves two leading slashes on POSIX, but
+    # those have no useful distinction in executor-reported worktree paths.
+    normalized = os.path.normpath(re.sub(r"/{2,}", "/", text))
+    if not os.path.isabs(normalized) or cwd is None:
+        return normalized
+    try:
+        # Use the supplied cwd spelling rather than resolving symlinks: Git's
+        # observed paths and an executor's absolute report are both rooted in
+        # that invocation path (for example, /var versus /private/var).
+        cwd_normalized = os.path.abspath(os.path.normpath(str(cwd)))
+        relative = os.path.relpath(normalized, cwd_normalized)
+    except (OSError, ValueError):
+        return normalized
+    if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+        return normalized
+    return relative
+
+
 def _bounded_command_text(command: object, limit: int = 500) -> str:
     text = summary_item_text(command).replace("\n", " ")
     if len(text) <= limit:
@@ -382,6 +404,12 @@ def render_summary(summary: dict, limit: int) -> str:
         lines.append(
             "unverified_changed_files: "
             + ", ".join(summary_item_text(item) for item in unverified_changed_files)
+        )
+    unreported_changed_files = summary.get("unreported_changed_files", [])
+    if unreported_changed_files:
+        lines.append(
+            "unreported_changed_files: "
+            + ", ".join(summary_item_text(item) for item in unreported_changed_files)
         )
     if summary.get("work_completed"):
         lines.append(f"work_completed (executor-reported): {summary['work_completed']}")

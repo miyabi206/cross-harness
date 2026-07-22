@@ -3,7 +3,7 @@ import tempfile
 import unittest
 
 from cross_harness.files import MARKER_START, append_marker, atomic_write, remove_marker
-from cross_harness.summarize import command_matches_check, failure_signature, parse_events, render_summary
+from cross_harness.summarize import command_matches_check, failure_signature, normalize_comparison_path, parse_events, render_summary
 
 
 class FileTests(unittest.TestCase):
@@ -164,6 +164,7 @@ class FileTests(unittest.TestCase):
             "changed_files": [{"z": 1, "a": "file"}, 42],
             "reported_changed_files": ["observed.txt", "reported-only.txt"],
             "unverified_changed_files": ["reported-only.txt"],
+            "unreported_changed_files": ["observed-only.txt"],
             "tests": [{"result": "passed", "command": "uv run pytest -q"}, 7],
             "event_log": "/tmp/run/events.jsonl", "stderr_log": "/tmp/run/stderr.log",
             "final_message": "/tmp/run/final.json",
@@ -174,6 +175,7 @@ class FileTests(unittest.TestCase):
         self.assertIn('changed_files: {"a": "file", "z": 1}, 42', rendered)
         self.assertIn("reported_changed_files: observed.txt, reported-only.txt", rendered)
         self.assertIn("unverified_changed_files: reported-only.txt", rendered)
+        self.assertIn("unreported_changed_files: observed-only.txt", rendered)
         self.assertIn('tests (executor-reported): {"command": "uv run pytest -q", "result": "passed"}; 7', rendered)
         self.assertIn("checks: none declared", rendered)
 
@@ -202,6 +204,13 @@ class FileTests(unittest.TestCase):
 
         self.assertNotIn("work_completed (executor-reported):", render_summary(summary, 10_000))
         self.assertNotIn("unverified_changed_files:", render_summary(summary, 10_000))
+        self.assertNotIn("unreported_changed_files:", render_summary(summary, 10_000))
+
+    def test_comparison_path_normalization_preserves_summary_item_handling(self):
+        cwd = Path("/tmp/project")
+        self.assertEqual("nested/file.txt", normalize_comparison_path("./nested//file.txt", cwd))
+        self.assertEqual("nested/file.txt", normalize_comparison_path("/tmp/project/nested/file.txt", cwd))
+        self.assertEqual("null", normalize_comparison_path(None, cwd))
 
     def test_summary_renders_overage_allowed_notice(self):
         summary = {

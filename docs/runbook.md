@@ -68,6 +68,13 @@ Every run directory contains `task.md`, `command.json`, `events.jsonl`,
 also creates `INTERRUPTED`; an abandoned directory older than one hour is marked
 `ORPHANED` on the next cleanup.
 
+`summary.txt` lists both sides of the executor's changed-file declaration:
+`unverified_changed_files` are files declared by the executor but not observed
+in the worktree diff, while `unreported_changed_files` are observed changes not
+declared by the executor. The latter is a visibility-only warning: it can signal
+an external worktree change during a run or an executor omission, but does not
+alter the run status, block category, or exit code.
+
 For a correctable failure, write only the changed instruction into a new task
 file and resume from the failed run. The normal budget is two retries. When the
 same normalized signature occurs twice, the wrapper performs one escalation

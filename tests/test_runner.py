@@ -391,6 +391,31 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(["reported-only.txt"], summary["unverified_changed_files"])
         self.assertIn("diff_stat", (run / "summary.txt").read_text())
 
+    def test_unreported_changes_are_normalized_without_affecting_unverified_changes(self):
+        (self.repo / "README.md").write_text("before\nafter\n")
+        (self.repo / "new.txt").write_text("new\n")
+        (self.repo / "unreported.txt").write_text("external\n")
+        run = self.root / "unreported-diff-run"
+        run.mkdir()
+        (run / "events.jsonl").write_text('{"type":"turn.completed","usage":{}}\n')
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "changed",
+            "changed_files": [f"{self.repo}//README.md", "./new.txt"],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-terra", "effort": "medium", "output_limit_chars": 8000}
+
+        summary = finalize_run(run, "implementer", role, "implementation", self.repo, 0, 1)
+
+        self.assertEqual("partial", summary["status"])
+        self.assertEqual(["unreported.txt"], summary["unreported_changed_files"])
+        self.assertEqual(
+            [f"{self.repo}//README.md", "./new.txt"],
+            summary["unverified_changed_files"],
+        )
+        self.assertIn("unreported_changed_files: unreported.txt", (run / "summary.txt").read_text())
+
     def test_read_only_role_changes_fail_after_execution(self):
         run = self.root / "read-only-change-run"
         run.mkdir()
@@ -904,10 +929,12 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
 
                 self.assertEqual("unavailable", summary["diff_check"])
                 self.assertEqual([], summary["changed_files"])
+                self.assertEqual([], summary["unreported_changed_files"])
                 self.assertEqual([], summary["diff_summary"])
                 self.assertTrue((run / "summary.txt").exists())
                 self.assertTrue((run / "summary.json").exists())
                 self.assertIn("diff_check: unavailable", (run / "summary.txt").read_text())
+                self.assertNotIn("unreported_changed_files:", (run / "summary.txt").read_text())
                 self.assertEqual(
                     "unavailable",
                     json.loads((run / "summary.json").read_text())["diff_check"],
