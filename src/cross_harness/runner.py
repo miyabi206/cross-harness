@@ -863,7 +863,7 @@ def delegate(
         raise ConfigError(delegation_kind_error(
             kind, role_name, config["delegate_kinds"], role["delegate_kinds"]
         ))
-    if role_name == "security_reviewer" and not confirm_high_risk:
+    if role_name == "security_reviewer" and kind == "security_review" and not confirm_high_risk:
         raise HarnessError("security review requires --confirm-high-risk after explicit human confirmation")
     if not task_file.is_file():
         raise HarnessError(f"task file not found: {task_file}")
@@ -950,7 +950,7 @@ def start_detached_delegate(
         raise ConfigError(delegation_kind_error(
             kind, role_name, config["delegate_kinds"], role["delegate_kinds"]
         ))
-    if role_name == "security_reviewer" and not confirm_high_risk:
+    if role_name == "security_reviewer" and kind == "security_review" and not confirm_high_risk:
         raise HarnessError("security review requires --confirm-high-risk after explicit human confirmation")
     if not task_file.is_file():
         raise HarnessError(f"task file not found: {task_file}")
@@ -1452,7 +1452,23 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
     role_name = state["role"]
     role = dict(config["roles"][role_name])
     if state["status"] == "blocked":
-        raise HarnessError("blocked runs cannot be retried automatically")
+        blocked_category = state.get("blocked_category")
+        if blocked_category == "executor_reported":
+            pass
+        elif blocked_category in {"authentication", "rate_limit"}:
+            raise HarnessError(
+                f"retry refused: {blocked_category} is a safety-policy stop; "
+                "authentication and rate-limit blocks must not be retried"
+            )
+        elif blocked_category in {"dirty_worktree", "missing_isolated_worktree"}:
+            raise HarnessError(
+                f"retry refused: {blocked_category} has no reusable result; "
+                "create a new delegate instead"
+            )
+        else:
+            raise HarnessError(
+                f"retry refused: blocked run category {blocked_category!r} is not eligible for retry"
+            )
     if state["attempts"] > role["retries"]:
         raise HarnessError("normal retry budget exhausted")
     if not task_file.is_file():

@@ -71,8 +71,11 @@ also creates `INTERRUPTED`; an abandoned directory older than one hour is marked
 For a correctable failure, write only the changed instruction into a new task
 file and resume from the failed run. The normal budget is two retries. When the
 same normalized signature occurs twice, the wrapper performs one escalation
-(Luna→Terra→Sol and/or one effort step) and marks `escalated=true`. A blocked
-auth/rate-limit run cannot be resumed automatically.
+(Luna→Terra→Sol and/or one effort step) and marks `escalated=true`. A run whose
+executor explicitly returned `blocked` can be retried. Authentication and
+rate-limit blocks remain safety-policy stops and cannot be resumed. A
+dirty-worktree or missing-isolated-worktree block has no reusable result, so
+create a new delegation instead.
 
 With `dirty_worktree_policy="isolate"`, the wrapper creates a detached Git
 worktree below the run directory and records it in `ISOLATED_WORKTREE`. Review

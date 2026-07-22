@@ -12,7 +12,7 @@ retention_days = 7
 auth_cache_hours = 24
 context_threshold_percent = 70
 max_parallel = 2
-dirty_worktree_policy = "stop"
+dirty_worktree_policy = "allow_delegated"
 delegate_kinds = ["exploration", "implementation", "test", "debug", "review", "security_review"]
 
 # Role settings: each role has harness, model, and effort.
@@ -122,4 +122,4 @@ retries = 0
 timeout_seconds = 3600
 write = false
 output_limit_chars = 10000
-delegate_kinds = ["security_review"]
+delegate_kinds = ["review", "security_review"]

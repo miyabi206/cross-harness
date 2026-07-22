@@ -148,6 +148,22 @@ class RunnerTests(unittest.TestCase):
     @patch("cross_harness.runner.verify_codex_chatgpt")
     @patch("cross_harness.runner.verify_codex_config_ownership")
     @patch("cross_harness.runner._invoke_safe")
+    def test_security_reviewer_review_does_not_require_high_risk_confirmation(
+        self, invoke, ownership, verify
+    ):
+        verify.return_value = (Path("/usr/bin/true"), False)
+        invoke.side_effect = self.fake_invoke
+
+        summary = delegate("security_reviewer", "review", self.task, self.repo, home=self.home)
+
+        self.assertEqual("success", summary["status"])
+        self.assertEqual(1, invoke.call_count)
+        with self.assertRaisesRegex(HarnessError, "requires --confirm-high-risk"):
+            delegate("security_reviewer", "security_review", self.task, self.repo, home=self.home)
+
+    @patch("cross_harness.runner.verify_codex_chatgpt")
+    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner._invoke_safe")
     def test_codex_parent_harness_is_passed_and_recorded(self, invoke, ownership, verify):
         config = self.root / "codex-parent.toml"
         contents = (Path(__file__).resolve().parents[1] / "config/default.toml").read_text()
@@ -178,8 +194,13 @@ class RunnerTests(unittest.TestCase):
     @patch("cross_harness.runner._invoke_safe")
     def test_dirty_worktree_blocks_write_before_codex(self, invoke, ownership, verify):
         (self.repo / "user-change.txt").write_text("mine\n")
+        config = self.root / "stop.toml"
+        contents = (Path(__file__).resolve().parents[1] / "config/default.toml").read_text()
+        config.write_text(contents.replace(
+            'dirty_worktree_policy = "allow_delegated"', 'dirty_worktree_policy = "stop"', 1
+        ))
         with self.assertRaises(DirtyWorktreeError):
-            delegate("implementer", "implementation", self.task, self.repo, home=self.home)
+            delegate("implementer", "implementation", self.task, self.repo, config_path=config, home=self.home)
         invoke.assert_not_called()
         verify.assert_not_called()
         ownership.assert_not_called()
@@ -1312,9 +1333,14 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
             "status": "failed", "model": "gpt-5.6-terra", "effort": "high",
         }))
         (self.repo / "user-change.txt").write_text("mine\n")
+        config = self.root / "retry-stop.toml"
+        contents = (Path(__file__).resolve().parents[1] / "config/default.toml").read_text()
+        config.write_text(contents.replace(
+            'dirty_worktree_policy = "allow_delegated"', 'dirty_worktree_policy = "stop"', 1
+        ))
 
         with self.assertRaises(DirtyWorktreeError):
-            retry(previous, self.task, home=self.home)
+            retry(previous, self.task, config_path=config, home=self.home)
 
         invoke.assert_not_called()
         verify.assert_not_called()
@@ -1396,7 +1422,7 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
     def test_isolated_retry_reuses_failed_run_worktree(self, invoke, ownership, verify):
         config = self.root / "isolate.toml"
         default = (Path(__file__).resolve().parents[1] / "config/default.toml").read_text()
-        config.write_text(default.replace('dirty_worktree_policy = "stop"', 'dirty_worktree_policy = "isolate"', 1))
+        config.write_text(default.replace('dirty_worktree_policy = "allow_delegated"', 'dirty_worktree_policy = "isolate"', 1))
         self.task.write_text("# Goal\nContinue.\n\n# Checks\n- fixture\n")
         (self.repo / "pre-existing.txt").write_text("outside isolated worktree\n")
         verify.return_value = (Path("/usr/bin/true"), False)
@@ -1456,10 +1482,7 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
     @patch("cross_harness.runner.verify_codex_chatgpt")
     @patch("cross_harness.runner.verify_codex_config_ownership")
     @patch("cross_harness.runner._invoke_safe")
-    def test_allow_delegated_retry_accepts_recorded_changes_and_rejects_other_changes(self, invoke, ownership, verify):
-        config = self.root / "allow-delegated.toml"
-        default = (Path(__file__).resolve().parents[1] / "config/default.toml").read_text()
-        config.write_text(default.replace('dirty_worktree_policy = "stop"', 'dirty_worktree_policy = "allow_delegated"', 1))
+    def test_default_allow_delegated_accepts_recorded_changes_and_rejects_other_changes(self, invoke, ownership, verify):
         self.task.write_text("# Goal\nMake a delegated change.\n\n# Checks\n- fixture\n")
         verify.return_value = (Path("/usr/bin/true"), False)
 
@@ -1478,19 +1501,65 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
             return 0
 
         invoke.side_effect = complete
-        first = delegate("implementer", "implementation", self.task, self.repo, config_path=config, home=self.home)
+        first = delegate("implementer", "implementation", self.task, self.repo, home=self.home)
         runtime_root = self.home / ".local/state/cross-harness"
         records = json.loads((runtime_root / "delegated-changes.json").read_text())
         self.assertIn("delegated.txt", records[str(self.repo.resolve())])
 
-        summary = retry(Path(first["run_dir"]), self.task, config_path=config, home=self.home)
+        second = delegate("implementer", "implementation", self.task, self.repo, home=self.home)
+        self.assertEqual("success", second["status"])
+        summary = retry(Path(first["run_dir"]), self.task, home=self.home)
         self.assertEqual("success", summary["status"])
-        self.assertEqual(2, invoke.call_count)
+        self.assertEqual(3, invoke.call_count)
 
         (self.repo / "user-change.txt").write_text("mine\n")
         with self.assertRaises(DirtyWorktreeError):
-            retry(Path(summary["run_dir"]), self.task, config_path=config, home=self.home)
-        self.assertEqual(2, invoke.call_count)
+            delegate("implementer", "implementation", self.task, self.repo, home=self.home)
+        self.assertEqual(3, invoke.call_count)
+
+    @patch("cross_harness.runner.verify_claude_subscription")
+    @patch("cross_harness.runner.verify_claude_config_ownership")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_retry_allows_executor_reported_block(self, invoke, ownership, verify):
+        run = self.root / "executor-reported-block"
+        run.mkdir()
+        (run / "events.jsonl").write_text("")
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "blocked", "work_completed": "", "changed_files": [],
+            "tests": [], "error": "needs revised instructions", "next_decision": None,
+        }))
+        role = default_config()["roles"]["tester"]
+        finalize_run(run, "tester", role, "test", self.repo, 1, 0)
+        state = json.loads((run / "state.json").read_text())
+        self.assertEqual("executor_reported", state["blocked_category"])
+        verify.return_value = (Path("/usr/bin/true"), False)
+        invoke.side_effect = self._successful_retry
+
+        summary = retry(run, self.task, home=self.home)
+
+        self.assertEqual("partial", summary["status"])
+        self.assertEqual(1, invoke.call_count)
+
+    def test_retry_refuses_safety_and_nonreusable_block_categories(self):
+        cases = (
+            ("authentication", "safety-policy stop"),
+            ("rate_limit", "safety-policy stop"),
+            ("dirty_worktree", "create a new delegate"),
+            ("missing_isolated_worktree", "create a new delegate"),
+        )
+        for category, message in cases:
+            with self.subTest(category=category):
+                run = self.root / f"{category}-block"
+                run.mkdir()
+                (run / "state.json").write_text(json.dumps({
+                    "role": "tester", "kind": "test", "cwd": str(self.repo),
+                    "thread_id": "session-1", "attempts": 0, "signatures": [], "escalated": False,
+                    "status": "blocked", "blocked_category": category,
+                }))
+
+                with self.assertRaisesRegex(HarnessError, message):
+                    retry(run, self.task, home=self.home)
 
     def test_finalize_records_only_run_delta_and_unchanged_trusted_changes(self):
         runtime_root = self.root / "explicit-runtime"
@@ -1663,7 +1732,7 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
                 self.assertEqual("blocked", summary["status"])
                 state = json.loads((run / "state.json").read_text())
                 self.assertEqual(category, state["blocked_category"])
-                with self.assertRaisesRegex(HarnessError, "blocked runs cannot be retried"):
+                with self.assertRaisesRegex(HarnessError, "safety-policy stop"):
                     retry(run, self.task, home=self.home)
 
     def test_rejected_overage_allowed_notice_does_not_block_completed_run(self):
@@ -1732,7 +1801,7 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
     def test_isolation_policy_preserves_dirty_original(self, invoke, ownership, verify):
         config = self.root / "isolate.toml"
         default = (Path(__file__).resolve().parents[1] / "config/default.toml").read_text()
-        config.write_text(default.replace('dirty_worktree_policy = "stop"', 'dirty_worktree_policy = "isolate"', 1))
+        config.write_text(default.replace('dirty_worktree_policy = "allow_delegated"', 'dirty_worktree_policy = "isolate"', 1))
         (self.repo / "user-change.txt").write_text("mine\n")
         verify.return_value = (Path("/usr/bin/true"), False)
         invoke.side_effect = self.fake_invoke

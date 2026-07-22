@@ -24,6 +24,11 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn("planner", config["roles"])
         self.assertEqual(DELEGATE_KINDS, ROLE_DELEGATE_KINDS)
         self.assertEqual(70, config["context_threshold_percent"])
+        self.assertEqual("allow_delegated", config["dirty_worktree_policy"])
+        self.assertEqual(
+            ["review", "security_review"],
+            config["roles"]["security_reviewer"]["delegate_kinds"],
+        )
 
     def test_planning_is_not_a_supported_role_delegate_kind(self):
         config = copy.deepcopy(default_config())

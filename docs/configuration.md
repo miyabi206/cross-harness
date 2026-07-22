@@ -22,12 +22,12 @@ sandbox. The most specific matching project path wins.
 
 ## Dirty worktrees
 
-`dirty_worktree_policy` defaults to `"stop"`, which blocks write roles when
-the repository has uncommitted changes. `"isolate"` runs the write role in a
-detached worktree instead. `"allow_delegated"` is an explicit opt-in that
-permits only unchanged dirty files recorded by a previous write delegation;
-any unrecorded, deleted, un-fingerprintable, or modified file still blocks the
-run. It may be set globally or in a project override. Do not edit the working
+`dirty_worktree_policy` defaults to `"allow_delegated"`, which permits a write
+role to continue only when every dirty file is unchanged and recorded by a
+previous write delegation. `"stop"` blocks write roles when the repository has
+uncommitted changes, and `"isolate"` runs the write role in a detached worktree
+instead. Any unrecorded, deleted, un-fingerprintable, or modified file still
+blocks the run. It may be set globally or in a project override. Do not edit the working
 tree while a delegated write run is executing: a concurrent user edit can be
 observed as that run's delta and recorded as delegated, so this policy depends
 on that operational discipline.
@@ -42,13 +42,18 @@ reviewer, debugger, and security_reviewer.
 The checked-in defaults implement plan section 6. Codex uses the explicit
 model IDs `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`; Claude uses the
 personal aliases from the plan. Change these only in the personal file.
+The read-only `security_reviewer` may perform a `review` without high-risk
+confirmation; `security_review` still requires `--confirm-high-risk`.
 
 ## Fallback and escalation
 
 Fallback stays inside the same subscription harness. Rate limits never trigger
 fallback. Retries are capped at two; two identical failure signatures stop the
 normal retry loop and permit one explicit escalation. There is no API-provider
-fallback.
+fallback. A run explicitly blocked by its executor (`blocked_category` of
+`executor_reported`) may be retried. Authentication and rate-limit blocks are
+safety-policy stops and cannot be retried. Dirty-worktree and missing-isolated-
+worktree blocks have no reusable result; create a new delegation instead.
 
 ## Context and retention
 
