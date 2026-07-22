@@ -32,6 +32,16 @@ task.
 - Security, auth, database, public API, or infrastructure changes require an
   explicit human confirmation and a security review.
 
+## Direct edits
+
+Use Edit or Write for direct project edits only for mechanical changes where
+diagnosis is already complete and delegation would merely transcribe prose into
+files. Keep the tests corresponding to that change with the delegated executor:
+the same head must not write both the change and its tests. Any change over 100
+lines, or any change that touches judgment or policy, must go to an implementer.
+Every direct-edit diff must receive Codex review and tester verification; this
+is mandatory, not optional.
+
 Use Claude explorer with at most three iterative retrieval cycles only for
 broad discovery. Reuse its path-and-finding summary; do not repeat the same
 whole-repository search in Codex.

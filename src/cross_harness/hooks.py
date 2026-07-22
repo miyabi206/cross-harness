@@ -126,8 +126,25 @@ def _mode_is_off(config: dict, data: dict | None) -> bool:
         return False
 
 
-def _orchestrator_write_path_is_allowed(file_path: str | None) -> bool:
-    """Allow only Claude's plan and per-project memory files for orchestration."""
+def _git_root_from_cwd(cwd: Path | None) -> Path | None:
+    """Find the Git root by walking ancestors from an already-resolved cwd."""
+    if cwd is None:
+        return None
+    try:
+        current = cwd
+        while True:
+            if (current / ".git").exists():
+                return current
+            parent = current.parent
+            if parent == current:
+                return None
+            current = parent
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _orchestrator_write_path_is_allowed(file_path: str | None, cwd: Path | None) -> bool:
+    """Allow Claude metadata and mechanical edits inside the cwd's Git worktree."""
     if file_path is None:
         return False
     try:
@@ -139,8 +156,15 @@ def _orchestrator_write_path_is_allowed(file_path: str | None) -> bool:
         projects = (claude_root / "projects").resolve()
         if not projects.is_relative_to(claude_root):
             return False
-        relative = target.relative_to(projects)
-        return len(relative.parts) >= 2 and relative.parts[1] == "memory"
+        if target.is_relative_to(projects):
+            relative = target.relative_to(projects)
+            if len(relative.parts) >= 2 and relative.parts[1] == "memory":
+                return True
+
+        git_root = _git_root_from_cwd(cwd)
+        if git_root is None or not target.is_relative_to(git_root):
+            return False
+        return not target.is_relative_to(git_root / ".git")
     except (OSError, RuntimeError, ValueError, TypeError):
         return False
 
@@ -225,7 +249,7 @@ def claude_pre_tool_use() -> int:
                 return 0
         except (OSError, RuntimeError, ValueError, TypeError, ConfigError):
             pass
-        if _orchestrator_write_path_is_allowed(_file_path(data)):
+        if _orchestrator_write_path_is_allowed(_file_path(data), _cwd(data)):
             return 0
         return _deny("cross-harness: Claude is the orchestrator; delegate project edits through cross-harness")
     wrapper_arguments = _installed_wrapper_arguments(command)

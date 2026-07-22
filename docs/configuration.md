@@ -45,6 +45,16 @@ personal aliases from the plan. Change these only in the personal file.
 The read-only `security_reviewer` may perform a `review` without high-risk
 confirmation; `security_review` still requires `--confirm-high-risk`.
 
+## Orchestrator direct-edit scope
+
+Claude's orchestrator hook permits `Edit` and `Write` under the Git repository
+root resolved by walking upward from the hook's absolute, existing `cwd`. It
+fails closed when that `cwd` is invalid or no Git root is found, resolves target
+paths before checking them to prevent symlink escapes, and never permits paths
+under the repository's `.git` directory. Claude plan files and per-project
+memory files under `~/.claude` remain permitted. This does not alter the
+read-only tools or the write scope of delegated executors.
+
 ## Fallback and escalation
 
 Fallback stays inside the same subscription harness. Rate limits never trigger

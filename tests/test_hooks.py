@@ -96,6 +96,62 @@ class HookTests(unittest.TestCase):
                         payload = json.dumps({"tool_name": tool_name, "tool_input": {"file_path": str(target)}})
                         self.assertEqual(0, self._run(claude_pre_tool_use, payload)[0], payload)
 
+    def test_orchestrator_can_write_within_git_root_from_cwd_but_not_git_metadata(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            nested = repo / "src" / "package"
+            external = root / "external"
+            nested.mkdir(parents=True)
+            (repo / ".git").mkdir()
+            external.mkdir()
+            (repo / "linked-external").symlink_to(external, target_is_directory=True)
+            paths = user_paths(home)
+            allowed = repo / "src" / "module.py"
+            rejected = (
+                repo / ".git",
+                repo / ".git" / "config",
+                repo / "linked-external" / "module.py",
+            )
+            with patch("cross_harness.hooks.user_paths", return_value=paths):
+                for tool_name in ("Edit", "Write"):
+                    payload = json.dumps({
+                        "cwd": str(nested),
+                        "tool_name": tool_name,
+                        "tool_input": {"file_path": str(allowed)},
+                    })
+                    self.assertEqual(0, self._run(claude_pre_tool_use, payload)[0], payload)
+                    for target in rejected:
+                        payload = json.dumps({
+                            "cwd": str(nested),
+                            "tool_name": tool_name,
+                            "tool_input": {"file_path": str(target)},
+                        })
+                        code, message = self._run(claude_pre_tool_use, payload)
+                        self.assertEqual(2, code, payload)
+                        self.assertIn("orchestrator", message, payload)
+
+    def test_orchestrator_git_root_write_scope_fails_closed_without_valid_repository_cwd(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            not_a_repo = root / "not-a-repo"
+            not_a_repo.mkdir()
+            paths = user_paths(home)
+            invalid_cwds = (None, "relative/path", str(root / "missing"), str(not_a_repo))
+            with patch("cross_harness.hooks.user_paths", return_value=paths):
+                for cwd in invalid_cwds:
+                    request = {
+                        "tool_name": "Write",
+                        "tool_input": {"file_path": str(not_a_repo / "module.py")},
+                    }
+                    if cwd is not None:
+                        request["cwd"] = cwd
+                    code, message = self._run(claude_pre_tool_use, json.dumps(request))
+                    self.assertEqual(2, code, request)
+                    self.assertIn("orchestrator", message, request)
+
     def test_orchestrator_rejects_all_other_edit_write_paths_and_path_bypasses(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

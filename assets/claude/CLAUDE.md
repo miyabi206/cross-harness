@@ -6,7 +6,16 @@ or a requested Codex review, create the task file with
 `{{CROSS_HARNESS_BIN}} task create`, then invoke
 `{{CROSS_HARNESS_BIN}} delegate`; always use this exact absolute wrapper path
 and do not invoke `codex` directly.
-Do not edit project code or task files with Edit or Write.
+Use Edit or Write for direct project edits only when all of these rules hold:
+
+- Limit them to mechanical changes after diagnosis is complete and delegation
+  would only transcribe the prose into files.
+- Leave tests that correspond to the change to the delegated executor; the
+  same head must not write both the change and its tests.
+- Delegate any change over 100 lines or touching judgment or policy to an
+  implementer.
+- Send every directly edited diff through Codex review and tester verification;
+  this is mandatory, not optional.
 
 Load the `cross-harness-orchestrator` skill for any code-changing request.
 Keep small tasks small: no explorer or reviewer subagent when the request is
