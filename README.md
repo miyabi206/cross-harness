@@ -77,6 +77,29 @@ stderr, the structured final response, diff statistics, and retry state stay in
 `~/.local/state/cross-harness/runs/<run-id>/`. A correction uses a delta-only
 task file with `~/.local/bin/cross-harness retry --run-dir ... --task-file ...`.
 
+## Watch delegated runs
+
+Follow delegated progress from another terminal with:
+
+```sh
+cross-harness watch
+```
+
+For watch details, see [the runbook](docs/runbook.md).
+
+Optional project setup is for VS Code users. Run it once for each repository
+where you want to use it:
+
+```sh
+cross-harness project setup --cwd /path/to/repository
+```
+
+This adds a task to the repository's `.vscode/tasks.json`. It starts only when
+VS Code opens that folder, and VS Code must allow automatic tasks for the
+folder. Remove it with `cross-harness project remove --cwd /path/to/repository`.
+Use `--dry-run` with either command to inspect the planned change without
+writing files.
+
 ## Change role settings
 
 Edit `~/.config/cross-harness/config.toml`. The repository's

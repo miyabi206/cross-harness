@@ -15,6 +15,7 @@ from .installer import install, uninstall
 from .inventory import create_backup, inventory
 from .maintenance import cleanup
 from .paths import source_root, user_paths
+from .project import remove as remove_project, setup as setup_project
 from .runner import delegate, retry, start_detached_delegate, wait_for_run
 from .taskfile import create_task_file
 from .trust import confirm_codex_hook
@@ -98,6 +99,17 @@ def parser() -> argparse.ArgumentParser:
     trust_commands = trust_parser.add_subparsers(dest="trust_command", required=True)
     trust_codex_hook = trust_commands.add_parser("codex-hook", help="record review of the current Codex hook definition")
     trust_codex_hook.add_argument("--confirmed-after-review", action="store_true")
+
+    project_parser = commands.add_parser("project", help="manage project-local VS Code integration")
+    project_commands = project_parser.add_subparsers(dest="project_command", required=True)
+    project_setup = project_commands.add_parser("setup", help="add the folder-open watch task")
+    project_setup.add_argument("--cwd", required=True, type=Path)
+    project_setup.add_argument("--config", type=Path)
+    project_setup.add_argument("--dry-run", action="store_true")
+    project_remove = project_commands.add_parser("remove", help="remove the folder-open watch task")
+    project_remove.add_argument("--cwd", required=True, type=Path)
+    project_remove.add_argument("--config", type=Path)
+    project_remove.add_argument("--dry-run", action="store_true")
 
     benchmark_parser = commands.add_parser("benchmark", help="validate and summarize a 5x2 benchmark")
     benchmark_parser.add_argument("--input", required=True, type=Path)
@@ -209,6 +221,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "trust":
             if args.trust_command == "codex-hook":
                 print(confirm_codex_hook(home, confirmed_after_review=args.confirmed_after_review))
+        elif args.command == "project":
+            actions = (
+                setup_project(args.cwd, args.config, home, args.dry_run)
+                if args.project_command == "setup"
+                else remove_project(args.cwd, args.config, home, args.dry_run)
+            )
+            for action in actions:
+                print(action)
         elif args.command == "benchmark":
             report = render_benchmark(load_records(args.input))
             atomic_write(args.output, report, 0o644)

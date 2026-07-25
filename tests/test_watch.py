@@ -54,11 +54,18 @@ class WatchTests(unittest.TestCase):
 
     def test_formats_only_safe_event_details(self):
         command = "python " + "x" * 200
+        started = format_event(Path("run"), {
+            "type": "item.started",
+            "item": {"type": "command_execution", "command": command},
+        })
+        self.assertNotIn("…", started)
+        self.assertEqual(command, started.removeprefix("  ⏺ Bash   ").replace("\n" + " " * 11, ""))
+        self.assertTrue(all(len(line) <= 100 for line in started.splitlines()))
         line = format_event(Path("run"), {
             "type": "item.completed",
-            "item": {"type": "command_execution", "command": command, "exit_code": 7, "aggregated_output": "secret"},
+            "item": {"type": "command_execution", "command": command, "exit_code": 7, "aggregated_output": "command failed"},
         })
-        self.assertEqual("  ⏺ Bash   python " + "x" * 112 + "…\n  ⎿ exit 7", line)
+        self.assertEqual("  ⎿ command failed\n  ⎿ exit 7", line)
         change = format_event(Path("run"), {
             "type": "item.completed",
             "item": {"type": "file_change", "changes": [{"kind": "modified", "path": "src/a.py"}]},
@@ -76,7 +83,8 @@ class WatchTests(unittest.TestCase):
             ]},
         })
         self.assertEqual(
-            "  ⏺ Bash   uv run pytest " + "x" * 105 + "…\n  ⏺ Edit   src/a.py\n  ⏺ Write  tests/test_a.py",
+            "  ⏺ Bash   uv run pytest \n           " + "x" * 89 + "\n           " + "x" * 89 + "\n           " + "x" * 22
+            + "\n  ⏺ Edit   src/a.py\n  ⏺ Write  tests/test_a.py",
             tool_use,
         )
         tool_result = format_event(Path("run"), {
@@ -111,8 +119,12 @@ class WatchTests(unittest.TestCase):
 
     def test_describe_codex_event_variants(self):
         self.assertEqual(
-            (EventLine("⏺", "Bash", "echo hi"), EventLine("⎿", detail="exit 0", tone="dim")),
-            describe_event({"type": "item.completed", "item": {"type": "command_execution", "command": "echo hi", "exit_code": 0}}),
+            (EventLine("⏺", "Bash", "echo hi", wrap=True),),
+            describe_event({"type": "item.started", "item": {"type": "command_execution", "command": "echo hi"}}),
+        )
+        self.assertEqual(
+            (EventLine("⎿", detail="one", wrap=True), EventLine("⎿", detail="two", wrap=True), EventLine("⎿", detail="exit 0", tone="dim")),
+            describe_event({"type": "item.completed", "item": {"type": "command_execution", "command": "echo hi", "aggregated_output": "one\ntwo", "exit_code": 0}}),
         )
         self.assertEqual(
             (EventLine("⏺", "Search", "cross harness"),),
@@ -137,13 +149,13 @@ class WatchTests(unittest.TestCase):
         self.assertEqual([], render_lines(describe_event(event)))
         self.assertEqual(["  · system"], render_lines(describe_event(event), show_all=True))
 
-    def test_sensitive_payloads_never_render_even_with_all(self):
+    def test_command_output_is_visible_but_sensitive_payloads_never_render_even_with_all(self):
         events = [
             {"type": "item.completed", "item": {"type": "command_execution", "command": "echo safe", "aggregated_output": "AGGREGATED_SECRET"}},
             {"type": "user", "message": {"content": [{"type": "tool_result", "content": "TOOL_RESULT_SECRET"}]}},
         ]
         output = "\n".join(line for event in events for line in render_lines(describe_event(event), show_all=True))
-        self.assertNotIn("AGGREGATED_SECRET", output)
+        self.assertIn("AGGREGATED_SECRET", output)
         self.assertNotIn("TOOL_RESULT_SECRET", output)
         watcher = RunWatcher(self.runs, show_all=True)
         watcher.poll()
@@ -153,6 +165,35 @@ class WatchTests(unittest.TestCase):
         output = "\n".join(watcher.poll())
         self.assertNotIn("STATE_SECRET", output)
         self.assertNotIn("BLOCKED_SECRET", output)
+
+    def test_command_output_shows_last_ten_lines_and_strips_terminal_controls(self):
+        output = "\n".join(f"line {number}" for number in range(12)) + "\n\x1b[31mred\x1b[0m"
+        lines = render_lines(describe_event({
+            "type": "item.completed",
+            "item": {"type": "command_execution", "aggregated_output": output, "exit_code": 1},
+        }))
+        self.assertEqual("  ⎿ … (3 lines omitted)", lines[0])
+        self.assertEqual("  ⎿ line 3", lines[1])
+        self.assertEqual("  ⎿ red", lines[-2])
+        self.assertEqual("  ⎿ exit 1", lines[-1])
+        self.assertNotIn("\x1b", "\n".join(lines))
+
+    def test_command_output_json_is_rendered_without_delegation_summary(self):
+        output = '{"status": "ok", "uptime": 42}'
+        lines = render_lines(describe_event({
+            "type": "item.completed",
+            "item": {"type": "command_execution", "command": "cat health.json", "aggregated_output": output, "exit_code": 0},
+        }))
+        self.assertEqual([f"  ⎿ {output}", "  ⎿ exit 0"], lines)
+
+    def test_empty_command_output_does_not_render_output_lines(self):
+        self.assertEqual(
+            ["  ⎿ exit 0"],
+            render_lines(describe_event({
+                "type": "item.completed",
+                "item": {"type": "command_execution", "aggregated_output": " \n\t ", "exit_code": 0},
+            })),
+        )
 
     def test_color_controls_and_non_tty_default(self):
         line = (EventLine("✔", detail="success", tone="green"),)

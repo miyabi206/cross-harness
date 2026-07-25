@@ -26,6 +26,31 @@ cross-harness watch
 Use `cross-harness watch --all` to include lifecycle events. Stop watching with
 Ctrl-C; it does not stop the delegated run.
 
+For Codex command executions, watch shows the complete command when it starts,
+wrapping it to the terminal width. When the command completes, it shows the
+last 10 lines of its aggregated output, an omitted-line count when applicable,
+and its exit code. ANSI escapes and control characters are removed before this
+output is rendered.
+
+Watch output is written only to the terminal and is not added to the
+orchestrator context. The complete raw event log is in the run directory's
+`events.jsonl`. `aggregated_output` from Codex `command_execution` events is
+shown, but Claude `tool_result` bodies and error text from `state.json` are not
+shown, even with `--all`.
+
+To start this watcher automatically when VS Code opens a repository folder,
+run the following once for each repository:
+
+```sh
+cross-harness project setup --cwd /path/to/repository
+```
+
+This adds the folder-open task to that repository's `.vscode/tasks.json`; it
+does not run merely because VS Code starts. VS Code must be configured to allow
+automatic tasks for the folder. Remove the repository-local task with
+`cross-harness project remove --cwd /path/to/repository`. Use `--dry-run` with
+either command to see the planned change without writing files.
+
 Run `cross-harness doctor` after either CLI upgrades, authentication changes,
 hook changes, or a reinstall. Run `cross-harness cleanup` when stale run
 directories need immediate maintenance; SessionStart also invokes it.

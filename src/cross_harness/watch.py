@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Iterable, TextIO
 import json
 import os
+import re
 import shutil
 import textwrap
 import time
@@ -15,7 +16,7 @@ from .paths import user_paths
 
 
 _VERDICTS = {"success", "failed", "blocked", "partial"}
-_COMMAND_LIMIT = 120
+_DETAIL_LIMIT = 120
 _DEFAULT_WIDTH = 100
 _RESET = "\033[0m"
 _BOLD = "\033[1m"
@@ -38,11 +39,40 @@ class EventLine:
     wrap: bool = False
 
 
-def _short_command(value: object) -> str:
-    command = " ".join(str(value or "").split())
-    if len(command) <= _COMMAND_LIMIT:
-        return command
-    return command[: _COMMAND_LIMIT - 1] + "…"
+_ANSI_ESCAPE = re.compile(
+    r"\x1B(?:[@-_][0-?]*[ -/]*[@-~]|\][^\x1B\x07]*(?:\x07|\x1B\\)|[\x00-\x7F])"
+)
+
+
+def _safe_text(value: object, *, collapse_whitespace: bool = False) -> str:
+    """Remove terminal controls from an allow-listed string value."""
+    text = _ANSI_ESCAPE.sub("", str(value or ""))
+    text = "".join(char for char in text if char == "\n" or unicodedata.category(char) != "Cc")
+    return " ".join(text.split()) if collapse_whitespace else text
+
+
+def _command(value: object) -> str:
+    return _safe_text(value, collapse_whitespace=True)
+
+
+def _short_detail(value: object) -> str:
+    detail = _command(value)
+    if len(detail) <= _DETAIL_LIMIT:
+        return detail
+    return detail[: _DETAIL_LIMIT - 1] + "…"
+
+
+def _command_output(value: object) -> tuple[EventLine, ...]:
+    output = _safe_text(value)
+    if not output.strip():
+        return ()
+    lines = output.splitlines()
+    omitted = max(0, len(lines) - 10)
+    rendered: list[EventLine] = []
+    if omitted:
+        rendered.append(EventLine("⎿", detail=f"… ({omitted} lines omitted)", tone="dim", wrap=True))
+    rendered.extend(EventLine("⎿", detail=line, wrap=True) for line in lines[-10:])
+    return tuple(rendered)
 
 
 def _usage_line(usage: object) -> EventLine:
@@ -73,14 +103,14 @@ def _error_text(event: dict) -> str:
 
 def _claude_tool_target(name: str, inputs: dict) -> str:
     if name == "Bash":
-        return _short_command(inputs.get("command"))
+        return _command(inputs.get("command"))
     if name in {"Read", "Edit", "Write"}:
         value = inputs.get("file_path")
     elif name in {"Grep", "Glob"}:
         value = inputs.get("pattern")
     else:
         return ""
-    return _short_command(value) if isinstance(value, str) else ""
+    return _short_detail(value) if isinstance(value, str) else ""
 
 
 def _codex_change_label(kind: object) -> str:
@@ -120,7 +150,12 @@ def describe_event(event: dict) -> tuple[EventLine, ...]:
                 lines.append(EventLine("›", detail=block["text"], wrap=True))
             elif block_type == "tool_use" and isinstance(block.get("name"), str):
                 inputs = block.get("input") if isinstance(block.get("input"), dict) else {}
-                lines.append(EventLine("⏺", label=block["name"], detail=_claude_tool_target(block["name"], inputs)))
+                lines.append(EventLine(
+                    "⏺",
+                    label=block["name"],
+                    detail=_claude_tool_target(block["name"], inputs),
+                    wrap=block["name"] == "Bash",
+                ))
             elif block_type == "thinking":
                 lines.append(EventLine("·", detail="thinking", noise=True))
         return tuple(lines) or _noise("assistant")
@@ -156,27 +191,29 @@ def describe_event(event: dict) -> tuple[EventLine, ...]:
     if event_type.startswith("item."):
         item = event.get("item") if isinstance(event.get("item"), dict) else {}
         item_type = item.get("type")
+        if event_type == "item.started" and item_type == "command_execution":
+            return (EventLine("⏺", label="Bash", detail=_command(item.get("command")), wrap=True),)
         if event_type != "item.completed":
             return _noise("item.started" if event_type == "item.started" else "item")
         if item_type == "command_execution":
-            lines = [EventLine("⏺", label="Bash", detail=_short_command(item.get("command")))]
+            lines = list(_command_output(item.get("aggregated_output")))
             if isinstance(item.get("exit_code"), int) and not isinstance(item.get("exit_code"), bool):
                 code = item["exit_code"]
                 lines.append(EventLine("⎿", detail=f"exit {code}", tone="dim" if code == 0 else "red"))
-            return tuple(lines)
+            return tuple(lines) or _noise("command_execution")
         if item_type == "file_change":
             changes = item.get("changes")
             if not isinstance(changes, list):
                 return _noise("file_change")
             return tuple(
-                EventLine("⏺", label=_codex_change_label(change.get("kind")), detail=_short_command(change["path"]))
+                EventLine("⏺", label=_codex_change_label(change.get("kind")), detail=_short_detail(change["path"]))
                 for change in changes
                 if isinstance(change, dict) and isinstance(change.get("path"), str)
             ) or _noise("file_change")
         if item_type == "agent_message" and isinstance(item.get("text"), str):
             return (EventLine("›", detail=item["text"], wrap=True),)
         if item_type == "web_search" and isinstance(item.get("query"), str):
-            return (EventLine("⏺", label="Search", detail=_short_command(item["query"])),)
+            return (EventLine("⏺", label="Search", detail=_short_detail(item["query"])),)
         return _noise("item.completed")
 
     if event_type in {"thread.started", "turn.started", "system"}:
@@ -203,18 +240,19 @@ def _render_one(line: EventLine, *, width: int, color: bool) -> list[str]:
     raw_prefix = f"  {line.marker} " + (f"{line.label:<7}" if line.label else "")
     available = max(1, width - len(raw_prefix))
     body = line.detail
-    try:
-        payload = json.loads(body)
-        if isinstance(payload, dict) and "status" in payload:
-            status = payload["status"]
-            changed_files = payload.get("changed_files")
-            tests = payload.get("tests")
-            changed_count = len(changed_files) if isinstance(changed_files, list) else 0
-            test_count = len(tests) if isinstance(tests, list) else 0
-            rendered_status = status if isinstance(status, str) and status in _VERDICTS else "unknown"
-            body = f"status={rendered_status} · changed_files={changed_count} · tests={test_count}"
-    except (TypeError, json.JSONDecodeError):
-        pass
+    if line.marker == "›":
+        try:
+            payload = json.loads(body)
+            if isinstance(payload, dict) and "status" in payload:
+                status = payload["status"]
+                changed_files = payload.get("changed_files")
+                tests = payload.get("tests")
+                changed_count = len(changed_files) if isinstance(changed_files, list) else 0
+                test_count = len(tests) if isinstance(tests, list) else 0
+                rendered_status = status if isinstance(status, str) and status in _VERDICTS else "unknown"
+                body = f"status={rendered_status} · changed_files={changed_count} · tests={test_count}"
+        except (TypeError, json.JSONDecodeError):
+            pass
 
     def display_width(value: str) -> int:
         return sum(
