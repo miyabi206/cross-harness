@@ -95,8 +95,7 @@ and `max`.
 Codex role changes apply to the next `delegate`. Claude role changes require a
 new Claude session, because its session-start hook synchronizes
 `~/.claude/agents/cross-harness-*.md`. `orchestrator` is the session itself,
-and `planner` has neither an agent definition nor a delegation path, so their
-`model` and `effort` settings currently have no effect.
+so its `model` and `effort` settings currently have no effect.
 
 Check the configuration with:
 

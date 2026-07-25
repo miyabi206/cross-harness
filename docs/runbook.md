@@ -102,6 +102,11 @@ rate-limit blocks remain safety-policy stops and cannot be resumed. A
 dirty-worktree or missing-isolated-worktree block has no reusable result, so
 create a new delegation instead.
 
+By default, `dirty_worktree_policy="allow_delegated"` lets a write role
+continue in a dirty worktree only when every dirty file was recorded by a prior
+write delegation and has not changed since. Otherwise, the wrapper stops the
+write role so the worktree can be reviewed before continuing.
+
 With `dirty_worktree_policy="isolate"`, the wrapper creates a detached Git
 worktree below the run directory and records it in `ISOLATED_WORKTREE`. Review
 and transfer its commit or patch explicitly. Cleanup does not remove a retained

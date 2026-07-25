@@ -5,6 +5,8 @@ It is validated before every delegation. Missing values, unknown keys, invalid
 enums, and unsafe limits fail closed. The machine-readable structural contract
 is in `schema/harness.schema.json`; the executable validation is implemented in
 `cross_harness.config` because the source format is TOML.
+`tests/test_schema_contract.py` checks that the schema and executable validation
+remain aligned.
 
 ## Ownership
 
@@ -16,9 +18,9 @@ is in `schema/harness.schema.json`; the executable validation is implemented in
   recursion guard, secret-file exclusion, and prohibition of
   `danger-full-access`.
 
-`projects."/absolute/path"` may set only `checks`, `delegate_kinds`, and
-`dirty_worktree_policy`. It cannot select a model, authentication method, or
-sandbox. The most specific matching project path wins.
+`projects."/absolute/path"` may set only `checks`, `delegate_kinds`,
+`dirty_worktree_policy`, and `mode`. It cannot select a model, authentication
+method, or sandbox. The most specific matching project path wins.
 
 ## Dirty worktrees
 
@@ -32,6 +34,12 @@ globally or in a project override. Do not edit the working tree while a
 delegated write run is executing: a concurrent user edit can be observed as
 that run's delta and recorded as delegated, so this policy depends on that
 operational discipline.
+
+## Enforcement mode
+
+`mode` is `"on"` or `"off"` and defaults fail closed to `"on"`. It may be set
+globally or in a project override, where the project value takes precedence.
+`"off"` disables enforcement; set a project value to `"on"` to opt back in.
 
 ## Roles
 

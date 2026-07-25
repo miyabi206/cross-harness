@@ -5,7 +5,7 @@
 | T01 | inventory and credential-excluding backup engine | **Pass:** live inventory plus `.local/backups/T01-pre-install/` manifest exist |
 | T02 | independent Codex CLI prerequisite and live smoke | **Pass:** npm Codex 0.144.5, ChatGPT auth, synthetic read-only run |
 | T03 | installer, manifest backup, dry-run, exact/surgical uninstall | **Pass:** temporary-HOME tests and live rollback/reinstall; Codex-added settings preserved |
-| T04 | default TOML, schema, strict executable validator | **Pass:** all eight roles and unknown/missing/enum/range/ownership tests |
+| T04 | default TOML, schema, strict executable validator | **Pass:** all seven roles and unknown/missing/enum/range/ownership tests |
 | T05 | fail-closed delegation core | **Pass:** auth/provider/API-key/dirty-tree guards plus live read/write delegation |
 | T06 | per-run raw artifacts, bounded deterministic summary, cleanup | **Pass:** output/baseline/retention/orphan tests and live artifacts |
 | T07 | resume budget, normalized signatures, one escalation, auth/rate stop | **Pass:** retry/escalation/timeout/blocked-state tests |
