@@ -13,7 +13,7 @@ import cross_harness.runner as runner
 from cross_harness.errors import AuthError, DirtyWorktreeError, HarnessError, SupervisorDiedError
 from cross_harness.files import sha256
 from cross_harness.config import default_config
-from cross_harness.runner import _claude_command, _claude_sandbox_profile, _codex_command, _contain_claude_write_command, _escalated_role, _filtered_executor_stderr, _invoke_safe, _self_reversions, _tee, _write_baseline, _write_claude_final_from_events, delegate, retry, start_detached_delegate, wait_for_run
+from cross_harness.runner import CLAUDE_EXECUTOR_CHARTER, CODEX_EXECUTOR_CHARTER, _claude_command, _claude_sandbox_profile, _codex_command, _contain_claude_write_command, _escalated_role, _executor_task, _filtered_executor_stderr, _invoke_safe, _self_reversions, _tee, _write_baseline, _write_claude_final_from_events, delegate, retry, start_detached_delegate, wait_for_run
 from cross_harness.runner import finalize_run
 from cross_harness.summarize import parse_events
 
@@ -81,6 +81,19 @@ class RunnerTests(unittest.TestCase):
         }))
         return 0
 
+    def test_codex_executor_task_injects_charter_without_changing_claude_task(self):
+        task = "# Goal\nImplement the requested change.\n"
+
+        codex_task = _executor_task(task, "codex")
+
+        self.assertTrue(codex_task.startswith(CODEX_EXECUTOR_CHARTER + "\n\n# Delegated task\n\n"))
+        self.assertTrue(codex_task.endswith(task))
+        self.assertIn("exactly these six fields", codex_task)
+        self.assertIn("delegate to another agent", codex_task)
+        self.assertIn("launch Claude", codex_task)
+        self.assertEqual(task, _executor_task(task, "claude"))
+        self.assertNotIn(CODEX_EXECUTOR_CHARTER, CLAUDE_EXECUTOR_CHARTER)
+
     def _failed_write_run(self, name: str, changed_file: str, contents: str, attempt: int = 1) -> Path:
         """Create a real failed write-run artifact for retry guard tests."""
         run = self.root / name
@@ -142,6 +155,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("1", environment["CROSS_HARNESS_WRITE"])
         self.assertEqual("claude", environment["CROSS_HARNESS_PARENT"])
         self.assertEqual(environment["CROSS_HARNESS_PARENT"], execution["parent_harness"])
+        self.assertTrue(invoke.call_args.args[1].startswith(CODEX_EXECUTOR_CHARTER))
         self.assertEqual("partial", summary["status"])
         self.assertIn("no checks declared", summary["error"])
 
@@ -1729,6 +1743,7 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
         invoke.side_effect = fail_with_change
         result = retry(previous, self.task, home=self.home)
         self.assertEqual(2, invoke.call_count)
+        self.assertTrue(all(call.args[1].startswith(CODEX_EXECUTOR_CHARTER) for call in invoke.call_args_list))
         self.assertTrue(json.loads((Path(result["run_dir"]) / "state.json").read_text())["escalated"])
 
     @patch("cross_harness.runner.verify_claude_config_ownership")

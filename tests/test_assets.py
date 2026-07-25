@@ -64,6 +64,15 @@ class AssetTests(unittest.TestCase):
             self.assertIn("launch Claude", content)
             self.assertIn("delegate", content)
 
+    def test_codex_agents_file_is_safe_for_interactive_sessions(self):
+        content = (source_root() / "assets/codex/AGENTS.md").read_text()
+        self.assertIn("Cross-harness integration", content)
+        self.assertIn("no interactive response\nformat requirements", content)
+        self.assertNotIn("exactly these six fields", content)
+        self.assertNotIn("Do not ask the user questions", content)
+        self.assertNotIn("Do not narrate intermediate work", content)
+        self.assertNotIn("smallest change", content)
+
     def test_orchestrator_uses_template_for_every_wrapper_action(self):
         skill = (source_root() / "assets/claude/skills/cross-harness-orchestrator/SKILL.md").read_text()
         for action in ("task create", "delegate", "retry"):

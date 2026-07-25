@@ -63,6 +63,18 @@ Your final response must contain exactly these six fields through the supplied
 JSON schema: status, work_completed, changed_files, tests, error, and
 next_decision. On failure, include exit code, cause, file, line, expected value,
 and actual value whenever those facts exist. Do not narrate intermediate work."""
+CODEX_EXECUTOR_CHARTER = """# Cross-harness executor
+
+You are the bounded execution worker for a task file supplied by Claude. Make
+the smallest change that satisfies its completion conditions. Do not ask the
+user questions, broaden scope, delegate to another agent, or launch Claude.
+If a blocking unknown prevents safe work, return `blocked` with the single
+decision needed.
+
+Your final response must contain exactly these six fields through the supplied
+JSON schema: status, work_completed, changed_files, tests, error, and
+next_decision. On failure, include exit code, cause, file, line, expected value,
+and actual value whenever those facts exist. Do not narrate intermediate work."""
 _DETACHED_SUPERVISORS: dict[int, subprocess.Popen] = {}
 
 
@@ -576,6 +588,13 @@ def _invoke_safe(command: list[str], task: str, env: dict[str, str], cwd: Path, 
         return 130
 
 
+def _executor_task(task: str, harness: str) -> str:
+    """Add the Codex-only executor charter to the stdin task prompt."""
+    if harness != "codex":
+        return task
+    return f"{CODEX_EXECUTOR_CHARTER}\n\n# Delegated task\n\n{task}"
+
+
 def _invoke_inner(command: list[str], task: str, env: dict[str, str], cwd: Path, run_dir: Path, timeout: int) -> int:
     events = run_dir / "events.jsonl"
     stderr = run_dir / "stderr.log"
@@ -959,7 +978,14 @@ def delegate(
         "cwd": str(execution_root),
         "sandbox_exec": sandbox_exec,
     }))
-    exit_code = _invoke_safe(command, task, environment, execution_root, run_dir, role["timeout_seconds"])
+    exit_code = _invoke_safe(
+        command,
+        _executor_task(task, role["harness"]),
+        environment,
+        execution_root,
+        run_dir,
+        role["timeout_seconds"],
+    )
     if role["harness"] == "claude":
         _write_claude_final_from_events(run_dir)
     return finalize_run(
@@ -1594,7 +1620,14 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         "resume": state["thread_id"],
         "sandbox_exec": sandbox_exec,
     }))
-    exit_code = _invoke_safe(command, task, environment, execution_root, retry_root, role["timeout_seconds"])
+    exit_code = _invoke_safe(
+        command,
+        _executor_task(task, role["harness"]),
+        environment,
+        execution_root,
+        retry_root,
+        role["timeout_seconds"],
+    )
     if role["harness"] == "claude":
         _write_claude_final_from_events(retry_root)
     summary = finalize_run(
@@ -1642,7 +1675,14 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
             "previous_run": str(retry_root),
             "sandbox_exec": sandbox_exec,
         }))
-        code = _invoke_safe(command, task, environment | {"CROSS_HARNESS_RUN_DIR": str(escalation_root)}, escalation_execution_root, escalation_root, escalation["timeout_seconds"])
+        code = _invoke_safe(
+            command,
+            _executor_task(task, escalation["harness"]),
+            environment | {"CROSS_HARNESS_RUN_DIR": str(escalation_root)},
+            escalation_execution_root,
+            escalation_root,
+            escalation["timeout_seconds"],
+        )
         if escalation["harness"] == "claude":
             _write_claude_final_from_events(escalation_root)
         escalated_summary = finalize_run(
