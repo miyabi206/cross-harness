@@ -5,13 +5,16 @@
       "label": "cross-harness: watch delegations",
       "type": "shell",
       "command": "/Users/itoutaisei/.local/bin/cross-harness",
-      "args": ["watch"],
+      "args": [
+        "watch"
+      ],
       "isBackground": true,
+      "problemMatcher": [],
       "runOptions": {
         "runOn": "folderOpen"
       },
       "presentation": {
-        "reveal": "silent",
+        "reveal": "always",
         "focus": false,
         "panel": "dedicated",
         "clear": false

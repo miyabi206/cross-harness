@@ -35,6 +35,9 @@ class ProjectTaskTests(unittest.TestCase):
             task = updated["tasks"][1]
             self.assertEqual(TASK_LABEL, task["label"])
             self.assertEqual(str(home.resolve() / ".local/bin/cross-harness"), task["command"])
+            self.assertEqual([], task["problemMatcher"])
+            self.assertEqual("always", task["presentation"]["reveal"])
+            self.assertFalse(task["presentation"]["focus"])
             backups = list((home / ".local/state/cross-harness/project-backups").glob("*-tasks.json"))
             self.assertEqual(1, len(backups))
             self.assertEqual(json.dumps(original), backups[0].read_text(encoding="utf-8"))

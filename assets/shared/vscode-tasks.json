@@ -7,11 +7,12 @@
       "command": "{{CROSS_HARNESS_BIN}}",
       "args": ["watch"],
       "isBackground": true,
+      "problemMatcher": [],
       "runOptions": {
         "runOn": "folderOpen"
       },
       "presentation": {
-        "reveal": "silent",
+        "reveal": "always",
         "focus": false,
         "panel": "dedicated",
         "clear": false
