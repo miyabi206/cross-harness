@@ -37,8 +37,8 @@ operational discipline.
 
 Every role has `harness`, `model`, `effort`, `max_parallel`, `retries`,
 `timeout_seconds`, `write`, `output_limit_chars`, and `delegate_kinds`.
-The required roles are orchestrator, explorer, planner, implementer, tester,
-reviewer, debugger, and security_reviewer.
+The required roles are orchestrator, explorer, implementer, tester, reviewer,
+debugger, and security_reviewer.
 
 The checked-in defaults implement plan section 6. Codex uses the explicit
 model IDs `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`; Claude uses the

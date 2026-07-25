@@ -12,6 +12,7 @@
   "properties": {
     "version": {"const": 1},
     "parent_harness": {"enum": ["claude", "codex"]},
+    "mode": {"enum": ["on", "off"]},
     "runtime_root": {"type": "string", "minLength": 1},
     "retention_days": {"type": "integer", "minimum": 1, "maximum": 365},
     "auth_cache_hours": {"type": "integer", "minimum": 1, "maximum": 24},
@@ -32,13 +33,12 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "orchestrator", "explorer", "planner", "implementer", "tester",
+        "orchestrator", "explorer", "implementer", "tester",
         "reviewer", "debugger", "security_reviewer"
       ],
       "properties": {
         "orchestrator": {"$ref": "#/$defs/role"},
         "explorer": {"$ref": "#/$defs/role"},
-        "planner": {"$ref": "#/$defs/role"},
         "implementer": {"$ref": "#/$defs/role"},
         "tester": {"$ref": "#/$defs/role"},
         "reviewer": {"$ref": "#/$defs/role"},
@@ -53,7 +53,7 @@
     }
   },
   "$defs": {
-    "dirtyPolicy": {"enum": ["stop", "isolate"]},
+    "dirtyPolicy": {"enum": ["stop", "isolate", "allow", "allow_delegated"]},
     "nonEmptyUniqueStrings": {
       "type": "array",
       "minItems": 1,
@@ -64,7 +64,7 @@
       "type": "array",
       "uniqueItems": true,
       "items": {
-        "enum": ["exploration", "planning", "implementation", "test", "debug", "review", "security_review"]
+        "enum": ["exploration", "implementation", "test", "debug", "review", "security_review"]
       }
     },
     "globalDelegateKinds": {
@@ -114,7 +114,8 @@
           "items": {"type": "string", "minLength": 1}
         },
         "delegate_kinds": {"$ref": "#/$defs/globalDelegateKinds"},
-        "dirty_worktree_policy": {"$ref": "#/$defs/dirtyPolicy"}
+        "dirty_worktree_policy": {"$ref": "#/$defs/dirtyPolicy"},
+        "mode": {"enum": ["on", "off"]}
       }
     }
   }
