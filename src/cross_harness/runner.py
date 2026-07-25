@@ -107,6 +107,11 @@ def _delegated_changes_path(runtime_root: Path) -> Path:
     return runtime_root / "delegated-changes.json"
 
 
+def _effective_dirty_worktree_policy(config: dict, root: Path) -> str:
+    """Return the project-specific write-worktree policy for a repository."""
+    return project_config(config, root).get("dirty_worktree_policy", config["dirty_worktree_policy"])
+
+
 def _load_delegated_changes(runtime_root: Path) -> dict[str, dict[str, str]] | None:
     """Load the trusted delegated-change fingerprints, failing closed on bad data."""
     path = _delegated_changes_path(runtime_root)
@@ -192,10 +197,11 @@ def _prepare_write_execution(
     signatures: list[str] | None = None,
 ) -> Path:
     """Apply the shared write-worktree policy and return the execution root."""
-    project = project_config(config, root)
-    policy = project.get("dirty_worktree_policy", config["dirty_worktree_policy"])
+    policy = _effective_dirty_worktree_policy(config, root)
+    if not role["write"] or policy == "allow":
+        return root
     dirty = _dirty(root)
-    if not role["write"] or not dirty:
+    if not dirty:
         return root
     if policy == "isolate":
         return _create_isolated_worktree(root, run_dir)
@@ -299,6 +305,10 @@ def _prepare_retry_execution(
         atomic_write(run_dir / "ISOLATED_WORKTREE", str(execution_root) + "\n")
     else:
         execution_root = root
+
+    policy = _effective_dirty_worktree_policy(config, root)
+    if policy == "allow":
+        return execution_root
 
     allowed, record_error = _recorded_retry_changes(previous_run)
     if allowed is None:
@@ -933,6 +943,7 @@ def delegate(
     if contains_secret(task):
         raise HarnessError("task file appears to contain credential material; refusing delegation")
     root = _git_root(cwd)
+    effective_policy = _effective_dirty_worktree_policy(config, root)
     runtime_root = Path(config["runtime_root"])
     run_dir = run_dir or _new_run_dir(runtime_root)
     if not run_dir.is_dir():
@@ -990,7 +1001,7 @@ def delegate(
         _write_claude_final_from_events(run_dir)
     return finalize_run(
         run_dir, role_name, role, kind, execution_root, exit_code, attempt=1,
-        runtime_root=runtime_root,
+        runtime_root=runtime_root, dirty_worktree_policy=effective_policy,
     )
 
 
@@ -1252,6 +1263,7 @@ def finalize_run(
     attempt: int,
     *,
     runtime_root: Path | None = None,
+    dirty_worktree_policy: str | None = None,
 ) -> dict:
     parsed = parse_events(run_dir / "events.jsonl")
     declared_checks = _declared_checks(run_dir)
@@ -1380,8 +1392,8 @@ def finalize_run(
     should_record_delegated_changes = (
         runtime_root is not None
         and role.get("write")
-        and status == "success"
         and not (run_dir / "ISOLATED_WORKTREE").exists()
+        and dirty_worktree_policy == "allow_delegated"
     )
     if should_record_delegated_changes and not diff_check_unavailable:
         try:
@@ -1561,6 +1573,7 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         raise HarnessError("task file appears to contain credential material; refusing delegation")
     runtime_root = Path(config["runtime_root"])
     source_root = _git_root(Path(state["cwd"]))
+    effective_policy = _effective_dirty_worktree_policy(config, source_root)
     retry_root = _new_run_dir(runtime_root)
     shutil.copy2(task_file, retry_root / "task.md")
     execution_root = _prepare_retry_execution(
@@ -1632,7 +1645,7 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         _write_claude_final_from_events(retry_root)
     summary = finalize_run(
         retry_root, state["role"], role, state["kind"], execution_root, exit_code, state["attempts"] + 1,
-        runtime_root=runtime_root,
+        runtime_root=runtime_root, dirty_worktree_policy=effective_policy,
     )
     new_state = json.loads((retry_root / "state.json").read_text(encoding="utf-8"))
     new_state["signatures"] = [*state.get("signatures", []), *new_state.get("signatures", [])]
@@ -1688,6 +1701,7 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         escalated_summary = finalize_run(
             escalation_root, state["role"], escalation, state["kind"], escalation_execution_root,
             code, new_state["attempts"] + 1, runtime_root=runtime_root,
+            dirty_worktree_policy=_effective_dirty_worktree_policy(config, source_root),
         )
         escalated_state = json.loads((escalation_root / "state.json").read_text(encoding="utf-8"))
         escalated_state["escalated"] = True

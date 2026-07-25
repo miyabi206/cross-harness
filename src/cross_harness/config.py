@@ -101,8 +101,8 @@ def validate(config: dict) -> list[str]:
     _integer(config, "auth_cache_hours", 1, 24, errors)
     _integer(config, "context_threshold_percent", 40, 85, errors)
     _integer(config, "max_parallel", 1, 2, errors)
-    if config.get("dirty_worktree_policy") not in {"stop", "isolate", "allow_delegated"}:
-        errors.append("dirty_worktree_policy: expected 'stop', 'isolate', or 'allow_delegated'")
+    if config.get("dirty_worktree_policy") not in {"stop", "isolate", "allow", "allow_delegated"}:
+        errors.append("dirty_worktree_policy: expected 'stop', 'isolate', 'allow', or 'allow_delegated'")
     if "mode" in config and config["mode"] not in {"on", "off"}:
         errors.append("mode: expected 'on' or 'off'")
     if not _string_list(config.get("delegate_kinds")):
@@ -177,9 +177,9 @@ def validate(config: dict) -> list[str]:
                 errors.append(f"{location}.delegate_kinds: expected unique string array")
             elif "delegate_kinds" in project and (unknown_kinds := set(project["delegate_kinds"]) - DELEGATE_KINDS):
                 errors.append(f"{location}.delegate_kinds: unsupported values " + ", ".join(sorted(unknown_kinds)))
-            if "dirty_worktree_policy" in project and project["dirty_worktree_policy"] not in {"stop", "isolate", "allow_delegated"}:
+            if "dirty_worktree_policy" in project and project["dirty_worktree_policy"] not in {"stop", "isolate", "allow", "allow_delegated"}:
                 errors.append(
-                    f"{location}.dirty_worktree_policy: expected 'stop', 'isolate', or 'allow_delegated'"
+                    f"{location}.dirty_worktree_policy: expected 'stop', 'isolate', 'allow', or 'allow_delegated'"
                 )
             if "mode" in project and project["mode"] not in {"on", "off"}:
                 errors.append(f"{location}.mode: expected 'on' or 'off'")

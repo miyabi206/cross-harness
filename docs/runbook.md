@@ -107,6 +107,11 @@ worktree below the run directory and records it in `ISOLATED_WORKTREE`. Review
 and transfer its commit or patch explicitly. Cleanup does not remove a retained
 isolated worktree before the run's seven-day retention window.
 
+With `dirty_worktree_policy="allow"`, write delegations and retries run in the
+current worktree even when it contains uncommitted changes. The wrapper still
+records and reports each run's observed diff, including its safeguards against
+executor-initiated reversions.
+
 ## Disable, uninstall, and restore
 
 To update an existing installation after changing this repository, run:

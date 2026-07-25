@@ -61,11 +61,20 @@ class ConfigTests(unittest.TestCase):
         config["projects"]["/tmp/project"]["model"] = "external"
         self.assertIn("unknown key 'model'", "\n".join(validate(config)))
 
-    def test_allow_delegated_dirty_worktree_policy_is_valid_globally_and_per_project(self):
+    def test_allow_dirty_worktree_policy_is_valid_globally_and_per_project(self):
         config = copy.deepcopy(default_config())
-        config["dirty_worktree_policy"] = "allow_delegated"
-        config["projects"] = {"/tmp/project": {"dirty_worktree_policy": "allow_delegated"}}
+        config["dirty_worktree_policy"] = "allow"
+        config["projects"] = {"/tmp/project": {"dirty_worktree_policy": "allow"}}
         self.assertEqual([], validate(config))
+
+        config["dirty_worktree_policy"] = "invalid"
+        config["projects"]["/tmp/project"]["dirty_worktree_policy"] = "invalid"
+        errors = "\n".join(validate(config))
+        self.assertIn("dirty_worktree_policy: expected 'stop', 'isolate', 'allow', or 'allow_delegated'", errors)
+        self.assertIn(
+            "projects./tmp/project.dirty_worktree_policy: expected 'stop', 'isolate', 'allow', or 'allow_delegated'",
+            errors,
+        )
 
     def test_project_key_must_be_absolute(self):
         config = default_config()

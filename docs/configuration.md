@@ -26,11 +26,12 @@ sandbox. The most specific matching project path wins.
 role to continue only when every dirty file is unchanged and recorded by a
 previous write delegation. `"stop"` blocks write roles when the repository has
 uncommitted changes, and `"isolate"` runs the write role in a detached worktree
-instead. Any unrecorded, deleted, un-fingerprintable, or modified file still
-blocks the run. It may be set globally or in a project override. Do not edit the working
-tree while a delegated write run is executing: a concurrent user edit can be
-observed as that run's delta and recorded as delegated, so this policy depends
-on that operational discipline.
+instead. `"allow"` runs write delegations and retries in the current worktree
+regardless of pre-existing changes or their recorded provenance. It may be set
+globally or in a project override. Do not edit the working tree while a
+delegated write run is executing: a concurrent user edit can be observed as
+that run's delta and recorded as delegated, so this policy depends on that
+operational discipline.
 
 ## Roles
 

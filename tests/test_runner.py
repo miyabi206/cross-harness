@@ -225,6 +225,24 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("dirty_worktree", state["blocked_category"])
         self.assertTrue((runs[0] / "BLOCKED").exists())
 
+    @patch("cross_harness.runner.verify_codex_chatgpt")
+    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_allow_policy_delegates_in_dirty_worktree(self, invoke, ownership, verify):
+        (self.repo / "user-change.txt").write_text("mine\n")
+        config = self.root / "allow.toml"
+        contents = (Path(__file__).resolve().parents[1] / "config/default.toml").read_text()
+        config.write_text(contents.replace(
+            'dirty_worktree_policy = "allow_delegated"', 'dirty_worktree_policy = "allow"', 1
+        ))
+        verify.return_value = (Path("/usr/bin/true"), False)
+        invoke.side_effect = self.fake_invoke
+
+        delegate("implementer", "implementation", self.task, self.repo, config_path=config, home=self.home)
+
+        self.assertEqual(1, invoke.call_count)
+        ownership.assert_called_once()
+
     @patch("cross_harness.runner.verify_claude_subscription", side_effect=AuthError("not logged in"))
     @patch("cross_harness.runner.verify_claude_config_ownership")
     @patch("cross_harness.runner._invoke_safe")
@@ -968,7 +986,8 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
 
         with patch("cross_harness.runner._record_delegated_changes", side_effect=OSError("git unavailable")):
             summary = finalize_run(
-                run, "implementer", role, "review", self.repo, 0, 1, runtime_root=runtime_root
+                run, "implementer", role, "review", self.repo, 0, 1,
+                runtime_root=runtime_root, dirty_worktree_policy="allow_delegated",
             )
 
         self.assertEqual("unavailable", summary["diff_check"])
@@ -1482,6 +1501,27 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
         verify.assert_not_called()
         ownership.assert_not_called()
 
+    @patch("cross_harness.runner.verify_codex_chatgpt")
+    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_allow_policy_retries_with_changes_outside_previous_run_diff(self, invoke, ownership, verify):
+        self.task.write_text("# Goal\nContinue.\n\n# Checks\n- fixture\n")
+        previous = self._failed_write_run("failed-write", "delegated.txt", "delegated\n")
+        (self.repo / "user-change.txt").write_text("mine\n")
+        config = self.root / "retry-allow.toml"
+        contents = (Path(__file__).resolve().parents[1] / "config/default.toml").read_text()
+        config.write_text(contents.replace(
+            'dirty_worktree_policy = "allow_delegated"', 'dirty_worktree_policy = "allow"', 1
+        ))
+        verify.return_value = (Path("/usr/bin/true"), False)
+        invoke.side_effect = self._successful_retry
+
+        summary = retry(previous, self.task, config_path=config, home=self.home)
+
+        self.assertEqual("success", summary["status"])
+        self.assertEqual(1, invoke.call_count)
+        ownership.assert_called_once()
+
     def test_retry_blocks_when_previous_diff_check_was_unavailable(self):
         previous = self._failed_write_run("failed-diff-check", "delegated.txt", "delegated\n")
         summary_path = previous / "summary.json"
@@ -1688,7 +1728,8 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
         role = {"model": "gpt-5.6-terra", "effort": "high", "output_limit_chars": 8000, "write": True}
 
         summary = finalize_run(
-            run, "implementer", role, "review", self.repo, 0, 1, runtime_root=runtime_root
+            run, "implementer", role, "review", self.repo, 0, 1,
+            runtime_root=runtime_root, dirty_worktree_policy="allow_delegated",
         )
 
         self.assertEqual("success", summary["status"])
@@ -1697,7 +1738,73 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
             {"trusted.txt", "delegated.txt"}, set(records[str(self.repo.resolve())])
         )
 
-    def test_finalize_does_not_record_partial_or_isolated_write_runs(self):
+    def test_finalize_records_partial_write_runs(self):
+        runtime_root = self.root / "runtime"
+        run = self.root / "partial"
+        run.mkdir()
+        _write_baseline(run, self.repo)
+        (self.repo / "partial.txt").write_text("partial\n")
+        (run / "events.jsonl").write_text('{"type":"turn.completed","usage":{}}\n')
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "partial", "work_completed": "", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-terra", "effort": "high", "output_limit_chars": 8000, "write": True}
+
+        summary = finalize_run(
+            run, "implementer", role, "review", self.repo, 0, 1,
+            runtime_root=runtime_root, dirty_worktree_policy="allow_delegated",
+        )
+
+        self.assertEqual("partial", summary["status"])
+        records = json.loads((runtime_root / "delegated-changes.json").read_text())
+        self.assertIn("partial.txt", records[str(self.repo.resolve())])
+
+    def test_finalize_records_delegated_changes_only_for_allow_delegated_policy(self):
+        runtime_root = self.root / "runtime"
+        role = {"model": "gpt-5.6-terra", "effort": "high", "output_limit_chars": 8000, "write": True}
+
+        allow_run = self.root / "allow"
+        allow_run.mkdir()
+        _write_baseline(allow_run, self.repo)
+        (self.repo / "allow-change.txt").write_text("allow\n")
+        (allow_run / "events.jsonl").write_text('{"type":"turn.completed","usage":{}}\n')
+        (allow_run / "stderr.log").write_text("")
+        (allow_run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "done", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+
+        finalize_run(
+            allow_run, "implementer", role, "review", self.repo, 0, 1,
+            runtime_root=runtime_root, dirty_worktree_policy="allow",
+        )
+
+        self.assertFalse((runtime_root / "delegated-changes.json").exists())
+
+        delegated_run = self.root / "allow-delegated"
+        delegated_run.mkdir()
+        _write_baseline(delegated_run, self.repo)
+        (self.repo / "delegated-change.txt").write_text("delegated\n")
+        (delegated_run / "events.jsonl").write_text('{"type":"turn.completed","usage":{}}\n')
+        (delegated_run / "stderr.log").write_text("")
+        (delegated_run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "done", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+
+        finalize_run(
+            delegated_run, "implementer", role, "review", self.repo, 0, 1,
+            runtime_root=runtime_root, dirty_worktree_policy="allow_delegated",
+        )
+
+        records = json.loads((runtime_root / "delegated-changes.json").read_text())
+        self.assertEqual(
+            {"delegated-change.txt"}, set(records[str(self.repo.resolve())])
+        )
+
+    def test_finalize_does_not_record_isolated_write_runs(self):
         runtime_root = self.root / "runtime"
         records_path = runtime_root / "delegated-changes.json"
         records_path.parent.mkdir(parents=True)
@@ -1705,20 +1812,18 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
         records_path.write_text(json.dumps(initial))
         role = {"model": "gpt-5.6-terra", "effort": "high", "output_limit_chars": 8000, "write": True}
 
-        for name, status, isolated in (("partial", "partial", False), ("isolated", "success", True)):
-            run = self.root / name
-            run.mkdir()
-            _write_baseline(run, self.repo)
-            (self.repo / f"{name}.txt").write_text(name + "\n")
-            (run / "events.jsonl").write_text('{"type":"turn.completed","usage":{}}\n')
-            (run / "stderr.log").write_text("")
-            (run / "final.json").write_text(json.dumps({
-                "status": status, "work_completed": "", "changed_files": [],
-                "tests": [], "error": None, "next_decision": None,
-            }))
-            if isolated:
-                (run / "ISOLATED_WORKTREE").write_text(str(self.repo) + "\n")
-            finalize_run(run, "implementer", role, "review", self.repo, 0, 1, runtime_root=runtime_root)
+        run = self.root / "isolated"
+        run.mkdir()
+        _write_baseline(run, self.repo)
+        (self.repo / "isolated.txt").write_text("isolated\n")
+        (run / "events.jsonl").write_text('{"type":"turn.completed","usage":{}}\n')
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+        (run / "ISOLATED_WORKTREE").write_text(str(self.repo) + "\n")
+        finalize_run(run, "implementer", role, "review", self.repo, 0, 1, runtime_root=runtime_root)
 
         self.assertEqual(initial, json.loads(records_path.read_text()))
 
