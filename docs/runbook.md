@@ -32,6 +32,13 @@ last 10 lines of its aggregated output, an omitted-line count when applicable,
 and its exit code. ANSI escapes and control characters are removed before this
 output is rendered.
 
+Codex publishes only a short heading line for each completed reasoning item,
+so watch displays that heading with a `✻` marker; reasoning items that have not
+completed are not displayed. A delegated result JSON message is rendered as
+readable text for `status`, `work_completed`,
+`changed_files`, `tests`, `error`, and `next_decision`. Fields whose values are
+null or empty are omitted with their entire line.
+
 Watch output is written only to the terminal and is not added to the
 orchestrator context. The complete raw event log is in the run directory's
 `events.jsonl`. `aggregated_output` from Codex `command_execution` events is

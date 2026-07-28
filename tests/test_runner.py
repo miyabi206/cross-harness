@@ -1098,6 +1098,10 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
         self.assertNotIn("--sandbox", command)
         self.assertNotIn("-C", command)
         self.assertIn('sandbox_mode="read-only"', command)
+        self.assertIn('model_reasoning_summary="detailed"', command)
+
+        fresh = _codex_command(Path("/usr/local/bin/codex"), read_only, self.repo, run)
+        self.assertIn('model_reasoning_summary="detailed"', fresh)
 
     @patch("cross_harness.runner.verify_codex_chatgpt")
     @patch("cross_harness.runner.verify_codex_config_ownership")

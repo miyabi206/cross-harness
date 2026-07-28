@@ -147,7 +147,7 @@ def describe_event(event: dict) -> tuple[EventLine, ...]:
                 continue
             block_type = block.get("type")
             if block_type == "text" and isinstance(block.get("text"), str):
-                lines.append(EventLine("›", detail=block["text"], wrap=True))
+                lines.append(EventLine("›", detail=_safe_text(block["text"]), wrap=True))
             elif block_type == "tool_use" and isinstance(block.get("name"), str):
                 inputs = block.get("input") if isinstance(block.get("input"), dict) else {}
                 lines.append(EventLine(
@@ -211,7 +211,9 @@ def describe_event(event: dict) -> tuple[EventLine, ...]:
                 if isinstance(change, dict) and isinstance(change.get("path"), str)
             ) or _noise("file_change")
         if item_type == "agent_message" and isinstance(item.get("text"), str):
-            return (EventLine("›", detail=item["text"], wrap=True),)
+            return (EventLine("›", detail=_safe_text(item["text"]), wrap=True),)
+        if item_type == "reasoning" and isinstance(item.get("text"), str):
+            return (EventLine("✻", detail=_safe_text(item["text"]), wrap=True),)
         if item_type == "web_search" and isinstance(item.get("query"), str):
             return (EventLine("⏺", label="Search", detail=_short_detail(item["query"])),)
         return _noise("item.completed")
@@ -226,7 +228,7 @@ def _styled(value: str, code: str, color: bool) -> str:
 
 
 def _render_one(line: EventLine, *, width: int, color: bool) -> list[str]:
-    marker = _styled(line.marker, _CYAN if line.marker in {"⏺", "›"} else "", color)
+    marker = _styled(line.marker, _CYAN if line.marker in {"⏺", "›", "✻"} else "", color)
     if line.label:
         label = _styled(f"{line.label:<7}", _BOLD + _CYAN, color)
         prefix = f"  {marker} {label}"
@@ -244,13 +246,25 @@ def _render_one(line: EventLine, *, width: int, color: bool) -> list[str]:
         try:
             payload = json.loads(body)
             if isinstance(payload, dict) and "status" in payload:
-                status = payload["status"]
+                status = _safe_text(payload.get("status"))
+                work_completed = _safe_text(payload.get("work_completed"))
                 changed_files = payload.get("changed_files")
                 tests = payload.get("tests")
-                changed_count = len(changed_files) if isinstance(changed_files, list) else 0
-                test_count = len(tests) if isinstance(tests, list) else 0
-                rendered_status = status if isinstance(status, str) and status in _VERDICTS else "unknown"
-                body = f"status={rendered_status} · changed_files={changed_count} · tests={test_count}"
+                rendered_status = status if status in _VERDICTS else "unknown"
+                rendered_files = [_safe_text(value) for value in changed_files] if isinstance(changed_files, list) else []
+                rendered_tests = [_safe_text(value) for value in tests] if isinstance(tests, list) else []
+                rows = [f"status: {rendered_status}"]
+                if work_completed:
+                    rows.extend(["work_completed:", work_completed])
+                if rendered_files:
+                    rows.extend(["changed_files:", *[f"- {value}" for value in rendered_files]])
+                if rendered_tests:
+                    rows.extend(["tests:", *[f"- {value}" for value in rendered_tests]])
+                if payload.get("error") is not None:
+                    rows.append(f"error: {_safe_text(payload.get('error'))}")
+                if payload.get("next_decision") is not None:
+                    rows.append(f"next_decision: {_safe_text(payload.get('next_decision'))}")
+                body = "\n".join(rows)
         except (TypeError, json.JSONDecodeError):
             pass
 

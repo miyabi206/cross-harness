@@ -130,6 +130,14 @@ class WatchTests(unittest.TestCase):
             (EventLine("⏺", "Search", "cross harness"),),
             describe_event({"type": "item.completed", "item": {"type": "web_search", "query": "cross harness"}}),
         )
+        self.assertEqual(
+            (EventLine("✻", detail="I inspected it.", wrap=True),),
+            describe_event({"type": "item.completed", "item": {"type": "reasoning", "text": "I inspected it."}}),
+        )
+        self.assertEqual(
+            (EventLine("·", detail="item.started", noise=True),),
+            describe_event({"type": "item.started", "item": {"type": "reasoning", "text": "not displayed"}}),
+        )
         self.assertEqual((EventLine("·", detail="item.started", noise=True),), describe_event({"type": "item.started"}))
 
     def test_describe_claude_event_variants(self):
@@ -143,6 +151,15 @@ class WatchTests(unittest.TestCase):
             describe_event(event),
         )
         self.assertEqual((EventLine("·", detail="system", noise=True),), describe_event({"type": "system", "subtype": "init"}))
+
+    def test_message_bodies_strip_terminal_controls_and_preserve_newlines(self):
+        events = [
+            {"type": "item.completed", "item": {"type": "reasoning", "text": "one\n\x1b[31mtwo"}},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "one\n\x1b[31mtwo"}},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "one\n\x1b[31mtwo"}]}},
+        ]
+        for event in events:
+            self.assertEqual("one\ntwo", describe_event(event)[0].detail)
 
     def test_noise_is_hidden_by_default_and_restored_by_all(self):
         event = {"type": "system", "subtype": "init", "secret": "not visible"}
@@ -214,6 +231,12 @@ class WatchTests(unittest.TestCase):
             self.assertEqual(0, watch(output=output, color="always"))
         self.assertIn("\033[", output.getvalue())
 
+    def test_reasoning_marker_is_cyan_when_color_is_enabled(self):
+        self.assertEqual(
+            "  \033[36m✻\033[0m summary",
+            render_lines((EventLine("✻", detail="summary", wrap=True),), color=True)[0],
+        )
+
     def test_header_once_for_active_run_and_not_completed_run(self):
         active = self.runs / "20260718T174442-22222222"
         active.mkdir()
@@ -249,17 +272,39 @@ class WatchTests(unittest.TestCase):
         self.assertRegex(run_header(run), r"· 20260719T151554-e73c766e ──────$")
         self.assertNotIn("20260719T151554-e73c766e · 20260719T151554-e73c766e", run_header(run))
 
-    def test_delegation_result_message_is_summarized(self):
+    def test_delegation_result_message_renders_all_fields_safely(self):
         payload = json.dumps({
             "status": "success",
-            "work_completed": "do not print this",
+            "work_completed": "implemented\nwith details\x1b[31m",
             "changed_files": ["src/a.py", "tests/test_a.py"],
             "tests": ["pytest", "lint"],
-            "error": "do not print this either",
+            "error": "none\x1b[0m",
+            "next_decision": "ship it",
         })
         rendered = "\n".join(render_lines((EventLine("›", detail=payload, wrap=True),)))
-        self.assertIn("status=success · changed_files=2 · tests=2", rendered)
-        self.assertNotIn("do not print this", rendered)
+        self.assertIn("status: success", rendered)
+        self.assertIn("work_completed:", rendered)
+        self.assertIn("implemented", rendered)
+        self.assertIn("with details", rendered)
+        self.assertIn("changed_files:", rendered)
+        self.assertIn("- src/a.py", rendered)
+        self.assertIn("tests:", rendered)
+        self.assertIn("- pytest", rendered)
+        self.assertIn("error: none", rendered)
+        self.assertIn("next_decision: ship it", rendered)
+        self.assertNotIn("\x1b", rendered)
+
+    def test_delegation_result_omits_empty_and_null_fields(self):
+        payload = json.dumps({
+            "status": "success",
+            "work_completed": "",
+            "changed_files": [],
+            "tests": [],
+            "error": None,
+            "next_decision": None,
+        })
+        rendered = "\n".join(render_lines((EventLine("›", detail=payload, wrap=True),)))
+        self.assertEqual("  › status: success", rendered)
 
 
 if __name__ == "__main__":
