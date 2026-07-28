@@ -254,3 +254,25 @@ codex 実行時に次の stderr が繰り返し出力された。
 | N2 | 対応済み。テストクラス全体で `os.environ` を clear し、ラッパー解決に関わるテストは HOME と PATH を一時ディレクトリで明示的に構成した。アサーションは変更していない。修正後、tester ロール（claude、read-only）が決定的テスト一式と実データ検証の全5検査を通過することを実測で確認した。 | `f995c1a` fix: フックのテストを環境非依存にする | なし。 |
 
 第2次では併せて、`40e29cf` feat: 実績にもとづきガードレールを3点緩める により `dirty_worktree_policy` の既定を `allow_delegated` へ変更し、`executor_reported` の blocked を retry 可能にし、security_reviewer の kind=review を確認ゲートなしにした。`d386814` feat: installをその場更新できるようにする、`a81196e` feat: オーケストレータの書き込み範囲にcwdのGitルート配下を加える も実施した。加えて `f348f94` fix: 検査がリポジトリに書き込まないようにする により、`scripts/test.sh` の実行がリポジトリに書き込む36ファイルは0件になった。
+
+## 第3次修正で確認された項目
+
+作成日: 2026-07-29。WSL2 環境への導入手順を検討する過程で、検証手順そのものが機能していないことが判明した。
+
+| # | 事象 | 判定 | 影響度 |
+|---|---|---|---|
+| T1 | pytest が未宣言依存であり、新規環境では `scripts/test.sh` が必ず失敗する | バグ（検証手順の欠落） | 高 |
+| T2 | `scripts/test.sh` が unittest で走るため `tests/conftest.py` の隔離機構が一度も読み込まれない | バグ（N2 の一般形が未解決のまま残存） | 高（tester が検証役として機能しない） |
+| T3 | `.venv` が gitignore されておらず、導入手順の実行自体がツリーを dirty にする | バグ（T1 の対応に伴う波及） | 低 |
+
+## 第3次修正の対応状況と残存する制約
+
+| # | 対応状況 | 対応コミット | 残存する制約 |
+|---|---|---|---|
+| T1 | 対応済み。`pyproject.toml` に `[dependency-groups] dev = ["pytest>=9.1.1"]` を宣言し `uv.lock` に記録した。`scripts/test.sh` は `.venv/bin/python` を優先して解決し、pytest を import できない場合は uv 版と非 uv 版の2通りの導入手順を stderr に出して非ゼロ終了する。修正前はテスト内部の `ModuleNotFoundError: No module named 'pytest'` として現れ、原因が読み取れなかった。`pyproject.toml` は依存を一切宣言しておらず、README と `cross-harness-wsl-setup.md` はどちらも `scripts/test.sh` の成功を合格条件にしていながら pytest も venv も導入していなかった。 | `81c8325` fix: 依存バージョンのロック。uv.lock<br>`c48e9bc` docs: pytest導入手順を検証手順の前に置く | `.venv` が `uv.lock` に対して古くても、pytest さえ import できれば黙ってその `.venv` を使う。 |
+| T2 | 対応済み。`scripts/test.sh` の実行系を unittest から pytest へ移し、`tests/conftest.py` の autouse fixture が読み込まれるようにした。併せてスクリプト冒頭で awk の `ENVIRON` を走査して `CROSS_HARNESS_` で始まる環境変数を除去する（defense-in-depth。`bin/cross-harness validate` はこの除去を必要としないことを実測で確認済み）。測定値: `CROSS_HARNESS_ACTIVE=1 CROSS_HARNESS_EXECUTOR=codex` 下で、修正前は unittest で 248 tests 中 8 failures + 25 errors、修正後は pytest で 254 passed。 | `81c8325` fix: 依存バージョンのロック。uv.lock | `python -m unittest discover -s tests` を直接実行する経路は依然として隔離されない。`tests/__init__.py` を置く対策は成立しない。unittest の discover は `tests/__init__.py` を実行せず、pytest だけが実行することを実測で確認した。 |
+| T3 | 対応済み。`.gitignore` に `.venv/` を追加した。venv 内 `.gitignore` の自動生成は Python 3.13 で導入されたもので、`cross-harness-wsl-setup.md` が対象とする Ubuntu 24.04 の Python 3.12 では生成されない。追加しないと T1 の導入手順の実行自体が `.venv/` を untracked にし、後続の書き込み委任を `dirty_worktree` でブロックする。 | `c48e9bc` docs: pytest導入手順を検証手順の前に置く | なし。 |
+
+第3次では、T2 が第2次の N2 と同一の根本原因を持つことを確認した。`tests/conftest.py` は `6f516d0`（2026-07-19）で「委譲実行役の環境からテストを隔離する」目的で追加されていたが、`scripts/test.sh` が unittest で実行していたため一度も読み込まれていなかった。N2 は `f995c1a`（2026-07-22）で `tests/test_hooks.py` 側を環境非依存にすることで解消され、残存する制約は「なし」と記録されたが、隔離機構そのものが無効である事実は検出されなかった。T2 はその一般形にあたる。個別テストの症状を消す修正が、機構の不作動を隠したことになる。
+
+また、第3次修正より前に `scripts/test.sh` を最後に更新した `f348f94`（2026-07-22）は、pytest を要求する `tests/test_cli_flag_contract.py` を追加した `d0ff71f`（2026-07-19）より後である。実行系の不整合は、当該ファイルを一度触った後も残っていた。
