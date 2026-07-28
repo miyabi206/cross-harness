@@ -51,7 +51,7 @@ claude = ["opus", "sonnet", "haiku"]
 
 [roles.orchestrator]
 harness = "claude"
-model = "opus"
+model = "opus[1m]"
 effort = "xhigh"
 max_parallel = 1
 retries = 0

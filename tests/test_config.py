@@ -33,6 +33,16 @@ class ConfigTests(unittest.TestCase):
             config["roles"]["security_reviewer"]["delegate_kinds"],
         )
 
+    def test_retrying_roles_use_models_in_their_harness_fallback_chain(self):
+        config = default_config()
+        for role_name, role in config["roles"].items():
+            if role["retries"] > 0:
+                self.assertIn(
+                    role["model"],
+                    config["fallback"][role["harness"]],
+                    role_name,
+                )
+
     def test_planning_is_not_a_supported_role_delegate_kind(self):
         config = copy.deepcopy(default_config())
         config["roles"]["explorer"]["delegate_kinds"] = ["planning"]
