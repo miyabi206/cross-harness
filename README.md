@@ -128,11 +128,38 @@ cross-harness validate --config ~/.config/cross-harness/config.toml
 
 ## Verify and remove
 
+The test suite runs under pytest. It is a development dependency, not a runtime
+one, so `install` does not provide it. Install it once before verifying:
+
+```sh
+uv sync --group dev
+```
+
+Without uv, create the virtual environment that `scripts/test.sh` prefers and
+install pytest into it. Do not install it into the system Python:
+
+```sh
+python3 -m venv .venv && .venv/bin/python -m pip install pytest
+```
+
+Then verify, and remove when needed:
+
 ```sh
 scripts/test.sh
 scripts/e2e.sh
 ~/.local/bin/cross-harness uninstall
 ```
+
+`scripts/test.sh` uses `.venv/bin/python` when it exists and falls back to
+`python3`. It stops with an explicit message when pytest is missing, so a
+failure there means the development dependency was never installed. It also
+clears `CROSS_HARNESS_*` from its own environment, which keeps the run
+identical whether or not it was started from a delegated executor.
+
+`scripts/e2e.sh` rewrites the tracked `docs/e2e-results.md`, so it leaves the
+worktree dirty. Its `claude auth status` probe degrades to `not verified by
+this run` instead of failing, so a passing e2e run is not evidence of an
+authenticated Claude session.
 
 Uninstall refuses to overwrite files changed after installation. Review the
 drift and merge it first; use `--preserve-user-changes` for surgical managed

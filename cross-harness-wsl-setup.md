@@ -213,6 +213,27 @@ cd ~/cross-harness
 
 ## 7. 検証
 
+### 7-1. テスト依存の導入
+テストは pytest で実行される。pytest は開発依存でありランタイムには不要なため、
+`install` では導入されない。**検証の前に一度だけ導入する。**
+
+ステップ2-1 で `python3-venv` を導入済みなので、追加ツールなしで次を実行できる。
+`scripts/test.sh` が優先して使う `.venv` をリポジトリ直下に作る。
+
+```sh
+cd ~/cross-harness
+python3 -m venv .venv
+.venv/bin/python -m pip install pytest
+.venv/bin/python -c 'import pytest; print(pytest.__version__)'
+```
+
+uv を導入済みなら `uv sync --group dev` でも同じ結果になる。
+
+- **合格条件**: 最終行がバージョンを表示する（9.1.1 以上）。
+- **失敗時の対応**: ネットワーク到達性を確認して報告する。`sudo pip install` でシステムの
+  Python へ入れてはならない。`scripts/test.sh` が参照するのは `.venv/bin/python` である。
+
+### 7-2. 実行
 ```sh
 cd ~/cross-harness
 scripts/test.sh
@@ -220,6 +241,7 @@ scripts/e2e.sh
 ```
 - **合格条件**: 両方成功。
 - **失敗時**: 失敗したテスト名と出力を添えて報告（成功したと偽らない）。
+  `pytest is required to run tests` で停止した場合は 7-1 が未実施なので 7-1 に戻る。
 
 `scripts/e2e.sh` は tracked file の `docs/e2e-results.md` を書き換える副作用がある。実行後はリポジトリが
 dirty になり、直後の書き込み委任が `dirty_worktree` で停止しうることを確認する。また、同スクリプト内の
@@ -238,6 +260,7 @@ e2e の成功は Claude 認証済みの証明ではない。認証はステッ�
 - clone: コミットハッシュ
 - install: `doctor` 結果（9項目すべて PASS か）
 - codex-hook trust: 実施済みか、`doctor` 再確認結果
+- テスト依存: `.venv` 作成と pytest 導入の可否、表示された pytest バージョン
 - test.sh / e2e.sh: 成否
 - 未完了・要フォロー事項（あれば）
 
@@ -245,7 +268,7 @@ e2e の成功は Claude 認証済みの証明ではない。認証はステッ�
 
 ## 停止条件（いずれかに該当したら、勝手に回避せず停止して人間に報告）
 
-- 事前確認4点のいずれかがNG（特に WSL2 でない／root／`/mnt` 配下）
+- 事前確認5点のいずれかがNG（特に WSL2 でない／root／`/mnt` 配下／Windows 側シェル）
 - Python が 3.11 未満
 - 認証状態が不明・失敗・レート制限
 - private リポジトリへアクセスできない（アカウント不一致）
