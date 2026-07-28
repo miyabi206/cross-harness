@@ -4,9 +4,27 @@ set -eu
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
 
+# Keep tests isolated from any harness invocation environment.
+for variable in $(awk 'BEGIN { for (name in ENVIRON) if (name ~ /^CROSS_HARNESS_/) print name }'); do
+    unset "$variable"
+done
+
+if [ -x .venv/bin/python ]; then
+    python=.venv/bin/python
+else
+    python=python3
+fi
+
+if ! "$python" -c 'import pytest' >/dev/null 2>&1; then
+    echo "pytest is required to run tests. Install it with either:" >&2
+    echo "  - uv: uv sync --group dev" >&2
+    echo "  - without uv: python3 -m venv .venv && .venv/bin/python -m pip install pytest" >&2
+    exit 1
+fi
+
 export PYTHONDONTWRITEBYTECODE=1
 
-python3 - <<'PY'
+"$python" - <<'PY'
 from pathlib import Path
 import sys
 
@@ -24,6 +42,6 @@ for path in sorted(Path("src").rglob("*.py")):
 if failed:
     raise SystemExit(1)
 PY
-PYTHONPATH=src python3 -m unittest discover -s tests -v
+PYTHONPATH=src "$python" -m pytest tests -v
 ./bin/cross-harness validate --config config/default.toml
 git diff --check
