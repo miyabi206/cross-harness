@@ -1,13 +1,14 @@
 # cross-harness WSL2 セットアップ指示書
 
-あなた（Claude Code）は、**WSL2 上の Ubuntu-24.04** に個人用ツール `cross-harness` を
-導入するセットアップ担当です。この指示書を **上から順に** 実行してください。各ステップには
+あなた（**WSL2 内で動作する Claude Code**）は、**WSL2 上の Ubuntu-24.04** に個人用ツール
+`cross-harness` を導入するセットアップ担当です。この指示書を **上から順に** 実行してください。各ステップには
 「実行コマンド」「合格条件」「失敗時の対応」があります。合格条件を満たさないまま次へ進まないこと。
 
 対象トポロジ: Claude（親・オーケストレータ）→ Codex（子・実行）の一方向・一段のみ。
 このマシンは native Linux なので、macOS 専用の Seatbelt サンドボックス（Claude 書き込みロールの封じ込め）は
 `platform_not_darwin` として**無効になりますが、これは想定内**です（既定では書き込み実行は Codex 側で、
-Linux の Landlock/seccomp 実サンドボックスが効きます）。
+Linux の Landlock/seccomp 実サンドボックスが効きます）。これは `doctor` の出力ではなく、書き込みロールの
+委任ごとに `sandbox_exec` の理由として run メタデータへ記録される文字列です。
 
 ---
 
@@ -26,7 +27,7 @@ Linux の Landlock/seccomp 実サンドボックスが効きます）。
 
 ---
 
-## 1. 事前確認 — 合格ライン4点（NG が1つでもあれば停止して報告）
+## 1. 事前確認 — 合格ライン5点（NG が1つでもあれば停止して報告）
 
 ```sh
 cd ~
@@ -34,11 +35,33 @@ pwd                                   # 1) /home/<user> であること（/mnt/.
 whoami                                # 2) 一般ユーザー（root はNG。プロンプト末尾が $ で # でない）
 grep VERSION= /etc/os-release         # 3) Ubuntu 24.04 (Noble)
 uname -r                              # 4) 文字列に "WSL2" を含む（例: 6.x...-microsoft-standard-WSL2）
+test -n "${WSL_DISTRO_NAME:-}"         # 5) 実行主体が WSL2 内のシェルであること
 ```
 
-- **合格条件**: 4項目すべて OK。
+- **合格条件**: 5項目すべて OK。`pwd` は `/home/<user>` 配下であり、実行主体は WSL2 内のシェルであること。
 - **失敗時**: どれがNGかを報告して停止。特に `uname -r` に `WSL2` が無い（WSL1）場合、
   Codex の実サンドボックスが効かないため、人間に「Windows側で `wsl --set-version Ubuntu-24.04 2`」を依頼する。
+  Windows 側 Claude Code の Git Bash では `pwd` が `/c/Users/...` となり不合格であるため、WSL2 内のシェルからやり直す。
+
+---
+
+## 1-1. 対象プロジェクトの配置方針
+
+対象プロジェクトは WSL ネイティブFS の `$HOME` 配下に置く。`delegate` の `--cwd` に `/mnt/c` 配下のパスを
+渡さない。
+
+```sh
+cd ~
+pwd                                   # /home/<user> 配下であること
+```
+
+- **合格条件**: clone と以後の作業対象が `$HOME` 配下にあり、`delegate --cwd` に `/mnt/c/...` を渡さない。
+- **失敗時の対応**: Windows 側にプロジェクトがある場合も、その clone を流用せず、WSL 側に作業用 clone を作成する。
+  両者の同期は push/pull で行い、Windows 側 clone を install 元にしない。
+
+> **注記**: このリポジトリには `.gitattributes` がない。Windows の既定 `core.autocrlf=true` で clone すると
+> `bin/cross-harness` の shebang が CRLF になり、install はそれをコピーするため
+> `~/.local/bin/cross-harness` が恒久的に壊れる。Windows 側の既存 clone は install 元に流用しないこと。
 
 ---
 
@@ -83,11 +106,18 @@ codex --version
 - **合格条件**: `node --version` と `codex --version` が表示される。
 
 ### 2-4. Claude Code の存在確認
-あなた自身が Claude Code なので通常は導入済み。確認のみ。
+あなた自身が Claude Code なので通常は導入済み。Windows 側の実行ファイルを検出して偽に合格しないよう、
+WSL 内の `claude` であることも確認する。
 ```sh
+claude_path="$(command -v claude)" || exit 1
+printf '%s\n' "$claude_path"
+case "$claude_path" in /mnt/*|*.exe) exit 1 ;; esac
 claude --version
 ```
-- **合格条件**: バージョンが表示される。表示されなければ、人間に WSL 内での Claude Code 導入を依頼して停止。
+- **合格条件**: バージョンが表示され、`command -v claude` の解決先が `/mnt/` 配下でも `.exe` でもない。
+  Windows 側の Claude Code は不合格とする。
+- **失敗時の対応**: Windows 側の `claude` が解決された場合、WSL 内へ Claude Code を導入または PATH を修正するよう
+  人間に依頼して停止する。
 
 ### 2-5. PATH 設定（インストーラが作る `~/.local/bin` を通す）
 ```sh
@@ -127,6 +157,7 @@ cd ~/cross-harness
 git log --oneline -1                  # 最新コミットが取得できていること
 ```
 - **合格条件**: `~/cross-harness` に clone され、`git log` が出る。作業ディレクトリが `/mnt/...` でないこと。
+  Windows 側 clone を install 元として流用していないこと。
 - **失敗時**: private リポジトリへのアクセス権（miyabi206 でのログイン）を確認。別アカウントなら collaborator 追加が必要 → 人間に報告して停止。
 
 ---
@@ -153,8 +184,11 @@ cd ~/cross-harness
 # 5-5. 健全性チェック
 ~/.local/bin/cross-harness doctor
 ```
-- **合格条件**: `doctor` が問題を報告しない（グリーン）。
-- **注意**: `platform_not_darwin`（Seatbelt 無効）は**想定内で問題なし**。それ以外の失敗は報告。
+- **合格条件**: `doctor` の9項目（configuration、independent Codex CLI、independent Claude CLI、
+  API-key environment、Codex ChatGPT auth、Claude subscription auth、Claude charter、Codex charter、
+  Codex hook trust）がすべて PASS。`independent Codex CLI` は `codex` の解決先が
+  `/.vscode/extensions/` 配下であれば FAIL となるため、その状態も不合格とする。
+- **失敗時の対応**: `doctor` の FAIL はすべて停止条件である。FAIL の項目を添えて停止・報告する。
 - **symlink 作成失敗**が出たら、作業場所が `/mnt/...` でないか（ステップ0違反）を最優先で疑う。
 
 ---
@@ -172,7 +206,7 @@ cd ~/cross-harness
 ~/.local/bin/cross-harness trust codex-hook --confirmed-after-review
 ~/.local/bin/cross-harness doctor
 ```
-- **合格条件**: `doctor` がグリーン。
+- **合格条件**: `doctor` の9項目がすべて PASS。
 - **失敗時**: 停止して報告（**信頼をスキップしたり `--force` 等で迂回しない**）。
 
 ---
@@ -187,17 +221,22 @@ scripts/e2e.sh
 - **合格条件**: 両方成功。
 - **失敗時**: 失敗したテスト名と出力を添えて報告（成功したと偽らない）。
 
+`scripts/e2e.sh` は tracked file の `docs/e2e-results.md` を書き換える副作用がある。実行後はリポジトリが
+dirty になり、直後の書き込み委任が `dirty_worktree` で停止しうることを確認する。また、同スクリプト内の
+`claude auth status` は失敗しても `not verified by this run` に落ち、スクリプト自体は PASS する。したがって、
+e2e の成功は Claude 認証済みの証明ではない。認証はステップ3の検証結果で判断する。
+
 ---
 
 ## 8. 完了報告フォーマット（最後に人間へ）
 
 以下を埋めて報告すること:
 
-- 事前確認4点: pwd / whoami / os-release / uname → 各結果
+- 事前確認5点: pwd / whoami / os-release / uname / WSL 内シェル → 各結果
 - 導入ツール版: python3 / gh / node / codex / claude
 - 認証状態: gh / codex / claude（各「認証済み」か）
 - clone: コミットハッシュ
-- install: `doctor` 結果（グリーン/警告内容）※`platform_not_darwin` は正常
+- install: `doctor` 結果（9項目すべて PASS か）
 - codex-hook trust: 実施済みか、`doctor` 再確認結果
 - test.sh / e2e.sh: 成否
 - 未完了・要フォロー事項（あれば）
@@ -210,7 +249,7 @@ scripts/e2e.sh
 - Python が 3.11 未満
 - 認証状態が不明・失敗・レート制限
 - private リポジトリへアクセスできない（アカウント不一致）
-- `install` / `doctor` が `platform_not_darwin` **以外**の失敗を出す
+- `install` が失敗した、または `doctor` の9項目のいずれかが FAIL
 - symlink 作成失敗、権限エラー（＝ネイティブFS外の疑い）
 - 再帰検出、リトライ予算の枯渇
 - 既存のユーザー変更・未コミット作業を壊しそうな操作が必要になったとき
