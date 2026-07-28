@@ -648,7 +648,8 @@ class HookTests(unittest.TestCase):
                 self.assertEqual(0, claude_session_start(home))
 
             explorer = (home / ".claude/agents/cross-harness-explorer.md").read_text()
-            self.assertIn("model: haiku", explorer)
+            self.assertNotIn("model:", explorer)
+            self.assertNotIn("effort:", explorer)
             self.assertIn("harness is 'codex', not 'claude'", stdout.getvalue())
 
 

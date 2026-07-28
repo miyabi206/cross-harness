@@ -3,11 +3,13 @@ import json
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from cross_harness.files import MARKER_START
+from cross_harness.files import MARKER_START, sha256
 from cross_harness.errors import ConfigError, HarnessError
-from cross_harness.installer import install, uninstall
-from cross_harness.paths import source_root
+from cross_harness.config import load_config
+from cross_harness.installer import install, synchronize_claude_agent_roles, uninstall
+from cross_harness.paths import source_root, user_paths
 
 
 class InstallerTests(unittest.TestCase):
@@ -32,6 +34,10 @@ class InstallerTests(unittest.TestCase):
             actions = install(home, repo)
             self.assertEqual(5, len(actions))
             self.assertIn(MARKER_START, (home / ".claude/CLAUDE.md").read_text())
+            installed_claude = (home / ".claude/CLAUDE.md").read_text()
+            self.assertIn("## Communication", installed_claude)
+            self.assertIn("or above 70 percent.", installed_claude)
+            self.assertNotIn("{{CONTEXT_THRESHOLD_PERCENT}}", installed_claude)
             settings = json.loads((home / ".claude/settings.json").read_text())
             self.assertEqual("fable", settings["model"])
             self.assertIn("PreToolUse", settings["hooks"])
@@ -41,6 +47,9 @@ class InstallerTests(unittest.TestCase):
             installed_skill = (home / ".claude/skills/cross-harness-orchestrator/SKILL.md").read_text()
             self.assertIn(str(home.resolve() / ".local/bin/cross-harness"), installed_skill)
             self.assertNotIn("{{CROSS_HARNESS_BIN}}", installed_skill)
+            for installed in (home / ".claude").rglob("*"):
+                if installed.is_file():
+                    self.assertNotIn("{{CONTEXT_THRESHOLD_PERCENT}}", installed.read_text(encoding="utf-8"))
             explorer = (home / ".claude/agents/cross-harness-explorer.md").read_text()
             reviewer = (home / ".claude/agents/cross-harness-reviewer.md").read_text()
             self.assertIn("model: haiku", explorer)
@@ -54,6 +63,64 @@ class InstallerTests(unittest.TestCase):
             for path, content in originals.items():
                 self.assertEqual(content, path.read_text(encoding="utf-8"))
             self.assertFalse((home / ".local/bin/cross-harness").exists())
+
+    def test_first_install_records_post_sync_agent_hashes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            config = home / ".config/cross-harness/config.toml"
+            config.parent.mkdir(parents=True)
+            contents = (repo / "config/default.toml").read_text(encoding="utf-8")
+            contents = contents.replace(
+                '[roles.implementer]\nharness = "codex"\nmodel = "gpt-5.6-terra"\neffort = "high"',
+                '[roles.implementer]\nharness = "claude"\nmodel = "sonnet"\neffort = "medium"',
+            )
+            config.write_text(contents, encoding="utf-8")
+
+            install(home, repo)
+            implementer = home / ".claude/agents/cross-harness-implementer.md"
+            self.assertIn("model: sonnet", implementer.read_text(encoding="utf-8"))
+
+            manifest = json.loads((home / ".local/state/cross-harness/install-manifest.json").read_text(encoding="utf-8"))
+            for record in manifest["records"]:
+                if "installed_hash" in record:
+                    path = Path(record["path"])
+                    self.assertEqual(sha256(path), record["installed_hash"])
+
+            install(home, repo)
+
+    def test_install_materializes_context_threshold_in_all_template_paths(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            config = home / ".config/cross-harness/config.toml"
+            config.parent.mkdir(parents=True)
+            contents = (repo / "config/default.toml").read_text(encoding="utf-8")
+            config.write_text(contents.replace("context_threshold_percent = 70", "context_threshold_percent = 63"), encoding="utf-8")
+            for source in (
+                repo / "assets/shared/safety.md",
+                repo / "assets/claude/skills/cross-harness-orchestrator/SKILL.md",
+                repo / "assets/claude/agents/explorer.md",
+            ):
+                source.write_text(source.read_text(encoding="utf-8") + "\nThreshold: {{CONTEXT_THRESHOLD_PERCENT}}\n", encoding="utf-8")
+
+            install(home, repo)
+
+            for installed in (
+                home / ".claude/CLAUDE.md",
+                home / ".codex/AGENTS.md",
+                home / ".claude/skills/cross-harness-orchestrator/SKILL.md",
+                home / ".claude/agents/cross-harness-explorer.md",
+            ):
+                content = installed.read_text(encoding="utf-8")
+                self.assertIn("Threshold: 63", content)
+                self.assertNotIn("{{CONTEXT_THRESHOLD_PERCENT}}", content)
 
     def test_install_materializes_claude_agent_role_models_and_efforts_from_config(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -114,7 +181,7 @@ class InstallerTests(unittest.TestCase):
             self.assertIn("model: custom-security", security_reviewer)
             self.assertIn("effort: security-effort", security_reviewer)
 
-    def test_install_does_not_write_codex_role_settings_to_claude_agents(self):
+    def test_codex_routed_role_loses_frontmatter_and_claude_sync_restores_it(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             home = root / "home"
@@ -125,16 +192,33 @@ class InstallerTests(unittest.TestCase):
             config.parent.mkdir(parents=True)
             contents = (repo / "config/default.toml").read_text(encoding="utf-8")
             contents = contents.replace(
-                'harness = "claude"\nmodel = "haiku"\neffort = "low"',
-                'harness = "codex"\nmodel = "gpt-5.6-terra"\neffort = "high"',
+                '[roles.explorer]\nharness = "claude"\nmodel = "haiku"\neffort = "low"',
+                '[roles.explorer]\nharness = "codex"\nmodel = "gpt-5.6-terra"\neffort = "high"',
             )
             config.write_text(contents, encoding="utf-8")
 
             install(home, repo)
 
             explorer = (home / ".claude/agents/cross-harness-explorer.md").read_text()
-            self.assertIn("model: haiku", explorer)
-            self.assertIn("effort: low", explorer)
+            self.assertNotIn("model:", explorer)
+            self.assertNotIn("effort:", explorer)
+            frontmatter = explorer.split("---\n", 2)[1]
+            self.assertNotIn("\n\n", frontmatter)
+            with patch("cross_harness.installer.atomic_write") as atomic_write:
+                synchronize_claude_agent_roles(user_paths(home), load_config(config, home))
+            atomic_write.assert_not_called()
+            self.assertEqual(explorer, (home / ".claude/agents/cross-harness-explorer.md").read_text())
+
+            restored = contents.replace(
+                '[roles.explorer]\nharness = "codex"\nmodel = "gpt-5.6-terra"\neffort = "high"',
+                '[roles.explorer]\nharness = "claude"\nmodel = "sonnet"\neffort = "medium"',
+            )
+            config.write_text(restored, encoding="utf-8")
+            synchronize_claude_agent_roles(user_paths(home), load_config(config, home))
+
+            explorer = (home / ".claude/agents/cross-harness-explorer.md").read_text()
+            self.assertIn("model: sonnet", explorer)
+            self.assertIn("effort: medium", explorer)
 
     def test_dry_run_does_not_touch_home(self):
         with tempfile.TemporaryDirectory() as folder:

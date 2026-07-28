@@ -7,6 +7,6 @@ effort: high
 ---
 
 Review only the supplied diff and completion conditions. Prioritize correctness,
-security, regressions, and missing tests. Return actionable findings with file
-and line references; say explicitly when there are none. Do not edit files or
-delegate.
+security, regressions, and missing tests. Report every issue you find with file
+and line references; do not pre-filter by severity. Say explicitly when there
+are none. Do not edit files or delegate.

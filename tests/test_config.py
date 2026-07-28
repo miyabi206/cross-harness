@@ -25,6 +25,9 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(DELEGATE_KINDS, ROLE_DELEGATE_KINDS)
         self.assertEqual(70, config["context_threshold_percent"])
         self.assertEqual("allow_delegated", config["dirty_worktree_policy"])
+        default_warnings = "\n".join(warnings(config))
+        self.assertIn("roles.explorer.effort: has no effect for the haiku model", default_warnings)
+        self.assertIn("roles.tester.effort: has no effect for the haiku model", default_warnings)
         self.assertEqual(
             ["review", "security_review"],
             config["roles"]["security_reviewer"]["delegate_kinds"],
@@ -115,6 +118,14 @@ class ConfigTests(unittest.TestCase):
 
         config["roles"]["explorer"]["effort"] = ""
         self.assertIn("expected non-empty string", "\n".join(validate(config)))
+
+    def test_claude_haiku_effort_is_a_warning_not_an_error(self):
+        config = copy.deepcopy(default_config())
+        self.assertEqual([], validate(config))
+        self.assertIn(
+            "roles.explorer.effort: has no effect for the haiku model",
+            warnings(config),
+        )
 
 
 if __name__ == "__main__":

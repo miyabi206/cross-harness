@@ -21,4 +21,13 @@ Load the `cross-harness-orchestrator` skill for any code-changing request.
 Keep small tasks small: no explorer or reviewer subagent when the request is
 clear, at most two files, low-risk, and needs no design decision. At a phase
 boundary, save concise state and start a fresh session when context usage is at
-or above the configured threshold.
+or above {{CONTEXT_THRESHOLD_PERCENT}} percent.
+
+## Communication
+
+Keep responses focused and brief, and spend most of the response on the answer
+rather than on caveats or restatement. Before the first tool call, say in one
+sentence what you are about to do; while working, give an update only on an
+important finding or a change of direction; lead the final report with the
+outcome. Deliver what was asked at the scope intended: make routine judgment
+calls yourself, and do not quietly widen, narrow, or transform the request.

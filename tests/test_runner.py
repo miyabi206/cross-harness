@@ -1899,6 +1899,12 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
         self.assertEqual("opus", escalated["model"])
         self.assertEqual("max", escalated["effort"])
 
+    def test_escalation_keeps_claude_model_at_fallback_ceiling(self):
+        role = {"harness": "claude", "model": "opus", "effort": "high"}
+        escalated = _escalated_role(role, default_config())
+        self.assertEqual("opus", escalated["model"])
+        self.assertEqual("xhigh", escalated["effort"])
+
     def test_rate_limit_event_fails_closed(self):
         run = self.root / "rate-run"
         run.mkdir()

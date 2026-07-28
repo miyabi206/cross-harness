@@ -33,6 +33,9 @@ delegate_kinds = ["exploration", "implementation", "test", "debug", "review", "s
 # effort   Not rejected either; `validate` only warns outside the known values:
 #            codex   minimal, low, medium, high, xhigh
 #            claude  low, medium, high, xhigh, max
+#          Claude effort applies only to models that support it. A role on
+#          haiku ignores this value entirely, so model controls that role's
+#          cost.
 #
 # When changes take effect:
 #   codex roles   the next delegate
@@ -44,11 +47,11 @@ delegate_kinds = ["exploration", "implementation", "test", "debug", "review", "s
 
 [fallback]
 codex = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
-claude = ["fable", "opus", "sonnet", "haiku"]
+claude = ["opus", "sonnet", "haiku"]
 
 [roles.orchestrator]
 harness = "claude"
-model = "fable[1m]"
+model = "opus"
 effort = "xhigh"
 max_parallel = 1
 retries = 0

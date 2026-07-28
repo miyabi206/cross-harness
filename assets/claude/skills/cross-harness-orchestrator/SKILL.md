@@ -112,3 +112,5 @@ Runtime cleanup marks incomplete runs as ORPHANED only when their
 
 Report only changes, verification, and unresolved items. Do not repeat the raw
 Codex response or terminal log.
+Lead with the outcome, and match length to what the change needs: no filler
+sections and no second summary of work already described.

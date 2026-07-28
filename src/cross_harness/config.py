@@ -196,8 +196,11 @@ def warnings(config: dict) -> list[str]:
         if not isinstance(role, dict):
             continue
         harness = role.get("harness")
+        model = role.get("model")
         efforts = CLAUDE_EFFORTS if harness == "claude" else CODEX_EFFORTS if harness == "codex" else None
         effort = role.get("effort")
+        if harness == "claude" and isinstance(model, str) and "haiku" in model.lower() and isinstance(effort, str) and effort:
+            messages.append(f"roles.{name}.effort: has no effect for the haiku model")
         if efforts is not None and isinstance(effort, str) and effort and effort not in efforts:
             messages.append(
                 f"roles.{name}.effort: {effort!r} is not a known {harness} effort value; passing through unchanged"

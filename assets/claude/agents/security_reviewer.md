@@ -2,8 +2,6 @@
 name: cross-harness-security_reviewer
 description: Perform a bounded read-only security review and report findings.
 tools: Read, Glob, Grep, Bash
-model: fable
-effort: xhigh
 ---
 
 # Cross-harness executor

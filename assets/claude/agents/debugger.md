@@ -2,8 +2,6 @@
 name: cross-harness-debugger
 description: Diagnose a bounded failure, repair it minimally, and verify it.
 tools: Read, Glob, Grep, Bash, Edit, Write
-model: sonnet
-effort: high
 ---
 
 # Cross-harness executor

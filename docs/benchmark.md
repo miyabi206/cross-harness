@@ -33,7 +33,7 @@ HEAD, renders the same prompt from the task manifest, captures Claude stream
 JSON, discovers only new cross-harness run directories for that worktree, runs
 the required checks independently, and writes `record.json` plus `audit.json`.
 
-Baseline uses Claude `fable[1m]` at `xhigh` in safe mode. The prompt explicitly
+Baseline uses Claude `opus[1m]` at `xhigh` in safe mode. The prompt explicitly
 requires reading the repository `AGENTS.md`, so disabling personal
 customizations does not disable repository rules. Cross-harness uses the same
 Claude model, effort, prompt, and allowed built-in tools with the installed

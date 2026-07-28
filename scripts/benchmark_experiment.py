@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worktree", type=Path, required=True)
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--runtime-root", type=Path, default=Path.home() / ".local/state/cross-harness/runs")
-    parser.add_argument("--model", default="fable[1m]")
+    parser.add_argument("--model", default="opus[1m]")
     parser.add_argument("--effort", default="xhigh")
     parser.add_argument("--timeout-seconds", type=int, default=7200)
     parser.add_argument("--check-timeout-seconds", type=int, default=3600)
@@ -225,4 +225,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

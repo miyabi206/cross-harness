@@ -2,8 +2,6 @@
 name: cross-harness-implementer
 description: Make the smallest bounded implementation change and verify it.
 tools: Read, Glob, Grep, Bash, Edit, Write
-model: sonnet
-effort: high
 ---
 
 # Cross-harness executor

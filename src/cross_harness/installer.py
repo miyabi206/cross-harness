@@ -68,18 +68,21 @@ def _write_text(
     records.append(record)
 
 
-def _template(text: str, executable: Path) -> str:
-    return text.replace("{{CROSS_HARNESS_BIN}}", str(executable))
+def _template(text: str, executable: Path, context_threshold_percent: int) -> str:
+    return (
+        text.replace("{{CROSS_HARNESS_BIN}}", str(executable))
+        .replace("{{CONTEXT_THRESHOLD_PERCENT}}", str(context_threshold_percent))
+    )
 
 
-def _materialize_templates(path: Path, executable: Path) -> None:
+def _materialize_templates(path: Path, executable: Path, context_threshold_percent: int) -> None:
     candidates = [path] if path.is_file() else [item for item in path.rglob("*") if item.is_file()]
     for candidate in candidates:
         try:
             text = candidate.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
-        rendered = _template(text, executable)
+        rendered = _template(text, executable, context_threshold_percent)
         if rendered != text:
             atomic_write(candidate, rendered, candidate.stat().st_mode & 0o777)
 
@@ -117,10 +120,19 @@ def _render_claude_agent_role(text: str, role: dict) -> str:
             f"{key}: {_frontmatter_scalar(value)}",
             frontmatter,
         )
-        if count != 1:
-            raise HarnessError(f"Claude agent template is missing {key} frontmatter")
-        frontmatter = rendered
+        frontmatter = rendered if count else frontmatter.rstrip("\n") + f"\n{key}: {_frontmatter_scalar(value)}"
     return "---\n" + frontmatter + text[closing:]
+
+
+def _remove_claude_agent_role_keys(text: str) -> str:
+    """Remove managed role keys only from an agent's YAML frontmatter."""
+    if not text.startswith("---\n"):
+        return text
+    closing = text.find("\n---\n", 4)
+    if closing < 0:
+        return text
+    frontmatter = re.sub(r"(?m)^(?:model|effort):.*\n?", "", text[4:closing])
+    return "---\n" + frontmatter.rstrip("\n") + text[closing:]
 
 
 def synchronize_claude_agent_roles(paths: UserPaths, config: dict) -> list[str]:
@@ -134,14 +146,17 @@ def synchronize_claude_agent_roles(paths: UserPaths, config: dict) -> list[str]:
         if not isinstance(role, dict):
             raise HarnessError(f"configuration role {role_name!r} is unavailable for Claude agent synchronization")
         harness = role.get("harness")
+        path = paths.claude / "agents" / filename
+        text = path.read_text(encoding="utf-8")
         if harness != "claude":
+            rendered = _remove_claude_agent_role_keys(text)
+            if rendered != text:
+                atomic_write(path, rendered, path.stat().st_mode & 0o777)
             warnings.append(
                 f"Skipped Claude agent synchronization for role {role_name!r}: "
                 f"harness is {harness!r}, not 'claude'"
             )
             continue
-        path = paths.claude / "agents" / filename
-        text = path.read_text(encoding="utf-8")
         rendered = _render_claude_agent_role(text, role)
         if rendered != text:
             atomic_write(path, rendered, path.stat().st_mode & 0o777)
@@ -155,9 +170,13 @@ def _merge_markdown(
     backup: Path,
     records: list[dict],
     executable: Path,
+    context_threshold_percent: int,
 ) -> None:
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
-    content = "\n\n".join(_template(source.read_text(encoding="utf-8"), executable).rstrip() for source in sources)
+    content = "\n\n".join(
+        _template(source.read_text(encoding="utf-8"), executable, context_threshold_percent).rstrip()
+        for source in sources
+    )
     _write_text(path, append_marker(existing, content), paths, backup, records, management="marker")
 
 
@@ -374,8 +393,14 @@ def _install(
         for path in (paths.claude / "CLAUDE.md", paths.codex / "AGENTS.md"):
             if path.is_file():
                 atomic_write(path, remove_marker(path.read_text(encoding="utf-8")))
-    _merge_markdown(paths.claude / "CLAUDE.md", [repo / "assets/claude/CLAUDE.md", shared], paths, backup_root, records, paths.executable)
-    _merge_markdown(paths.codex / "AGENTS.md", [repo / "assets/codex/AGENTS.md", shared], paths, backup_root, records, paths.executable)
+    _merge_markdown(
+        paths.claude / "CLAUDE.md", [repo / "assets/claude/CLAUDE.md", shared], paths,
+        backup_root, records, paths.executable, config["context_threshold_percent"],
+    )
+    _merge_markdown(
+        paths.codex / "AGENTS.md", [repo / "assets/codex/AGENTS.md", shared], paths,
+        backup_root, records, paths.executable, config["context_threshold_percent"],
+    )
 
     settings = paths.claude / "settings.json"
     _write_text(settings, _merge_claude_settings(settings, paths.executable), paths, backup_root, records, management="claude_settings")
@@ -410,10 +435,17 @@ def _install(
         else:
             shutil.copy2(source, destination)
             _finish_record(record, destination)
-        _materialize_templates(destination, paths.executable)
+        _materialize_templates(destination, paths.executable, config["context_threshold_percent"])
         _finish_record(record, destination)
         records.append(record)
     synchronize_claude_agent_roles(paths, config)
+    claude_agent_paths = {
+        str(paths.claude / "agents" / filename)
+        for filename in CLAUDE_AGENT_ROLES
+    }
+    for record in records:
+        if record["path"] in claude_agent_paths:
+            _finish_record(record, Path(record["path"]))
     for source in sorted((repo / "assets/codex/agents").glob("*.toml")):
         destination = paths.codex / "agents" / f"cross-harness-{source.name}"
         record = _record(destination, paths, backup_root)

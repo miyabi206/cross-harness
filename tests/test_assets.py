@@ -22,15 +22,19 @@ class AssetTests(unittest.TestCase):
     def test_claude_executor_agents_use_executor_charter_and_permissions(self):
         assets = source_root() / "assets/claude/agents"
         expected = {
-            "implementer.md": ("sonnet", "high", "Read, Glob, Grep, Bash, Edit, Write"),
+            "implementer.md": (None, None, "Read, Glob, Grep, Bash, Edit, Write"),
             "tester.md": ("haiku", "medium", "Read, Glob, Grep, Bash"),
-            "debugger.md": ("sonnet", "high", "Read, Glob, Grep, Bash, Edit, Write"),
-            "security_reviewer.md": ("fable", "xhigh", "Read, Glob, Grep, Bash"),
+            "debugger.md": (None, None, "Read, Glob, Grep, Bash, Edit, Write"),
+            "security_reviewer.md": (None, None, "Read, Glob, Grep, Bash"),
         }
         for name, (model, effort, tools) in expected.items():
             content = (assets / name).read_text()
-            self.assertIn(f"model: {model}", content)
-            self.assertIn(f"effort: {effort}", content)
+            if model is None:
+                self.assertNotIn("model:", content)
+                self.assertNotIn("effort:", content)
+            else:
+                self.assertIn(f"model: {model}", content)
+                self.assertIn(f"effort: {effort}", content)
             self.assertIn(f"tools: {tools}", content)
             self.assertIn("Cross-harness executor", content)
             self.assertIn("Do not ask the user questions", content)
