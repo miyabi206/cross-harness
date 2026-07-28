@@ -22,6 +22,15 @@ if ! "$python" -c 'import pytest' >/dev/null 2>&1; then
     exit 1
 fi
 
+if [ "$python" = .venv/bin/python ] && command -v uv >/dev/null 2>&1; then
+    if ! uv_output=$(uv sync --check 2>&1); then
+        printf '%s\n' "$uv_output" >&2
+        echo "uv could not verify that .venv is in sync with uv.lock; the lock may be out of sync or uv may not have completed the check. Run:" >&2
+        echo "  uv sync --group dev" >&2
+        exit 1
+    fi
+fi
+
 export PYTHONDONTWRITEBYTECODE=1
 
 "$python" - <<'PY'
