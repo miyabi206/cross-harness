@@ -73,6 +73,48 @@ def default_config() -> dict:
     return load_toml(source_root() / "config/default.toml")
 
 
+def _merge_tables(defaults: dict, overrides: dict) -> dict:
+    merged = deepcopy(defaults)
+    for key, value in overrides.items():
+        default_value = merged.get(key)
+        if isinstance(default_value, dict) and isinstance(value, dict):
+            merged[key] = _merge_tables(default_value, value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
+
+
+def merge_defaults(overrides: dict) -> dict:
+    """Apply personal settings over the repository defaults without writing them back."""
+    return _merge_tables(default_config(), overrides)
+
+
+def defaulted_paths(overrides: dict) -> list[str]:
+    """Return leaf setting paths supplied by defaults rather than personal settings."""
+    paths: list[str] = []
+
+    def collect(defaults: dict, values: dict, prefix: str = "") -> None:
+        for key, default_value in defaults.items():
+            path = f"{prefix}.{key}" if prefix else key
+            if key not in values:
+                if isinstance(default_value, dict):
+                    collect(default_value, {}, path)
+                else:
+                    paths.append(path)
+            elif isinstance(default_value, dict) and isinstance(values[key], dict):
+                collect(default_value, values[key], path)
+
+    collect(default_config(), overrides)
+    return paths
+
+
+def defaulted_config_paths(path: Path | None = None, home: Path | None = None) -> list[str]:
+    """Return defaults applied to a personal configuration file, if one exists."""
+    home_path = user_paths(home).home
+    selected = path or user_paths(home_path).config
+    return defaulted_paths(load_toml(selected)) if selected.exists() else []
+
+
 def _unknown(actual: set[str], allowed: set[str], location: str, errors: list[str]) -> None:
     for key in sorted(actual - allowed):
         errors.append(f"{location}: unknown key {key!r}")
@@ -217,7 +259,7 @@ def _string_list(value: object, allow_empty: bool = False) -> bool:
 def load_config(path: Path | None = None, home: Path | None = None) -> dict:
     home_path = user_paths(home).home
     selected = path or user_paths(home_path).config
-    config = load_toml(selected) if selected.exists() else default_config()
+    config = merge_defaults(load_toml(selected)) if selected.exists() else default_config()
     errors = validate(config)
     if errors:
         raise ConfigError("invalid configuration:\n- " + "\n- ".join(errors))

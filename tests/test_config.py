@@ -1,16 +1,22 @@
 from pathlib import Path
 import copy
+import tempfile
 import unittest
 
 from cross_harness.config import (
     DELEGATE_KINDS,
     ROLE_DELEGATE_KINDS,
+    defaulted_config_paths,
+    defaulted_paths,
     default_config,
     effective_mode,
+    load_config,
+    merge_defaults,
     project_config,
     validate,
     warnings,
 )
+from cross_harness.errors import ConfigError
 
 
 class ConfigTests(unittest.TestCase):
@@ -136,6 +142,68 @@ class ConfigTests(unittest.TestCase):
             "roles.explorer.effort: has no effect for the haiku model",
             warnings(config),
         )
+
+    def test_merge_defaults_recursively_overlays_personal_values(self):
+        defaults = default_config()
+        overrides = {
+            "retention_days": 14,
+            "delegate_kinds": ["test"],
+            "roles": {"tester": {"timeout_seconds": 321}},
+        }
+
+        merged = merge_defaults(overrides)
+
+        self.assertEqual(14, merged["retention_days"])
+        self.assertEqual(["test"], merged["delegate_kinds"])
+        self.assertEqual(321, merged["roles"]["tester"]["timeout_seconds"])
+        self.assertEqual(defaults["roles"]["tester"]["model"], merged["roles"]["tester"]["model"])
+        self.assertEqual(defaults["fallback"], merged["fallback"])
+        self.assertEqual(defaults["roles"]["reviewer"], merged["roles"]["reviewer"])
+
+    def test_defaulted_paths_lists_only_leaves_added_from_defaults(self):
+        overrides = {
+            "retention_days": 14,
+            "delegate_kinds": ["test"],
+            "roles": {"tester": {"timeout_seconds": 321}},
+            "projects": {"/tmp/personal-only": {"checks": ["test"]}},
+        }
+
+        paths = defaulted_paths(overrides)
+
+        self.assertNotIn("retention_days", paths)
+        self.assertNotIn("delegate_kinds", paths)
+        self.assertNotIn("roles.tester.timeout_seconds", paths)
+        self.assertIn("roles.tester.model", paths)
+        self.assertIn("fallback.codex", paths)
+        self.assertIn("fallback.claude", paths)
+        self.assertNotIn("projects./tmp/personal-only.checks", paths)
+
+    def test_partial_personal_config_loads_and_unknown_keys_remain_invalid_without_writes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder) / "home"
+            config = home / ".config/cross-harness/config.toml"
+            config.parent.mkdir(parents=True)
+            contents = 'retention_days = 14\n[roles.tester]\ntimeout_seconds = 321\n'
+            config.write_text(contents, encoding="utf-8")
+
+            loaded = load_config(config, home)
+
+            self.assertEqual(14, loaded["retention_days"])
+            self.assertEqual(321, loaded["roles"]["tester"]["timeout_seconds"])
+            self.assertEqual([], validate(loaded))
+            self.assertEqual(contents, config.read_text(encoding="utf-8"))
+
+            unknown_contents = contents + 'retentoin_days = 21\n'
+            config.write_text(unknown_contents, encoding="utf-8")
+            with self.assertRaisesRegex(ConfigError, "unknown key 'retentoin_days'"):
+                load_config(config, home)
+            self.assertEqual(unknown_contents, config.read_text(encoding="utf-8"))
+
+    def test_defaulted_config_paths_is_empty_when_personal_config_is_absent(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder) / "home"
+            config = home / ".config/cross-harness/config.toml"
+            self.assertEqual([], defaulted_config_paths(config, home))
 
 
 if __name__ == "__main__":

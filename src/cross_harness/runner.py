@@ -20,7 +20,14 @@ from .auth import (
     verify_codex_chatgpt,
     verify_codex_config_ownership,
 )
-from .config import CLAUDE_EFFORTS, CODEX_EFFORTS, delegation_kind_error, load_config, project_config
+from .config import (
+    CLAUDE_EFFORTS,
+    CODEX_EFFORTS,
+    defaulted_config_paths,
+    delegation_kind_error,
+    load_config,
+    project_config,
+)
 from .errors import AuthError, ConfigError, DirtyWorktreeError, HarnessError, SupervisorDiedError
 from .files import atomic_write, dump_json, sha256
 from .paths import source_root, user_paths
@@ -195,6 +202,7 @@ def _prepare_write_execution(
     attempts: int = 0,
     thread_id: str | None = None,
     signatures: list[str] | None = None,
+    defaulted_settings: list[str] | None = None,
 ) -> Path:
     """Apply the shared write-worktree policy and return the execution root."""
     policy = _effective_dirty_worktree_policy(config, root)
@@ -211,7 +219,10 @@ def _prepare_write_execution(
         reason = "write delegation blocked by pre-existing changes:\n- " + "\n- ".join(dirty[:20])
         finalize_blocked_run(
             run_dir, role_name, role, kind, root, reason, "dirty_worktree",
-            attempts=attempts, thread_id=thread_id, signatures=signatures,
+            attempts=attempts,
+            thread_id=thread_id,
+            signatures=signatures,
+            defaulted_settings=defaulted_settings,
         )
         raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
     return root
@@ -288,6 +299,7 @@ def _prepare_retry_execution(
     attempts: int,
     thread_id: str | None,
     signatures: list[str] | None,
+    defaulted_settings: list[str] | None = None,
 ) -> Path:
     """Prepare a retry from its predecessor's recorded worktree state."""
     if not role["write"]:
@@ -299,7 +311,10 @@ def _prepare_retry_execution(
             reason = "retry blocked: missing isolated worktree"
             finalize_blocked_run(
                 run_dir, role_name, role, kind, root, reason, "missing_isolated_worktree",
-                attempts=attempts, thread_id=thread_id, signatures=signatures,
+                attempts=attempts,
+                thread_id=thread_id,
+                signatures=signatures,
+                defaulted_settings=defaulted_settings,
             )
             raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
         atomic_write(run_dir / "ISOLATED_WORKTREE", str(execution_root) + "\n")
@@ -315,7 +330,10 @@ def _prepare_retry_execution(
         reason = f"retry blocked: {record_error}"
         finalize_blocked_run(
             run_dir, role_name, role, kind, execution_root, reason, "dirty_worktree",
-            attempts=attempts, thread_id=thread_id, signatures=signatures,
+            attempts=attempts,
+            thread_id=thread_id,
+            signatures=signatures,
+            defaulted_settings=defaulted_settings,
         )
         raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
     try:
@@ -325,7 +343,10 @@ def _prepare_retry_execution(
         reason = "retry blocked: could not inspect Git worktree changes to verify the previous run's recorded diff"
         finalize_blocked_run(
             run_dir, role_name, role, kind, execution_root, reason, "dirty_worktree",
-            attempts=attempts, thread_id=thread_id, signatures=signatures,
+            attempts=attempts,
+            thread_id=thread_id,
+            signatures=signatures,
+            defaulted_settings=defaulted_settings,
         )
         raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
     current_changes: set[tuple[str, str | None]] = set()
@@ -341,7 +362,10 @@ def _prepare_retry_execution(
         reason = "retry blocked by changes outside the previous run's recorded diff"
         finalize_blocked_run(
             run_dir, role_name, role, kind, execution_root, reason, "dirty_worktree",
-            attempts=attempts, thread_id=thread_id, signatures=signatures,
+            attempts=attempts,
+            thread_id=thread_id,
+            signatures=signatures,
+            defaulted_settings=defaulted_settings,
         )
         raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
     return execution_root
@@ -926,6 +950,7 @@ def delegate(
         raise HarnessError("nested cross-harness delegation from an active executor is blocked")
     paths = user_paths(home)
     config = load_config(config_path, paths.home)
+    defaulted_settings = defaulted_config_paths(config_path, paths.home)
     if role_name not in config["roles"]:
         raise ConfigError(f"unknown role: {role_name}")
     role = dict(config["roles"][role_name])
@@ -954,7 +979,14 @@ def delegate(
     if task_file.resolve() != run_task.resolve():
         shutil.copy2(task_file, run_task)
     execution_root = _prepare_write_execution(
-        config, role_name, role, kind, root, runtime_root, run_dir,
+        config,
+        role_name,
+        role,
+        kind,
+        root,
+        runtime_root,
+        run_dir,
+        defaulted_settings=defaulted_settings,
     )
     _write_baseline(run_dir, execution_root)
     try:
@@ -967,7 +999,16 @@ def delegate(
         else:
             raise ConfigError(f"unsupported harness: {role['harness']}")
     except AuthError as exc:
-        return finalize_blocked_run(run_dir, role_name, role, kind, execution_root, str(exc), "authentication")
+        return finalize_blocked_run(
+            run_dir,
+            role_name,
+            role,
+            kind,
+            execution_root,
+            str(exc),
+            "authentication",
+            defaulted_settings=defaulted_settings,
+        )
     environment = sanitized_environment(paths.home, {
         "CROSS_HARNESS_ACTIVE": "1",
         "CROSS_HARNESS_EXECUTOR": role["harness"],
@@ -1003,7 +1044,9 @@ def delegate(
         _write_claude_final_from_events(run_dir)
     return finalize_run(
         run_dir, role_name, role, kind, execution_root, exit_code, attempt=1,
-        runtime_root=runtime_root, dirty_worktree_policy=effective_policy,
+        runtime_root=runtime_root,
+        dirty_worktree_policy=effective_policy,
+        defaulted_settings=defaulted_settings,
     )
 
 
@@ -1198,6 +1241,7 @@ def finalize_blocked_run(
     attempts: int = 0,
     thread_id: str | None = None,
     signatures: list[str] | None = None,
+    defaulted_settings: list[str] | None = None,
 ) -> dict:
     final = {
         "status": "blocked",
@@ -1233,6 +1277,7 @@ def finalize_blocked_run(
         "final_message": _final_message_path(run_dir),
         "final_text": _final_text_path(run_dir),
         "cwd": str(cwd),
+        "defaulted_settings": defaulted_settings or [],
     }
     state = {
         "role": role_name,
@@ -1266,6 +1311,7 @@ def finalize_run(
     *,
     runtime_root: Path | None = None,
     dirty_worktree_policy: str | None = None,
+    defaulted_settings: list[str] | None = None,
 ) -> dict:
     parsed = parse_events(run_dir / "events.jsonl")
     declared_checks = _declared_checks(run_dir)
@@ -1470,6 +1516,7 @@ def finalize_run(
         "diff_stat_file": str(run_dir / "diff-stat.txt"),
         "baseline_file": str(run_dir / "baseline.json"),
         "cwd": str(cwd),
+        "defaulted_settings": defaulted_settings or [],
     }
     if self_reversion_check_unavailable:
         summary["self_reversion_check"] = "unavailable"
@@ -1538,6 +1585,7 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         raise HarnessError("nested cross-harness retry from an active executor is blocked")
     paths = user_paths(home)
     config = load_config(config_path, paths.home)
+    defaulted_settings = defaulted_config_paths(config_path, paths.home)
     state_path = run_dir / "state.json"
     if not state_path.exists():
         raise HarnessError(f"run state not found: {state_path}")
@@ -1580,7 +1628,10 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
     shutil.copy2(task_file, retry_root / "task.md")
     execution_root = _prepare_retry_execution(
         config, role_name, role, state["kind"], source_root, retry_root, run_dir,
-        attempts=state["attempts"], thread_id=state["thread_id"], signatures=state.get("signatures", []),
+        attempts=state["attempts"],
+        thread_id=state["thread_id"],
+        signatures=state.get("signatures", []),
+        defaulted_settings=defaulted_settings,
     )
     _write_baseline(retry_root, execution_root)
     try:
@@ -1604,6 +1655,7 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
             attempts=state["attempts"],
             thread_id=state["thread_id"],
             signatures=state.get("signatures", []),
+            defaulted_settings=defaulted_settings,
         )
     environment = sanitized_environment(paths.home, {
         "CROSS_HARNESS_ACTIVE": "1",
@@ -1647,7 +1699,9 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         _write_claude_final_from_events(retry_root)
     summary = finalize_run(
         retry_root, state["role"], role, state["kind"], execution_root, exit_code, state["attempts"] + 1,
-        runtime_root=runtime_root, dirty_worktree_policy=effective_policy,
+        runtime_root=runtime_root,
+        dirty_worktree_policy=effective_policy,
+        defaulted_settings=defaulted_settings,
     )
     new_state = json.loads((retry_root / "state.json").read_text(encoding="utf-8"))
     new_state["signatures"] = [*state.get("signatures", []), *new_state.get("signatures", [])]
@@ -1662,6 +1716,7 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
             config, role_name, escalation, state["kind"], source_root, escalation_root, retry_root,
             attempts=new_state["attempts"], thread_id=summary.get("thread_id"),
             signatures=new_state.get("signatures", []),
+            defaulted_settings=defaulted_settings,
         )
         _write_baseline(escalation_root, escalation_execution_root)
         command = _command(
@@ -1704,6 +1759,7 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
             escalation_root, state["role"], escalation, state["kind"], escalation_execution_root,
             code, new_state["attempts"] + 1, runtime_root=runtime_root,
             dirty_worktree_policy=_effective_dirty_worktree_policy(config, source_root),
+            defaulted_settings=defaulted_settings,
         )
         escalated_state = json.loads((escalation_root / "state.json").read_text(encoding="utf-8"))
         escalated_state["escalated"] = True

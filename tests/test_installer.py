@@ -228,6 +228,46 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(5, len(actions))
             self.assertEqual([], list(home.iterdir()))
 
+    def test_install_reports_defaulted_settings_for_existing_partial_config_without_rewriting_it(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            config = home / ".config/cross-harness/config.toml"
+            config.parent.mkdir(parents=True)
+            contents = 'retention_days = 14\n[roles.tester]\ntimeout_seconds = 321\n'
+            config.write_text(contents, encoding="utf-8")
+            # The partial config supplies two of 75 default leaf settings.
+            expected_defaulted_count = 73
+            expected_default_action = "default: roles.tester.model"
+
+            dry_run_actions = install(home, repo, dry_run=True)
+
+            self.assertIn(f"defaulted settings: {expected_defaulted_count}", dry_run_actions)
+            self.assertEqual(
+                expected_defaulted_count,
+                len([action for action in dry_run_actions if action.startswith("default: ")]),
+            )
+            self.assertIn(expected_default_action, dry_run_actions)
+            self.assertEqual(contents, config.read_text(encoding="utf-8"))
+
+            install_actions = install(home, repo)
+
+            self.assertIn(f"defaulted settings: {expected_defaulted_count}", install_actions)
+            self.assertEqual(
+                expected_defaulted_count,
+                len([action for action in install_actions if action.startswith("default: ")]),
+            )
+            self.assertIn(expected_default_action, install_actions)
+            self.assertEqual(contents, config.read_text(encoding="utf-8"))
+
+            first_home = root / "first-home"
+            first_home.mkdir()
+            first_actions = install(first_home, repo, dry_run=True)
+            self.assertFalse(any(action.startswith("defaulted settings:") or action.startswith("default: ") for action in first_actions))
+
     def test_install_updates_existing_installation_and_preserves_personal_config(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

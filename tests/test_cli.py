@@ -12,6 +12,29 @@ from cross_harness.errors import SupervisorDiedError
 
 
 class CliWaitTests(unittest.TestCase):
+    def test_validate_reports_defaulted_settings_for_partial_personal_config(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            home.mkdir()
+            config = root / "config.toml"
+            config.write_text(
+                '[roles.explorer]\neffort = "future-effort"\n', encoding="utf-8"
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                self.assertEqual(
+                    0,
+                    main(["--home", str(home), "validate", "--config", str(config)]),
+                )
+
+            self.assertEqual("configuration valid\n", stdout.getvalue())
+            self.assertIn("warning: roles.explorer.effort", stderr.getvalue())
+            self.assertIn("default: roles.tester.model", stderr.getvalue())
+            self.assertNotIn("default: roles.explorer.effort", stderr.getvalue())
+
     def test_validate_reports_unknown_effort_as_warning_without_failure(self):
         with tempfile.TemporaryDirectory() as folder:
             config = Path(folder) / "config.toml"

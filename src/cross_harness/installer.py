@@ -9,7 +9,7 @@ import shlex
 import shutil
 import tomllib
 
-from .config import load_config
+from .config import defaulted_config_paths, load_config
 from .errors import ConfigError, HarnessError
 from .files import append_marker, atomic_write, dump_json, load_json, marker_block, remove_marker, sha256
 from .inventory import create_backup
@@ -337,6 +337,10 @@ def _install(
                 f"existing personal configuration is invalid: {paths.config}. "
                 f"No files were changed. Fix the configuration and run install again.\n{exc}"
             ) from exc
+        defaulted = defaulted_config_paths(paths.config, paths.home)
+        if defaulted:
+            actions.append(f"defaulted settings: {len(defaulted)}")
+            actions.extend(f"default: {path}" for path in defaulted)
     if dry_run:
         return actions
 

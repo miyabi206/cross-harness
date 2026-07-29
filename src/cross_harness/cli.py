@@ -6,7 +6,7 @@ import json
 import sys
 
 from .benchmark import load_records, load_task_plan, render as render_benchmark, verify_task_commits
-from .config import load_config, validate, load_toml, warnings as config_warnings
+from .config import defaulted_paths, load_config, merge_defaults, validate, load_toml, warnings as config_warnings
 from .doctor import doctor, render as render_doctor
 from .errors import HarnessError, SupervisorDiedError
 from .files import atomic_write
@@ -127,13 +127,17 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "validate":
             config_path = args.config or user_paths(home).config
-            config = load_toml(config_path) if config_path.exists() else load_config(home=home)
+            personal_config = load_toml(config_path) if config_path.exists() else None
+            config = merge_defaults(personal_config) if personal_config is not None else load_config(home=home)
             errors = validate(config)
             if errors:
                 print("\n".join(errors), file=sys.stderr)
                 return 2
             for warning in config_warnings(config):
                 print(f"warning: {warning}", file=sys.stderr)
+            if personal_config is not None:
+                for path in defaulted_paths(personal_config):
+                    print(f"default: {path}", file=sys.stderr)
             print("configuration valid")
         elif args.command == "inventory":
             report = inventory(user_paths(home))

@@ -14,7 +14,7 @@ from cross_harness.errors import AuthError, DirtyWorktreeError, HarnessError, Su
 from cross_harness.files import sha256
 from cross_harness.config import default_config
 from cross_harness.runner import CLAUDE_EXECUTOR_CHARTER, CODEX_EXECUTOR_CHARTER, _claude_command, _claude_sandbox_profile, _codex_command, _contain_claude_write_command, _escalated_role, _executor_task, _filtered_executor_stderr, _invoke_safe, _self_reversions, _tee, _write_baseline, _write_claude_final_from_events, delegate, retry, start_detached_delegate, wait_for_run
-from cross_harness.runner import finalize_run
+from cross_harness.runner import finalize_blocked_run, finalize_run
 from cross_harness.summarize import parse_events
 
 
@@ -192,6 +192,21 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("codex", environment["CROSS_HARNESS_PARENT"])
         self.assertEqual(environment["CROSS_HARNESS_PARENT"], execution["parent_harness"])
 
+    @patch("cross_harness.runner.verify_codex_chatgpt")
+    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_delegate_summary_records_defaulted_settings_from_partial_config(self, invoke, ownership, verify):
+        config = self.root / "partial-delegate.toml"
+        config.write_text('[roles.implementer]\nmodel = "custom-implementer"\n')
+        verify.return_value = (Path("/usr/bin/true"), False)
+        invoke.side_effect = self.fake_invoke
+
+        summary = delegate("implementer", "implementation", self.task, self.repo, config_path=config, home=self.home)
+        recorded_summary = json.loads((Path(summary["run_dir"]) / "summary.json").read_text())
+
+        self.assertIn("roles.tester.model", recorded_summary["defaulted_settings"])
+        self.assertNotIn("roles.implementer.model", recorded_summary["defaulted_settings"])
+
     @patch("cross_harness.runner.verify_claude_subscription")
     @patch("cross_harness.runner.verify_claude_config_ownership")
     @patch("cross_harness.runner._invoke_safe")
@@ -265,6 +280,64 @@ class RunnerTests(unittest.TestCase):
         summary = finalize_run(run, "tester", role, "test", self.repo, 0, 1)
         self.assertEqual("failed", summary["status"])
         self.assertIn("invalid schema", summary["error"])
+
+    def test_finalize_summaries_record_defaulted_settings_and_default_to_empty(self):
+        role = {"model": "haiku", "effort": "medium", "output_limit_chars": 8000, "write": False}
+        explicit_run = self.root / "explicit-defaulted"
+        explicit_run.mkdir()
+        (explicit_run / "events.jsonl").write_text('{"type":"turn.completed","usage":{}}\n')
+        (explicit_run / "stderr.log").write_text("")
+        (explicit_run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "done", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+
+        explicit_summary = finalize_run(
+            explicit_run, "tester", role, "review", self.repo, 0, 1,
+            defaulted_settings=["roles.tester.timeout_seconds"],
+        )
+
+        self.assertEqual(["roles.tester.timeout_seconds"], explicit_summary["defaulted_settings"])
+        self.assertEqual(
+            ["roles.tester.timeout_seconds"],
+            json.loads((explicit_run / "summary.json").read_text())["defaulted_settings"],
+        )
+
+        implicit_run = self.root / "implicit-defaulted"
+        implicit_run.mkdir()
+        (implicit_run / "events.jsonl").write_text('{"type":"turn.completed","usage":{}}\n')
+        (implicit_run / "stderr.log").write_text("")
+        (implicit_run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "done", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+        implicit_summary = finalize_run(implicit_run, "tester", role, "review", self.repo, 0, 1)
+        self.assertEqual([], implicit_summary["defaulted_settings"])
+        implicit_summary_on_disk = json.loads((implicit_run / "summary.json").read_text())
+        self.assertIn("defaulted_settings", implicit_summary_on_disk)
+        self.assertEqual([], implicit_summary_on_disk["defaulted_settings"])
+
+        blocked_explicit = self.root / "blocked-explicit-defaulted"
+        blocked_explicit.mkdir()
+        blocked_summary = finalize_blocked_run(
+            blocked_explicit, "tester", role, "test", self.repo, "configuration unavailable", "configuration",
+            defaulted_settings=["fallback.codex"],
+        )
+        self.assertEqual(["fallback.codex"], blocked_summary["defaulted_settings"])
+        self.assertEqual(
+            ["fallback.codex"],
+            json.loads((blocked_explicit / "summary.json").read_text())["defaulted_settings"],
+        )
+
+        blocked_implicit = self.root / "blocked-implicit-defaulted"
+        blocked_implicit.mkdir()
+        implicit_blocked_summary = finalize_blocked_run(
+            blocked_implicit, "tester", role, "test", self.repo, "configuration unavailable", "configuration",
+        )
+        self.assertEqual([], implicit_blocked_summary["defaulted_settings"])
+        implicit_blocked_summary_on_disk = json.loads((blocked_implicit / "summary.json").read_text())
+        self.assertIn("defaulted_settings", implicit_blocked_summary_on_disk)
+        self.assertEqual([], implicit_blocked_summary_on_disk["defaulted_settings"])
 
     def test_success_ignores_benign_codex_model_cache_stderr(self):
         run = self.root / "benign-codex-cache-stderr-run"
@@ -1490,6 +1563,23 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
 
         self.assertEqual("success", summary["status"])
         self.assertEqual(1, invoke.call_count)
+
+    @patch("cross_harness.runner.verify_codex_chatgpt")
+    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_retry_summary_records_defaulted_settings_from_partial_config(self, invoke, ownership, verify):
+        self.task.write_text("# Goal\nContinue.\n\n# Checks\n- fixture\n")
+        previous = self._failed_write_run("partial-config-failed-write", "delegated.txt", "delegated\n")
+        config = self.root / "partial-retry.toml"
+        config.write_text('[roles.implementer]\nmodel = "custom-implementer"\n')
+        verify.return_value = (Path("/usr/bin/true"), False)
+        invoke.side_effect = self._successful_retry
+
+        summary = retry(previous, self.task, config_path=config, home=self.home)
+        recorded_summary = json.loads((Path(summary["run_dir"]) / "summary.json").read_text())
+
+        self.assertIn("roles.tester.model", recorded_summary["defaulted_settings"])
+        self.assertNotIn("roles.implementer.model", recorded_summary["defaulted_settings"])
 
     @patch("cross_harness.runner.verify_codex_chatgpt")
     @patch("cross_harness.runner.verify_codex_config_ownership")
