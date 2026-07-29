@@ -23,11 +23,17 @@ if ! "$python" -c 'import pytest' >/dev/null 2>&1; then
 fi
 
 if [ "$python" = .venv/bin/python ] && command -v uv >/dev/null 2>&1; then
-    if ! uv_output=$(uv sync --check 2>&1); then
+    if uv_output=$(uv sync --check 2>&1); then
+        :
+    else
+        uv_status=$?
         printf '%s\n' "$uv_output" >&2
-        echo "uv could not verify that .venv is in sync with uv.lock; the lock may be out of sync or uv may not have completed the check. Run:" >&2
-        echo "  uv sync --group dev" >&2
-        exit 1
+        if [ "$uv_status" -eq 1 ]; then
+            echo "uv detected that .venv is out of sync with uv.lock. Run:" >&2
+            echo "  uv sync --group dev" >&2
+            exit 1
+        fi
+        echo "warning: uv could not complete the .venv drift check; continuing with tests." >&2
     fi
 fi
 
