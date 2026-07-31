@@ -641,8 +641,15 @@ def _invoke_inner(command: list[str], task: str, env: dict[str, str], cwd: Path,
         thread.start()
     try:
         assert process.stdin is not None
-        process.stdin.write(task.encode("utf-8"))
-        process.stdin.close()
+        # The executor may exit before consuming stdin.
+        try:
+            process.stdin.write(task.encode("utf-8"))
+        except BrokenPipeError:
+            pass
+        try:
+            process.stdin.close()
+        except BrokenPipeError:
+            pass
         try:
             return process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:

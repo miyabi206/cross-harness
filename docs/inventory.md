@@ -1,26 +1,23 @@
 # Local harness inventory
 
-Generated: 2026-07-17T06:03:53.692058+00:00
-
-This is the immutable pre-install snapshot. Current authenticated/installed
-state is recorded in `docs/live-verification.md`.
+Generated: 2026-07-28T18:59:15.951517+00:00
 
 ## CLI
 
-- Codex: `codex-cli 0.144.5`
-- Claude Code: `2.1.202 (Claude Code)`
-- Python: `Python 3.14.5`
-- Git: `git version 2.30.1 (Apple Git-130)`
+- Codex: `codex-cli 0.145.0`
+- Claude Code: `2.1.220 (Claude Code)`
+- Python: `Python 3.12.3`
+- Git: `git version 2.43.0`
 
 ## Authentication (status only)
 
 - Codex: authenticated with ChatGPT
-- Claude Code: not authenticated
+- Claude Code: authenticated
 - Codex credential file exists: True (content not read)
 
 ## Existing settings
 
-- `~/.claude/settings.json`: 85 bytes, sha256 `ec37cdcd9ae6cc945861b192ef0df9d06c90d15d4f6b58b44429710309014e9a`
-- `~/.codex/config.toml`: 535 bytes, sha256 `8574afb8c142bff09676443fe21d7bb69da9c26af8797344a980a2c2fd76d579`
+- `~/.claude/settings.json`: 48 bytes, sha256 `fe164f356b8dac0e7399719d7b65ad7b2696acc40f9e61710e6606a3ab20d383`
+- `~/.codex/config.toml`: 63 bytes, sha256 `4e7e8a0e2dffa052138bafc8392763fddf32f4c45320b3203e8a8c06fae14566`
 
 Credential and environment files are intentionally excluded.
