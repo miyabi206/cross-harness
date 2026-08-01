@@ -65,6 +65,29 @@ Run `cross-harness doctor` after either CLI upgrades, authentication changes,
 hook changes, or a reinstall. Run `cross-harness cleanup` when stale run
 directories need immediate maintenance; SessionStart also invokes it.
 
+## Self-update
+
+The install manifest records the repository path and the source commit for
+human-facing diagnostics. Runtime drift is determined from the contents of the
+managed `bin`, `src`, `config`, `schema`, `schemas`, and `assets` trees; commit
+changes alone do not trigger an update, and `__pycache__`/`*.pyc` are ignored.
+
+Check without changing files, preview an update, or apply it explicitly with:
+
+```sh
+cross-harness self-update --check
+cross-harness self-update --dry-run
+cross-harness self-update
+```
+
+Installing this repository also adds fail-open Git hooks for post-merge,
+post-commit, post-checkout, and post-rewrite. They invoke self-update and
+always return success so pull, commit, checkout, and rebase are not blocked.
+An active delegated supervisor causes the update to be skipped with a warning.
+If a refresh changes the Codex hook definition, review it again in `/hooks`
+and record the new receipt with `cross-harness trust codex-hook
+--confirmed-after-review`.
+
 ## Orchestrator action record
 
 The non-delegated Claude `PreToolUse` hook appends one JSON object per `Edit`,

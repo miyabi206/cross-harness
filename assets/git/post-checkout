@@ -1,0 +1,12 @@
+#!/bin/sh
+
+# Git hooks are a notification boundary: self-update must never make Git fail.
+repo=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+if [ -x {{CROSS_HARNESS_BIN}} ]; then
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 300 {{CROSS_HARNESS_BIN}} self-update --from-hook --repo "$repo" || :
+    else
+        {{CROSS_HARNESS_BIN}} self-update --from-hook --repo "$repo" || :
+    fi
+fi
+exit 0

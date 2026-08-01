@@ -1,6 +1,8 @@
 from pathlib import Path
 import json
+import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -8,11 +10,87 @@ from unittest.mock import patch
 from cross_harness.files import MARKER_START, sha256
 from cross_harness.errors import ConfigError, HarnessError
 from cross_harness.config import load_config
-from cross_harness.installer import install, synchronize_claude_agent_roles, uninstall
+from cross_harness.installer import _git_hooks_path, install, synchronize_claude_agent_roles, uninstall
 from cross_harness.paths import source_root, user_paths
 
 
 class InstallerTests(unittest.TestCase):
+    def test_global_core_hooks_path_is_ignored(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            global_config = root / "gitconfig"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            shared_hooks = root / "shared-hooks"
+            env = {**os.environ, "GIT_CONFIG_GLOBAL": str(global_config), "GIT_CONFIG_NOSYSTEM": "1"}
+            subprocess.run(
+                ["git", "config", "--global", "core.hooksPath", str(shared_hooks)],
+                cwd=repo,
+                env=env,
+                check=True,
+            )
+
+            with patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(global_config), "GIT_CONFIG_NOSYSTEM": "1"}):
+                install(home, repo)
+
+            self.assertTrue((repo / ".git/hooks/post-commit").is_file())
+            self.assertFalse((shared_hooks / "post-commit").exists())
+
+    def test_global_core_hooks_path_is_ignored_for_git_file_worktree_marker(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            repo = root / "repo"
+            worktree = root / "worktree"
+            global_config = root / "gitconfig"
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "initial"], cwd=repo, check=True)
+            subprocess.run(["git", "worktree", "add", "-q", str(worktree)], cwd=repo, check=True)
+            shared_hooks = root / "shared-hooks"
+            env = {"GIT_CONFIG_GLOBAL": str(global_config), "GIT_CONFIG_NOSYSTEM": "1"}
+            subprocess.run(
+                ["git", "config", "--global", "core.hooksPath", str(shared_hooks)],
+                cwd=repo,
+                env={**os.environ, **env},
+                check=True,
+            )
+
+            with patch.dict(os.environ, env):
+                hooks_path = _git_hooks_path(worktree)
+
+            self.assertEqual((repo / ".git/hooks").resolve(), hooks_path)
+
+    def test_install_uses_core_hooks_path_and_uninstall_restores_it(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            hooks = repo / "custom-hooks"
+            hooks.mkdir()
+            existing = hooks / "post-commit"
+            existing.write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")
+            existing.chmod(0o755)
+            subprocess.run(["git", "config", "core.hooksPath", "custom-hooks"], cwd=repo, check=True)
+
+            install(home, repo)
+
+            installed = hooks / "post-commit"
+            self.assertNotIn("exit 7", installed.read_text(encoding="utf-8"))
+            manifest = json.loads((home / ".local/state/cross-harness/install-manifest.json").read_text())
+            self.assertTrue(any(record["path"] == str(installed) for record in manifest["records"]))
+
+            uninstall(home)
+            self.assertEqual("#!/bin/sh\nexit 7\n", existing.read_text(encoding="utf-8"))
+
     def test_install_uninstall_restores_exact_user_files(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -245,6 +323,41 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(5, len(actions))
             self.assertEqual([], list(home.iterdir()))
 
+    def test_interrupted_runtime_copy_preserves_current_and_retry_cleans_staging(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            install(home, repo)
+
+            runtime = home / ".local/share/cross-harness/current"
+            installed_cli = runtime / "src/cross_harness/cli.py"
+            original = installed_cli.read_text(encoding="utf-8")
+            source_cli = repo / "src/cross_harness/cli.py"
+            source_cli.write_text(source_cli.read_text(encoding="utf-8") + "\n# updated\n", encoding="utf-8")
+
+            original_copytree = shutil.copytree
+
+            def interrupt_runtime_copy(source, destination, *args, **kwargs):
+                if Path(destination).parent.name.startswith(".current.tmp-"):
+                    raise KeyboardInterrupt
+                return original_copytree(source, destination, *args, **kwargs)
+
+            with patch("cross_harness.installer.shutil.copytree", side_effect=interrupt_runtime_copy):
+                with self.assertRaises(KeyboardInterrupt):
+                    install(home, repo)
+
+            self.assertEqual(original, installed_cli.read_text(encoding="utf-8"))
+            staging = list(runtime.parent.glob(".current.tmp-*"))
+            self.assertTrue(staging)
+
+            install(home, repo)
+
+            self.assertIn("# updated", installed_cli.read_text(encoding="utf-8"))
+            self.assertEqual([], list(runtime.parent.glob(".current.tmp-*")))
+
     def test_install_reports_defaulted_settings_for_existing_partial_config_without_rewriting_it(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -432,6 +545,24 @@ class InstallerTests(unittest.TestCase):
             self.assertIn("Bash(git status)", settings["permissions"]["allow"])
             self.assertIn("Bash(git diff)", settings["permissions"]["allow"])
             self.assertFalse(any("cross-harness" in str(item) for item in settings.get("hooks", {}).values()))
+
+    def test_surgical_uninstall_preserves_changed_git_hook(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+
+            install(home, repo)
+            hook = repo / ".git/hooks/post-commit"
+            changed = "#!/bin/sh\n# user change\nexit 0\n"
+            hook.write_text(changed, encoding="utf-8")
+
+            uninstall(home, preserve_user_changes=True)
+
+            self.assertEqual(changed, hook.read_text(encoding="utf-8"))
 
     def test_surgical_uninstall_preserves_codex_settings_inserted_inside_legacy_marker(self):
         with tempfile.TemporaryDirectory() as folder:

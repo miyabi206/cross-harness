@@ -17,6 +17,7 @@ from .maintenance import cleanup
 from .paths import source_root, user_paths
 from .project import remove as remove_project, setup as setup_project
 from .runner import adopt, delegate, retry, start_detached_delegate, wait_for_run
+from .selfupdate import render as render_self_update, self_update
 from .taskfile import create_task_file
 from .trust import confirm_codex_hook
 from .watch import watch
@@ -43,6 +44,12 @@ def parser() -> argparse.ArgumentParser:
     uninstall_parser.add_argument("--force", action="store_true")
     uninstall_parser.add_argument("--preserve-user-changes", action="store_true")
     uninstall_parser.add_argument("--purge-runtime", action="store_true")
+
+    self_update_parser = commands.add_parser("self-update", help="detect and refresh repository drift")
+    self_update_parser.add_argument("--repo", type=Path)
+    self_update_parser.add_argument("--check", action="store_true", help="report drift without changing files")
+    self_update_parser.add_argument("--dry-run", action="store_true", help="report the update without changing files")
+    self_update_parser.add_argument("--from-hook", action="store_true", help=argparse.SUPPRESS)
 
     delegate_parser = commands.add_parser("delegate", help="run a bounded delegated task")
     delegate_parser.add_argument("--role", required=True)
@@ -159,6 +166,15 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "uninstall":
             restored = uninstall(home, args.force, args.preserve_user_changes, args.purge_runtime)
             print(f"restored {len(restored)} paths")
+        elif args.command == "self-update":
+            result = self_update(home, args.repo, check=args.check, dry_run=args.dry_run, from_hook=args.from_hook)
+            if args.from_hook and result.state == "skipped" and not result.warnings:
+                return 0
+            for warning in result.warnings:
+                print(f"warning: {warning}", file=sys.stderr)
+            print(render_self_update(result, check=args.check, dry_run=args.dry_run), end="")
+            if args.check and not args.from_hook and result.state == "drift":
+                return 1
         elif args.command == "delegate":
             if args.supervisor or args.no_detach:
                 summary = delegate(

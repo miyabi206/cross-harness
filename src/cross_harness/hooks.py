@@ -16,6 +16,7 @@ from .files import atomic_write, dump_json
 from .maintenance import cleanup
 from .paths import user_paths
 from .installer import synchronize_claude_agent_roles
+from .selfupdate import self_update
 from .taskfile import contains_secret
 
 
@@ -364,6 +365,19 @@ def claude_session_start(home: Path | None = None) -> int:
     data = _input()
     warnings: list[str] = []
     config = None
+    try:
+        self_update_result = self_update(paths.home, check=True)
+        if self_update_result.state == "drift":
+            warnings.append(
+                "cross-harness installed runtime drift detected; run `cross-harness self-update`"
+            )
+        warnings.extend(
+            f"self-update warning: {warning}"
+            for warning in self_update_result.warnings
+            if warning != "install manifest not found"
+        )
+    except Exception as exc:  # self-update is a fail-open session diagnostic
+        warnings.append(f"self-update warning: {exc}")
     try:
         config = load_config(home=paths.home)
         if _mode_is_off(config, data):

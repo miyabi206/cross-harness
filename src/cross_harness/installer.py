@@ -7,7 +7,9 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
 import tomllib
+import uuid
 
 from .config import defaulted_config_paths, load_config
 from .errors import ConfigError, HarnessError
@@ -18,6 +20,26 @@ from .paths import UserPaths, source_root, user_paths
 
 MANIFEST_PATH = ".local/state/cross-harness/install-manifest.json"
 COPY_TREES = ("bin", "src", "config", "schema", "schemas", "assets")
+RUNTIME_TEMP_PREFIX = ".current.tmp-"
+
+
+def _runtime_temp_path(install_root: Path) -> Path:
+    parent = install_root.parent
+    while True:
+        candidate = parent / f"{RUNTIME_TEMP_PREFIX}{uuid.uuid4().hex}"
+        if not os.path.lexists(candidate):
+            return candidate
+
+
+def _cleanup_runtime_temporary_dirs(install_root: Path) -> None:
+    parent = install_root.parent
+    if not parent.is_dir():
+        return
+    for candidate in parent.iterdir():
+        if not candidate.name.startswith(RUNTIME_TEMP_PREFIX):
+            continue
+        if candidate.is_dir() and not candidate.is_symlink():
+            shutil.rmtree(candidate)
 
 
 def _manifest_path(paths: UserPaths) -> Path:
@@ -41,6 +63,24 @@ def _record(path: Path, paths: UserPaths, backup_root: Path) -> dict:
         backup = backup_root / relative
         if not backup.exists():
             shutil.copytree(path, backup, symlinks=True)
+        record["backup"] = str(backup)
+    return record
+
+
+def _record_external(path: Path, backup_root: Path) -> dict:
+    """Record a path outside the user's home, such as a repository hook."""
+    record = {"path": str(path), "existed": path.exists() or path.is_symlink()}
+    if path.is_file() and not path.is_symlink():
+        backup = backup_root / "git-hooks" / path.name
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, backup)
+        record["backup"] = str(backup)
+        record["before_hash"] = sha256(path)
+    elif path.is_symlink():
+        record["symlink"] = os.readlink(path)
+    elif path.is_dir():
+        backup = backup_root / "git-hooks" / path.name
+        shutil.copytree(path, backup, symlinks=True)
         record["backup"] = str(backup)
     return record
 
@@ -279,6 +319,8 @@ def _installed_drift(records: list[dict], paths: UserPaths, preserve_personal_co
     drift: list[str] = []
     for record in records:
         path = Path(record["path"])
+        if record.get("management") == "git_hook":
+            continue
         if preserve_personal_config and _is_personal_config_record(record, paths):
             continue
         if "installed_hash" in record:
@@ -300,6 +342,72 @@ def _backup_root(repo: Path) -> Path:
     return root
 
 
+def _git_hooks_path(repo: Path) -> Path | None:
+    """Return the repository's hooks directory without requiring a Git repo."""
+    git_marker = repo / ".git"
+    if not git_marker.is_dir() and not git_marker.is_file():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "config", "--local", "--get", "core.hooksPath"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        result = None
+    if result is not None and result.returncode == 0:
+        value = result.stdout.strip()
+        if value:
+            path = Path(value).expanduser()
+            return (repo / path).resolve() if not path.is_absolute() else path.resolve()
+    if git_marker.is_dir():
+        return git_marker / "hooks"
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "rev-parse",
+                "--git-common-dir",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode:
+        return None
+    value = result.stdout.strip()
+    if not value:
+        return None
+    path = Path(value)
+    common_dir = (repo / path).resolve() if not path.is_absolute() else path.resolve()
+    return common_dir / "hooks"
+
+
+def _repo_commit(repo: Path) -> str | None:
+    """Return HEAD for human-facing install reporting, when Git can provide it."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode:
+        return None
+    commit = result.stdout.strip()
+    return commit or None
+
+
 def _install(
     home: Path | None = None,
     repo: Path | None = None,
@@ -309,6 +417,10 @@ def _install(
 ) -> list[str]:
     paths = user_paths(home)
     repo = (repo or source_root()).resolve()
+    if not dry_run:
+        _cleanup_runtime_temporary_dirs(paths.install_root)
+    git_hooks = _git_hooks_path(repo)
+    repo_commit = _repo_commit(repo)
     manifest_path = _manifest_path(paths)
     previous_manifest: dict | None = None
     previous_records: dict[str, dict] = {}
@@ -367,14 +479,19 @@ def _install(
 
     runtime_record = begin_record(paths.install_root, "owned")
     paths.install_root.parent.mkdir(parents=True, exist_ok=True)
-    if paths.install_root.exists():
-        shutil.rmtree(paths.install_root)
-    paths.install_root.mkdir()
+    staging_root = _runtime_temp_path(paths.install_root)
+    staging_root.mkdir()
     for name in COPY_TREES:
         source = repo / name
         if source.is_dir():
-            shutil.copytree(source, paths.install_root / name)
-    os.chmod(paths.install_root / "bin/cross-harness", 0o755)
+            shutil.copytree(source, staging_root / name)
+    os.chmod(staging_root / "bin/cross-harness", 0o755)
+    previous_root = _runtime_temp_path(paths.install_root)
+    if paths.install_root.exists() or paths.install_root.is_symlink():
+        os.rename(paths.install_root, previous_root)
+    os.rename(staging_root, paths.install_root)
+    if previous_root.exists():
+        shutil.rmtree(previous_root)
     records.append(runtime_record)
 
     executable_record = begin_record(paths.executable, "owned")
@@ -463,6 +580,25 @@ def _install(
         _finish_record(record, destination)
         records.append(record)
 
+    if git_hooks is not None:
+        for source in sorted((repo / "assets/git").glob("*")):
+            if not source.is_file():
+                continue
+            destination = git_hooks / source.name
+            record = _record_external(destination, backup_root)
+            record["management"] = "git_hook"
+            record.pop("installed_hash", None)
+            record.pop("installed_symlink", None)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.is_dir() and not destination.is_symlink():
+                shutil.rmtree(destination)
+            rendered = source.read_text(encoding="utf-8").replace(
+                "{{CROSS_HARNESS_BIN}}", shlex.quote(str(paths.executable))
+            )
+            atomic_write(destination, rendered, 0o755)
+            _finish_record(record, destination)
+            records.append(record)
+
     # A reinstall keeps the original pre-install backups.  The operations
     # above necessarily make fresh snapshots while applying the update; use
     # the prior records for paths that were already managed so uninstall still
@@ -484,9 +620,10 @@ def _install(
             records[index] = refreshed
 
     manifest = {
-        "version": 1,
+        "version": 2,
         "installed_at": datetime.now(timezone.utc).isoformat(),
         "repo": str(repo),
+        "repo_commit": repo_commit,
         "backup_root": str(backup_root),
         "records": records,
     }
@@ -670,6 +807,15 @@ def uninstall(
                 if not record.get("existed") and load_json(path, {}) == {}:
                     path.unlink()
                 restored.append(str(path))
+            elif management == "git_hook" and (
+                path.is_symlink()
+                or not path.is_file()
+                or (
+                    isinstance(record.get("installed_hash"), str)
+                    and sha256(path) != record["installed_hash"]
+                )
+            ):
+                restored.append(f"preserved user changes {path}")
             else:
                 restored.append(_restore_record(record))
     else:

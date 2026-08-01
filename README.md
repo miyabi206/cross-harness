@@ -49,6 +49,22 @@ The installer backs up non-credential settings, copies its runtime under
 `~/.config/cross-harness/config.toml`, and merges user assets. Markdown and TOML
 additions use visible marker blocks. JSON hooks and permissions are merged as
 structured entries; the install manifest preserves their exact prior content.
+When this repository is a Git worktree, the installer also installs fail-open
+`post-merge`, `post-commit`, `post-checkout`, and `post-rewrite` hooks. Existing
+hooks are backed up and restored by `uninstall`.
+
+After changing the repository, inspect or refresh the installed runtime with:
+
+```sh
+~/.local/bin/cross-harness self-update --check
+~/.local/bin/cross-harness self-update --dry-run
+~/.local/bin/cross-harness self-update
+```
+
+The check compares the `bin`, `src`, `config`, `schema`, `schemas`, and
+`assets` trees, ignoring `__pycache__` and `*.pyc`. Git hooks run the final
+command automatically after repository history changes. Drift detection and
+installation are fail-open: a warning never blocks a session or Git command.
 
 Codex requires one manual trust action for non-managed hooks: open Codex, run
 `/hooks`, inspect the user-level recursion guard, and trust its exact definition.
