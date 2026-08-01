@@ -276,3 +276,38 @@ codex 実行時に次の stderr が繰り返し出力された。
 第3次では、T2 が第2次の N2 と同一の根本原因を持つことを確認した。`tests/conftest.py` は `6f516d0`（2026-07-19）で「委譲実行役の環境からテストを隔離する」目的で追加されていたが、`scripts/test.sh` が unittest で実行していたため一度も読み込まれていなかった。N2 は `f995c1a`（2026-07-22）で `tests/test_hooks.py` 側を環境非依存にすることで解消され、残存する制約は「なし」と記録されたが、隔離機構そのものが無効である事実は検出されなかった。T2 はその一般形にあたる。個別テストの症状を消す修正が、機構の不作動を隠したことになる。
 
 また、第3次修正より前に `scripts/test.sh` を最後に更新した `f348f94`（2026-07-22）は、pytest を要求する `tests/test_cli_flag_contract.py` を追加した `d0ff71f`（2026-07-19）より後である。実行系の不整合は、当該ファイルを一度触った後も残っていた。
+
+## 第4次修正で確認された項目
+
+作成日: 2026-08-02。第3次の後に着手した並列委譲と `cross-harness adopt` の実装に対するレビューで検出した。A1〜A5 はレビュー報告での F1〜F5 に対応する。第2次にも F1〜F5 の項番があり別件のため、ここでは A の記号を用いる。A6 は A1〜A5 の修正中に、落ちていたテストの原因調査から見つかった本番コードの欠陥である。
+
+| # | 事象 | 判定 | 影響度 |
+|---|---|---|---|
+| A1 | 不正な UTF-8 を含むパスの JSON 永続化が `UnicodeEncodeError` で落ちる | バグ | 高 |
+| A2 | `adopt` が同一の分離 worktree を共有する別 run の生存を見ない | バグ（競合） | 中 |
+| A3 | コロンで始まるパスが pathspec マジックとして食われ常に誤衝突する | バグ | 中 |
+| A4 | submodule の変更で原因の読み取れないエラーになる | バグ（UX。挙動は安全側） | 低 |
+| A5 | 取りこぼし検査と CLI の非ゼロ終了にテストが無い | テスト不足 | 低 |
+| A6 | 空の `.git` ディレクトリを Git ルートと誤認し、書き込み許可範囲が広がる | バグ | 中 |
+
+## 第4次修正の対応状況と残存する制約
+
+| # | 対応状況 | 対応コミット | 残存する制約 |
+|---|---|---|---|
+| A1 | 対応済み。git は不正な UTF-8 のファイル名をサロゲート符号位置として返す。`dump_json` は `ensure_ascii=False` を維持したままサロゲートのみを `\uXXXX` へ退避し、日本語などの通常の非 ASCII はエスケープしない。`atomic_write` は encode に失敗した場合のみ `backslashreplace` へフォールバックし、不正な UTF-8 バイト列は書き出さない。修正前は `_diff_details` が返したサロゲート付き文字列が `baseline.json`、`delegated-changes.json`、`summary.json` の書き出しで素の例外を投げ、`delegate` が `_write_baseline` でトレースバック終了していた。 | `33fc25d` fix: サロゲートを含むパスをJSONへ安全に永続化する<br>`7ce4c2c` feat: 分離worktreeの成果をadoptで取り込めるようにする（`_git` の surrogateescape と numstat の `-z` 化） | `ISOLATED_WORKTREE` の読み戻しは `surrogateescape` を用いないため、`runtime_root` のパス自体にデコード不能なバイトが含まれる場合に限り、明示的な失敗ではなく「isolated worktree not found」になる。 |
+| A2 | 対応済み。`runtime_root/runs` 配下の `ISOLATED_WORKTREE` マーカを走査し、同一 worktree を指す生存 run があれば拒否する。判定は adopt の入口と、root ロック取得後の書き込み直前の二段で行う。走査や候補マーカの読み取りに失敗した場合は通過させず拒否する。マーカの許容範囲を run ディレクトリ配下から `runtime_root/runs` 配下へ緩めた結果、retry 連鎖では複数の run が正当に同一 worktree を指すため、旧実装では死亡した古い run を指定するだけで実行中の worktree を取り込めた。 | `7ce4c2c` feat: 分離worktreeの成果をadoptで取り込めるようにする | 分離 worktree で走る run は root ロックを取らないため、再判定の通過から書き込み完了までの窓は縮小しただけで閉じてはいない。完全に閉じるには worktree 単位のロックが必要である。 |
+| A3 | 対応済み。`ls-tree` と `diff --quiet` に `--literal-pathspecs` を用いる。修正前は `:weird.txt` の先頭コロンが pathspec マジックとして解釈され、`ls-tree` が空を返して base が missing 扱いになり、root がクリーンでも常に衝突と判定されて永久に adopt できなかった。既存テストの `[x]` は git がリテラル一致を優先するため通ってしまい、この経路を覆っていなかった。 | `7ce4c2c` feat: 分離worktreeの成果をadoptで取り込めるようにする | なし。 |
+| A4 | 対応済み。gitlink（モード 160000）を検出したら、root への書き込み前に submodule 非対応と読み取れる `HarnessError` を投げる。root の HEAD に既存の gitlink だけでなく、分離側で新規に追加された gitlink も分離 worktree の index を検査して捕捉する。後者は root の HEAD に存在しないため、当初の修正では衝突検出も抜けて他ファイル書き込み後に「unsupported path type while adopting」で失敗していた。 | `7ce4c2c` feat: 分離worktreeの成果をadoptで取り込めるようにする | `adopt` は submodule を含む変更を取り込めない。拒否するだけである。 |
+| A5 | 対応済み。取りこぼし検査が rollback 経路に入ることと、`cross-harness adopt` が `HarnessError` で終了コード 2 を返すことに回帰テストを追加した。 | `7ce4c2c` feat: 分離worktreeの成果をadoptで取り込めるようにする | なし。 |
+| A6 | 対応済み。`_git_root_from_cwd` は `.git` の存在だけを見ていたため、中身の無い `.git` があるだけでそのディレクトリを Git ルートと判定し、オーケストレータの書き込み許可範囲が意図せず広がっていた。実リポジトリであること（`HEAD` の存在）を要求する。`.git` がファイルの場合は `gitdir:` を解決してから同じ検査を行うため、linked worktree と submodule の埋め込み gitdir は従来どおり成立する。 | `5bce77c` fix: 空の.gitディレクトリをGitルートと誤認しないようにする | なし。 |
+
+A6 は、A1〜A4 の修正中に `./scripts/test.sh` が `tests/test_hooks.py` の2件で落ち続けたことから見つかった。Codex のサンドボックスが実行名前空間内に read-only の空 `/tmp/.git` を作るため、一時ディレクトリの Git ルートが `/tmp` と判定され、`a81196e`（オーケストレータの書き込み範囲に cwd の Git ルート配下を加える）の許可範囲が一時ディレクトリ全体に及んでいた。リポジトリのテストコード自体に `/tmp/.git` を生成する箇所は無く、サンドボックス外では再現しない。実行環境の差異がテストの失敗として現れ、その原因が本番コードの欠陥だった例にあたる。
+
+第4次の修正後、`./scripts/test.sh` は 303 passed / 28 subtests passed で終了コード 0 になる。
+
+レビューで指摘され、今回は対応していない所見を記録しておく。いずれも低重大度である。
+
+- `retry` が適格性判定より前に `_git_root` を呼ぶため、記録された cwd が既に Git リポジトリでない blocked run を retry すると、`retry refused: ...` ではなく「delegation requires a Git repository」が返る。エラーメッセージの後退のみ。
+- `adopt` は `dirty_worktree_policy` に関わらず delegated-changes を記録するが、`finalize_run` は `allow_delegated` のときだけ記録する。`stop` や `isolate` の運用下では参照されないレコードが adopt 経由でのみ残る非対称がある。
+- `_adopt_git_snapshot` は呼び出し側が kind と mode しか使わない経路でも HEAD の blob 全体を `git show` で読む。adopt のコストが HEAD 側の総バイト数に比例する。
+- `tests/test_assets.py` のラッパ用テンプレート検査が対象を `task|delegate|retry` に限っており、SKILL.md に新規追加された `adopt` を含まない。
