@@ -173,7 +173,7 @@ class HookTests(unittest.TestCase):
             nested = repo / "src" / "package"
             external = root / "external"
             nested.mkdir(parents=True)
-            (repo / ".git").mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
             external.mkdir()
             (repo / "linked-external").symlink_to(external, target_is_directory=True)
             paths = user_paths(home)
@@ -207,6 +207,7 @@ class HookTests(unittest.TestCase):
             home = root / "home"
             not_a_repo = root / "not-a-repo"
             not_a_repo.mkdir()
+            (root / ".git").mkdir()
             paths = user_paths(home)
             invalid_cwds = (None, "relative/path", str(root / "missing"), str(not_a_repo))
             with patch("cross_harness.hooks.user_paths", return_value=paths):

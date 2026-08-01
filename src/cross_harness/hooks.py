@@ -136,7 +136,16 @@ def _git_root_from_cwd(cwd: Path | None) -> Path | None:
     try:
         current = cwd
         while True:
-            if (current / ".git").exists():
+            marker = current / ".git"
+            git_dir = marker
+            if marker.is_file():
+                prefix = "gitdir:"
+                contents = marker.read_text(encoding="utf-8", errors="surrogateescape").strip()
+                if contents.lower().startswith(prefix):
+                    git_dir = Path(contents[len(prefix):].strip())
+                    if not git_dir.is_absolute():
+                        git_dir = current / git_dir
+            if git_dir.is_dir() and (git_dir / "HEAD").is_file():
                 return current
             parent = current.parent
             if parent == current:
