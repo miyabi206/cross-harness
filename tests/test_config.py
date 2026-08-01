@@ -67,9 +67,24 @@ class ConfigTests(unittest.TestCase):
         errors = "\n".join(validate(config))
         self.assertIn("unknown key 'surprise'", errors)
         self.assertIn("missing key 'timeout_seconds'", errors)
-        self.assertIn("range 1..2", errors)
+        self.assertIn("range 1..5", errors)
         self.assertIn("unsupported values invented", errors)
         self.assertIn("roles: unknown key 'invented'", errors)
+
+    def test_max_parallel_accepts_one_through_five_and_rejects_six(self):
+        for value in (1, 5):
+            config = copy.deepcopy(default_config())
+            config["max_parallel"] = value
+            for role in config["roles"].values():
+                role["max_parallel"] = value
+            self.assertEqual([], validate(config), value)
+
+        config = copy.deepcopy(default_config())
+        config["max_parallel"] = 6
+        config["roles"]["tester"]["max_parallel"] = 6
+        errors = "\n".join(validate(config))
+        self.assertIn("max_parallel: expected integer in range 1..5", errors)
+        self.assertIn("roles.tester.max_parallel: expected integer in range 1..5", errors)
 
     def test_project_override_cannot_own_models(self):
         config = default_config()

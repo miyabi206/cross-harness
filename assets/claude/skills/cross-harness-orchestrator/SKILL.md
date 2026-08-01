@@ -31,8 +31,17 @@ task.
   then verify. Do not start explorer or reviewer agents.
 - Medium changes: one bounded exploration, plan, implement, test, review.
 - Large changes: split into independently verifiable units and run them
-  sequentially. Parallelize only truly independent units and never exceed the
-  configured limit of two.
+  sequentially by default.
+- Independent read-only investigation, verification, and review roles are
+  parallelized by default when there are multiple independent units.
+  Parallelize only truly independent units and never exceed the
+  configured limit of {{MAX_PARALLEL}}.
+  Small changes still do not use explorer or reviewer agents. When write roles
+  are delegated in parallel, the second and later roles run in isolated
+  worktrees when `dirty_worktree_policy` is not `stop`. Under `stop`, they are
+  not isolated and become blocked, so write roles must run sequentially. Adopt
+  each isolated result with
+  `{{CROSS_HARNESS_BIN}} adopt --run <run_dir>` before incorporating it.
 - Security, auth, database, public API, or infrastructure changes require an
   explicit human confirmation and a security review.
 
@@ -89,6 +98,13 @@ and security_reviewer only after explicit human confirmation. Never shorten the
 absolute wrapper path to a bare `cross-harness` command.
 
 Invoke `delegate` only in a foreground Bash call; never use `run_in_background`.
+Parallel delegation uses multiple foreground Bash `delegate` calls in one
+message; `run_in_background` remains forbidden. For parallel write roles, the
+second and later roles use isolated worktrees when `dirty_worktree_policy` is
+not `stop`; under `stop`, they are not isolated and become blocked, so run
+write delegations sequentially. Adopt each isolated result with
+`{{CROSS_HARNESS_BIN}} adopt --run <run_dir>`; adoption conflicts leave the
+root worktree unchanged and return non-zero.
 It prints the run directory first and then waits for the detached supervisor.
 If the foreground call is interrupted or times out, do not delegate again. Re-attach
 to that printed run with:

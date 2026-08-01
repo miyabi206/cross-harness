@@ -68,21 +68,24 @@ def _write_text(
     records.append(record)
 
 
-def _template(text: str, executable: Path, context_threshold_percent: int) -> str:
+def _template(text: str, executable: Path, context_threshold_percent: int, max_parallel: int) -> str:
     return (
         text.replace("{{CROSS_HARNESS_BIN}}", str(executable))
         .replace("{{CONTEXT_THRESHOLD_PERCENT}}", str(context_threshold_percent))
+        .replace("{{MAX_PARALLEL}}", str(max_parallel))
     )
 
 
-def _materialize_templates(path: Path, executable: Path, context_threshold_percent: int) -> None:
+def _materialize_templates(
+    path: Path, executable: Path, context_threshold_percent: int, max_parallel: int
+) -> None:
     candidates = [path] if path.is_file() else [item for item in path.rglob("*") if item.is_file()]
     for candidate in candidates:
         try:
             text = candidate.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
-        rendered = _template(text, executable, context_threshold_percent)
+        rendered = _template(text, executable, context_threshold_percent, max_parallel)
         if rendered != text:
             atomic_write(candidate, rendered, candidate.stat().st_mode & 0o777)
 
@@ -171,10 +174,11 @@ def _merge_markdown(
     records: list[dict],
     executable: Path,
     context_threshold_percent: int,
+    max_parallel: int,
 ) -> None:
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
     content = "\n\n".join(
-        _template(source.read_text(encoding="utf-8"), executable, context_threshold_percent).rstrip()
+        _template(source.read_text(encoding="utf-8"), executable, context_threshold_percent, max_parallel).rstrip()
         for source in sources
     )
     _write_text(path, append_marker(existing, content), paths, backup, records, management="marker")
@@ -399,11 +403,11 @@ def _install(
                 atomic_write(path, remove_marker(path.read_text(encoding="utf-8")))
     _merge_markdown(
         paths.claude / "CLAUDE.md", [repo / "assets/claude/CLAUDE.md", shared], paths,
-        backup_root, records, paths.executable, config["context_threshold_percent"],
+        backup_root, records, paths.executable, config["context_threshold_percent"], config["max_parallel"],
     )
     _merge_markdown(
         paths.codex / "AGENTS.md", [repo / "assets/codex/AGENTS.md", shared], paths,
-        backup_root, records, paths.executable, config["context_threshold_percent"],
+        backup_root, records, paths.executable, config["context_threshold_percent"], config["max_parallel"],
     )
 
     settings = paths.claude / "settings.json"
@@ -439,7 +443,7 @@ def _install(
         else:
             shutil.copy2(source, destination)
             _finish_record(record, destination)
-        _materialize_templates(destination, paths.executable, config["context_threshold_percent"])
+        _materialize_templates(destination, paths.executable, config["context_threshold_percent"], config["max_parallel"])
         _finish_record(record, destination)
         records.append(record)
     synchronize_claude_agent_roles(paths, config)

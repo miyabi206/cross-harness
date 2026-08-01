@@ -142,7 +142,7 @@ def validate(config: dict) -> list[str]:
     _integer(config, "retention_days", 1, 365, errors)
     _integer(config, "auth_cache_hours", 1, 24, errors)
     _integer(config, "context_threshold_percent", 40, 85, errors)
-    _integer(config, "max_parallel", 1, 2, errors)
+    _integer(config, "max_parallel", 1, 5, errors)
     if config.get("dirty_worktree_policy") not in {"stop", "isolate", "allow", "allow_delegated"}:
         errors.append("dirty_worktree_policy: expected 'stop', 'isolate', 'allow', or 'allow_delegated'")
     if "mode" in config and config["mode"] not in {"on", "off"}:
@@ -186,7 +186,7 @@ def validate(config: dict) -> list[str]:
             if not isinstance(role.get("effort"), str) or not role.get("effort"):
                 errors.append(f"{location}.effort: expected non-empty string")
             for key, low, high in (
-                ("max_parallel", 1, 2),
+                ("max_parallel", 1, 5),
                 ("retries", 0, 2),
                 ("timeout_seconds", 30, 14400),
                 ("output_limit_chars", 1000, 50000),
