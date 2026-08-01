@@ -2,7 +2,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from cross_harness.files import MARKER_START, append_marker, atomic_write, remove_marker
+from cross_harness.files import MARKER_START, append_marker, atomic_write, dump_json, load_json, remove_marker
 from cross_harness.summarize import command_matches_check, failure_signature, normalize_comparison_path, parse_events, render_summary
 
 
@@ -19,6 +19,19 @@ class FileTests(unittest.TestCase):
             atomic_write(path, "hello")
             self.assertEqual("hello", path.read_text())
             self.assertEqual(0o600, path.stat().st_mode & 0o777)
+
+    def test_json_surrogate_fallback_keeps_output_valid_utf8_and_unicode_literal(self):
+        value = {"label": "日本語", "path": "bad-\udcff-name.txt"}
+        rendered = dump_json(value)
+
+        self.assertIn("日本語", rendered)
+        self.assertIn(r"\udcff", rendered)
+        self.assertNotIn("\udcff", rendered)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "record.json"
+            atomic_write(path, rendered)
+            self.assertEqual(value, load_json(path, None))
+            path.read_bytes().decode("utf-8")
 
     def test_failure_signature_removes_volatile_numbers(self):
         parsed = {"errors": ["test failed at 12.4s address 0xabc123"], "commands": []}

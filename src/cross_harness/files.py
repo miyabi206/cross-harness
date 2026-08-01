@@ -21,7 +21,15 @@ def sha256(path: Path) -> str:
 
 def atomic_write(path: Path, data: str | bytes, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    raw = data.encode("utf-8") if isinstance(data, str) else data
+    if isinstance(data, str):
+        try:
+            raw = data.encode("utf-8")
+        except UnicodeEncodeError:
+            # Keep text artifacts writable when they contain a filesystem
+            # surrogate, while never emitting an invalid UTF-8 byte sequence.
+            raw = data.encode("utf-8", errors="backslashreplace")
+    else:
+        raw = data
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temp_path = Path(temporary)
     try:
@@ -43,7 +51,19 @@ def load_json(path: Path, default: object) -> object:
 
 
 def dump_json(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    rendered = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
+    try:
+        rendered.encode("utf-8")
+    except UnicodeEncodeError:
+        # Git exposes undecodable bytes as surrogate code points. Escape only
+        # those code points so ordinary non-ASCII text remains unescaped.
+        rendered = "".join(
+            f"\\u{ord(character):04x}"
+            if 0xD800 <= ord(character) <= 0xDFFF
+            else character
+            for character in rendered
+        )
+    return rendered + "\n"
 
 
 def marker_block(content: str) -> str:
@@ -76,4 +96,3 @@ def remove_marker(existing: str) -> str:
     if combined and not combined.endswith("\n"):
         combined += "\n"
     return combined
-
