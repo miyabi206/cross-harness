@@ -32,6 +32,9 @@ last 10 lines of its aggregated output, an omitted-line count when applicable,
 and its exit code. ANSI escapes and control characters are removed before this
 output is rendered.
 
+The watch header shows the delegated role, harness, model, and effort. Model
+and effort are omitted when the run record does not provide usable values.
+
 Codex publishes only a short heading line for each completed reasoning item,
 so watch displays that heading with a `✻` marker; reasoning items that have not
 completed are not displayed. A delegated result JSON message is rendered as

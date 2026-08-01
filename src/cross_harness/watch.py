@@ -330,16 +330,25 @@ def run_header(run_dir: Path, *, color: bool = False) -> str:
     """Return a defensive, human-readable header for an active run."""
     role = run_dir.name
     harness = ""
+    model = ""
+    effort = ""
     try:
         record = json.loads((run_dir / "execution.json").read_text(encoding="utf-8"))
         if isinstance(record, dict):
             if isinstance(record.get("role_name"), str):
-                role = record["role_name"]
+                role = _safe_text(record["role_name"], collapse_whitespace=True)
             if isinstance(record.get("harness"), str):
-                harness = record["harness"]
+                harness = _safe_text(record["harness"], collapse_whitespace=True)
+            if isinstance(record.get("model"), str):
+                model = _safe_text(record["model"], collapse_whitespace=True)
+            if isinstance(record.get("effort"), str):
+                effort = _safe_text(record["effort"], collapse_whitespace=True)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         pass
     identity = f"{role} · {harness}" if harness else role
+    details = [value for value in (model, effort) if value]
+    if details:
+        identity = " · ".join((identity, *details))
     value = f"── {time.strftime('%H:%M:%S')} · {identity} ──────"
     return _styled(value, _BOLD, color)
 

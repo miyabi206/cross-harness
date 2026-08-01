@@ -13,7 +13,7 @@ import cross_harness.runner as runner
 from cross_harness.errors import AuthError, DirtyWorktreeError, HarnessError, SupervisorDiedError
 from cross_harness.files import load_json, sha256
 from cross_harness.config import default_config
-from cross_harness.runner import CLAUDE_EXECUTOR_CHARTER, CODEX_EXECUTOR_CHARTER, _claude_command, _claude_sandbox_profile, _codex_command, _contain_claude_write_command, _escalated_role, _executor_task, _filtered_executor_stderr, _invoke_safe, _self_reversions, _tee, _write_baseline, _write_claude_final_from_events, adopt, delegate, retry, start_detached_delegate, wait_for_run
+from cross_harness.runner import CLAUDE_EXECUTOR_CHARTER, CODEX_EXECUTOR_CHARTER, _claude_command, _claude_sandbox_profile, _codex_command, _contain_claude_write_command, _escalated_role, _executor_task, _filtered_executor_stderr, _invoke_safe, _self_reversions, _tee, _write_baseline, _write_claude_final_from_events, _write_execution_record, adopt, delegate, retry, start_detached_delegate, wait_for_run
 from cross_harness.runner import finalize_blocked_run, finalize_run
 from cross_harness.summarize import parse_events
 
@@ -80,6 +80,15 @@ class RunnerTests(unittest.TestCase):
             "tests": ["read-only inspection"], "error": None, "next_decision": None,
         }))
         return 0
+
+    def test_execution_record_includes_role_model_and_effort(self):
+        run = self.root / "execution-record"
+        run.mkdir()
+        role = {"harness": "codex", "model": "gpt-5.6-luna", "effort": "high", "write": True}
+        _write_execution_record(run, "implementer", role, "implementation", self.repo, "claude")
+        execution = json.loads((run / "execution.json").read_text())
+        self.assertEqual("gpt-5.6-luna", execution["model"])
+        self.assertEqual("high", execution["effort"])
 
     def test_codex_executor_task_injects_charter_without_changing_claude_task(self):
         task = "# Goal\nImplement the requested change.\n"

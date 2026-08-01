@@ -976,6 +976,8 @@ def _write_execution_record(
     atomic_write(run_dir / "execution.json", dump_json({
         "role_name": role_name,
         "harness": role["harness"],
+        "model": role["model"],
+        "effort": role["effort"],
         "parent_harness": parent_harness,
         "write": role["write"],
         "kind": kind,

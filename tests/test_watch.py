@@ -247,6 +247,50 @@ class WatchTests(unittest.TestCase):
         (active / "state.json").write_text(json.dumps({"status": "success"}))
         self.assertEqual(["  ✔ success"], watcher.poll())
 
+    def test_header_includes_safe_model_and_effort(self):
+        run = self.runs / "20260718T174442-22222222"
+        run.mkdir()
+        (run / "execution.json").write_text(json.dumps({
+            "role_name": "implementer",
+            "harness": "codex",
+            "model": "gpt-5.6-luna\x1b[31m",
+            "effort": "high\x1b[0m",
+        }))
+        with patch("cross_harness.watch.time.strftime", return_value="12:34:56"):
+            self.assertEqual(
+                "── 12:34:56 · implementer · codex · gpt-5.6-luna · high ──────",
+                run_header(run),
+            )
+
+    def test_header_collapses_model_and_effort_whitespace(self):
+        run = self.runs / "20260718T174442-22222222"
+        run.mkdir()
+        (run / "execution.json").write_text(json.dumps({
+            "role_name": "implementer",
+            "harness": "codex",
+            "model": "gpt-5.6\nluna",
+            "effort": "high\tpriority",
+        }))
+        header = run_header(run)
+        self.assertNotIn("\n", header)
+        self.assertNotIn("\t", header)
+        self.assertIn("gpt-5.6 luna · highpriority", header)
+
+    def test_header_omits_invalid_model_and_effort_independently(self):
+        run = self.runs / "20260718T174442-22222222"
+        run.mkdir()
+        cases = [
+            ({"model": "", "effort": "high"}, "implementer · codex · high"),
+            ({"model": "gpt-5.6-luna", "effort": 1}, "implementer · codex · gpt-5.6-luna"),
+            ({"model": None, "effort": ""}, "implementer · codex"),
+        ]
+        for values, expected in cases:
+            with self.subTest(values=values):
+                (run / "execution.json").write_text(json.dumps({
+                    "role_name": "implementer", "harness": "codex", **values,
+                }))
+                self.assertRegex(run_header(run), rf"· {re.escape(expected)} ──────$")
+
     def test_long_agent_message_wraps_at_requested_width(self):
         lines = render_lines((EventLine("›", detail="one two three four five six", wrap=True),), width=12)
         self.assertEqual(["  › one two ", "    three ", "    four ", "    five six"], lines)
