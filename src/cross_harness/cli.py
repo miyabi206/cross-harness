@@ -16,7 +16,7 @@ from .inventory import create_backup, inventory
 from .maintenance import cleanup
 from .paths import source_root, user_paths
 from .project import remove as remove_project, setup as setup_project
-from .runner import delegate, retry, start_detached_delegate, wait_for_run
+from .runner import adopt, delegate, retry, start_detached_delegate, wait_for_run
 from .taskfile import create_task_file
 from .trust import confirm_codex_hook
 from .watch import watch
@@ -69,6 +69,10 @@ def parser() -> argparse.ArgumentParser:
     retry_parser.add_argument("--run-dir", required=True, type=Path)
     retry_parser.add_argument("--task-file", required=True, type=Path)
     retry_parser.add_argument("--config", type=Path)
+
+    adopt_parser = commands.add_parser("adopt", help="apply an isolated worktree run to the root worktree")
+    adopt_parser.add_argument("--run", required=True, type=Path)
+    adopt_parser.add_argument("--config", type=Path)
 
     task_parser = commands.add_parser("task", help="create a credential-screened delegation task file")
     task_commands = task_parser.add_subparsers(dest="task_command", required=True)
@@ -197,6 +201,9 @@ def main(argv: list[str] | None = None) -> int:
             summary = retry(args.run_dir.resolve(), args.task_file.resolve(), args.config, home)
             print((Path(summary["run_dir"]) / "summary.txt").read_text(encoding="utf-8"), end="")
             return 0 if summary["status"] == "success" else 1
+        elif args.command == "adopt":
+            summary = adopt(args.run.resolve(), args.config, home)
+            print(f"adopted {len(summary['changed_files'])} file(s) into {summary['root']}")
         elif args.command == "task":
             if args.task_command == "create":
                 path = create_task_file(

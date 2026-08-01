@@ -11,9 +11,9 @@ import unittest
 
 import cross_harness.runner as runner
 from cross_harness.errors import AuthError, DirtyWorktreeError, HarnessError, SupervisorDiedError
-from cross_harness.files import sha256
+from cross_harness.files import load_json, sha256
 from cross_harness.config import default_config
-from cross_harness.runner import CLAUDE_EXECUTOR_CHARTER, CODEX_EXECUTOR_CHARTER, _claude_command, _claude_sandbox_profile, _codex_command, _contain_claude_write_command, _escalated_role, _executor_task, _filtered_executor_stderr, _invoke_safe, _self_reversions, _tee, _write_baseline, _write_claude_final_from_events, delegate, retry, start_detached_delegate, wait_for_run
+from cross_harness.runner import CLAUDE_EXECUTOR_CHARTER, CODEX_EXECUTOR_CHARTER, _claude_command, _claude_sandbox_profile, _codex_command, _contain_claude_write_command, _escalated_role, _executor_task, _filtered_executor_stderr, _invoke_safe, _self_reversions, _tee, _write_baseline, _write_claude_final_from_events, adopt, delegate, retry, start_detached_delegate, wait_for_run
 from cross_harness.runner import finalize_blocked_run, finalize_run
 from cross_harness.summarize import parse_events
 
@@ -158,6 +158,88 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(invoke.call_args.args[1].startswith(CODEX_EXECUTOR_CHARTER))
         self.assertEqual("partial", summary["status"])
         self.assertIn("no checks declared", summary["error"])
+
+    @patch("cross_harness.runner.verify_codex_chatgpt")
+    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_delegate_writes_json_artifacts_for_invalid_utf8_changes(self, invoke, ownership, verify):
+        file_name = os.fsdecode(b"bad-\xff-delegate.txt")
+        path = self.repo / file_name
+        path.write_bytes(b"before\n")
+        git(self.repo, "add", file_name)
+        git(self.repo, "commit", "-m", "invalid utf8 delegate path")
+
+        def invoke_with_invalid_path(command, task, env, cwd, run_dir, timeout):
+            (cwd / file_name).write_bytes(b"after\n")
+            (run_dir / "events.jsonl").write_text('{"type":"turn.completed","usage":{}}\n')
+            (run_dir / "stderr.log").write_text("")
+            (run_dir / "final.json").write_text(json.dumps({
+                "status": "success", "work_completed": "done", "changed_files": [],
+                "tests": [], "error": None, "next_decision": None,
+            }))
+            return 0
+
+        verify.return_value = (Path("/usr/bin/true"), False)
+        invoke.side_effect = invoke_with_invalid_path
+
+        summary = delegate("implementer", "implementation", self.task, self.repo, home=self.home)
+        run = Path(summary["run_dir"])
+
+        self.assertEqual(file_name, summary["changed_files"][0])
+        self.assertEqual([], load_json(run / "baseline.json", {})["changed_files"])
+        self.assertEqual(file_name, load_json(run / "summary.json", {})["diff_summary"][0]["file"])
+        records = load_json(self.home / ".local/state/cross-harness/delegated-changes.json", {})
+        self.assertEqual({file_name}, set(records[str(self.repo.resolve())]))
+        (run / "summary.json").read_bytes().decode("utf-8")
+        (run / "summary.txt").read_bytes().decode("utf-8")
+
+    @patch("cross_harness.runner.verify_codex_chatgpt")
+    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_delegate_releases_root_lock_when_baseline_fails(self, invoke, ownership, verify):
+        runtime_root = self.home / ".local/state/cross-harness"
+        with patch("cross_harness.runner._write_baseline", side_effect=RuntimeError("baseline failed")):
+            with self.assertRaisesRegex(RuntimeError, "baseline failed"):
+                delegate("implementer", "implementation", self.task, self.repo, home=self.home)
+
+        self.assertTrue(runner._acquire_root_lock(runtime_root, self.repo))
+        runner._release_root_lock(runtime_root, self.repo)
+        invoke.assert_not_called()
+        ownership.assert_not_called()
+        verify.assert_not_called()
+
+    @patch("cross_harness.runner.verify_codex_chatgpt")
+    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_delegate_does_not_release_a_preexisting_root_lock(self, invoke, ownership, verify):
+        runtime_root = self.home / ".local/state/cross-harness"
+        verify.return_value = (Path("/usr/bin/true"), False)
+        invoke.side_effect = self.fake_invoke
+        self.assertTrue(runner._acquire_root_lock(runtime_root, self.repo))
+        try:
+            summary = delegate("implementer", "implementation", self.task, self.repo, home=self.home)
+            run = Path(summary["run_dir"])
+            self.assertTrue((run / "ISOLATED_WORKTREE").is_file())
+            self.assertIsNone(runner._try_lock(runner._root_lock_path(runtime_root, self.repo)))
+        finally:
+            runner._release_root_lock(runtime_root, self.repo)
+
+        ownership.assert_called_once()
+        verify.assert_called_once()
+
+    def test_try_lock_converts_open_failures_to_harness_error(self):
+        lock_path = self.root / "runtime" / "locks" / "root.lock"
+        with patch("cross_harness.runner.os.open", side_effect=OSError("read-only filesystem")):
+            with self.assertRaisesRegex(HarnessError, "could not open lock file"):
+                runner._try_lock(lock_path)
+
+    def test_delegated_changes_lock_timeout_is_bounded_and_diagnostic(self):
+        runtime_root = self.root / "runtime"
+        with patch.object(runner, "_try_lock", return_value=None), patch.object(
+            runner, "_DELEGATED_CHANGES_LOCK_TIMEOUT_SECONDS", 0
+        ):
+            with self.assertRaisesRegex(HarnessError, "timed out waiting for lock"):
+                runner._acquire_delegated_changes_lock(runtime_root)
 
     @patch("cross_harness.runner.verify_codex_chatgpt")
     @patch("cross_harness.runner.verify_codex_config_ownership")
@@ -496,6 +578,25 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(["reported-only.txt"], summary["unverified_changed_files"])
         self.assertIn("diff_stat", (run / "summary.txt").read_text())
 
+    def test_diff_details_preserves_invalid_utf8_file_names(self):
+        raw_name = b"bad-\xff-name.txt"
+        file_name = os.fsdecode(raw_name)
+        path = self.repo / file_name
+        path.write_bytes(b"before\n")
+        git(self.repo, "add", file_name)
+        git(self.repo, "commit", "-m", "invalid utf8 path")
+        path.write_bytes(b"after\n")
+
+        _, details, changed = runner._diff_details(self.repo)
+
+        self.assertEqual([file_name], changed)
+        self.assertEqual(file_name, details[0]["file"])
+        run = self.root / "invalid-utf8-baseline"
+        run.mkdir()
+        _write_baseline(run, self.repo)
+        baseline = load_json(run / "baseline.json", {})
+        self.assertEqual(file_name, baseline["diff_summary"][0]["file"])
+
     def test_unreported_changes_are_normalized_without_affecting_unverified_changes(self):
         (self.repo / "README.md").write_text("before\nafter\n")
         (self.repo / "new.txt").write_text("new\n")
@@ -699,6 +800,417 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(isolated, actual)
         diff_details.assert_not_called()
         create_worktree.assert_called_once_with(self.repo, run)
+
+    def test_second_write_prepare_forces_isolated_worktree_when_root_lock_is_held(self):
+        runtime_root = self.root / "runtime"
+        first_run = self.root / "first-run"
+        second_run = self.root / "second-run"
+        first_run.mkdir()
+        second_run.mkdir()
+        config = default_config()
+        role = config["roles"]["implementer"]
+
+        try:
+            self.assertEqual(
+                self.repo,
+                runner._prepare_write_execution(
+                    config, "implementer", role, "implementation", self.repo,
+                    runtime_root, first_run,
+                ),
+            )
+            isolated = runner._prepare_write_execution(
+                config, "implementer", role, "implementation", self.repo,
+                runtime_root, second_run,
+            )
+        finally:
+            runner._release_root_lock(runtime_root, self.repo)
+
+        self.assertNotEqual(self.repo, isolated)
+        self.assertEqual(isolated, Path((second_run / "ISOLATED_WORKTREE").read_text().strip()))
+        lock_path = runner._root_lock_path(runtime_root, self.repo)
+        self.assertTrue(lock_path.is_file())
+        self.assertTrue(lock_path.is_relative_to(runtime_root))
+        self.assertFalse(lock_path.is_relative_to(self.repo))
+
+    def _adopt_fixture(self, name="adopt"):
+        runtime_root = self.home / ".local/state/cross-harness"
+        run = runtime_root / "runs" / f"{name}-run"
+        run.mkdir(parents=True)
+        worktree = run / "worktree"
+        git(self.repo, "worktree", "add", "--detach", str(worktree), "HEAD")
+        (run / "ISOLATED_WORKTREE").write_text(str(worktree) + "\n")
+        (run / "summary.json").write_text(json.dumps({"status": "success"}))
+        (run / "summary.txt").write_text("success\n")
+        (run / "state.json").write_text(json.dumps({"status": "success"}))
+        return run, worktree
+
+    def test_adopt_preserves_non_ascii_and_special_tracked_paths(self):
+        file_name = '日本語 "quoted" [x].txt'
+        (self.repo / file_name).write_text("before\n")
+        git(self.repo, "add", file_name)
+        git(self.repo, "commit", "-m", "special path")
+        run, worktree = self._adopt_fixture("adopt-special-path")
+        try:
+            (worktree / file_name).write_text("adopted\n")
+
+            result = adopt(run, home=self.home)
+
+            self.assertEqual([file_name], result["changed_files"])
+            self.assertEqual("adopted\n", (self.repo / file_name).read_text())
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+
+    def test_adopt_treats_colon_and_glob_paths_as_literal(self):
+        file_names = (":weird.txt", "*.glob.txt")
+        for file_name in file_names:
+            (self.repo / file_name).write_text("before\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "colon and glob paths")
+        run, worktree = self._adopt_fixture("adopt-literal-paths")
+        try:
+            for file_name in file_names:
+                (worktree / file_name).write_text("adopted\n")
+
+            result = adopt(run, home=self.home)
+
+            self.assertEqual(sorted(file_names), result["changed_files"])
+            for file_name in file_names:
+                self.assertEqual("adopted\n", (self.repo / file_name).read_text())
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+
+    def test_adopt_accepts_a_retry_run_worktree_marker(self):
+        config = self.root / "isolate-adopt.toml"
+        default = (Path(__file__).resolve().parents[1] / "config/default.toml").read_text()
+        config.write_text(default.replace('dirty_worktree_policy = "allow_delegated"', 'dirty_worktree_policy = "isolate"', 1))
+        self.task.write_text("# Goal\nContinue.\n\n# Checks\n- fixture\n")
+        verify_result = (Path("/usr/bin/true"), False)
+
+        def fail_in_isolated_worktree(command, task, env, cwd, run_dir, timeout):
+            (cwd / "delegated.txt").write_text("delegated\n")
+            (run_dir / "events.jsonl").write_text('{"type":"turn.failed","error":{"message":"fixture failure"}}\n')
+            (run_dir / "stderr.log").write_text("fixture failure")
+            (run_dir / "final.json").write_text(json.dumps({
+                "status": "failed", "work_completed": "", "changed_files": [],
+                "tests": [], "error": "fixture failure", "next_decision": None,
+            }))
+            return 1
+
+        calls = []
+
+        def invoke(*args):
+            calls.append(args)
+            return fail_in_isolated_worktree(*args) if len(calls) == 1 else self._successful_retry(*args)
+
+        with patch("cross_harness.runner.verify_codex_chatgpt", return_value=verify_result), patch(
+            "cross_harness.runner.verify_codex_config_ownership"
+        ), patch("cross_harness.runner._invoke_safe", side_effect=invoke):
+            failed = runner.delegate(
+                "implementer", "implementation", self.task, self.repo,
+                config_path=config, home=self.home,
+            )
+            retried = adopt(
+                Path(runner.retry(Path(failed["run_dir"]), self.task, config_path=config, home=self.home)["run_dir"]),
+                config_path=config, home=self.home,
+            )
+
+        self.assertEqual(["delegated.txt"], retried["changed_files"])
+        self.assertEqual("delegated\n", (self.repo / "delegated.txt").read_text())
+
+    def test_adopt_rejects_marker_outside_run_directory(self):
+        run, worktree = self._adopt_fixture("adopt-outside-marker")
+        try:
+            outside = self.root / "outside-worktree"
+            (run / "ISOLATED_WORKTREE").write_text(str(outside) + "\n")
+
+            with self.assertRaisesRegex(HarnessError, "outside run directory"):
+                adopt(run, home=self.home)
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+
+    def test_adopt_rejects_submodule_changes_with_a_clear_error(self):
+        subrepo = self.root / "subrepo"
+        subrepo.mkdir()
+        git(subrepo, "init")
+        git(subrepo, "config", "user.email", "test@example.com")
+        git(subrepo, "config", "user.name", "Test")
+        (subrepo / "sub.txt").write_text("before\n")
+        git(subrepo, "add", ".")
+        git(subrepo, "commit", "-m", "submodule initial")
+        git(self.repo, "-c", "protocol.file.allow=always", "submodule", "add", str(subrepo), "sub")
+        git(self.repo, "commit", "-m", "submodule")
+        (subrepo / "sub.txt").write_text("after\n")
+        git(subrepo, "add", ".")
+        git(subrepo, "commit", "-m", "submodule update")
+        new_submodule_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=subrepo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        run, worktree = self._adopt_fixture("adopt-submodule")
+        try:
+            git(worktree, "update-index", "--add", "--cacheinfo", f"160000,{new_submodule_head},sub")
+
+            with self.assertRaisesRegex(HarnessError, "does not support submodules"):
+                adopt(run, home=self.home)
+
+            self.assertEqual("before\n", (self.repo / "sub" / "sub.txt").read_text())
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+
+    def test_adopt_rejects_new_submodule_changes_before_writing_the_root(self):
+        subrepo = self.root / "new-subrepo"
+        subrepo.mkdir()
+        git(subrepo, "init")
+        git(subrepo, "config", "user.email", "test@example.com")
+        git(subrepo, "config", "user.name", "Test")
+        (subrepo / "sub.txt").write_text("before\n")
+        git(subrepo, "add", ".")
+        git(subrepo, "commit", "-m", "submodule initial")
+        submodule_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=subrepo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        run, worktree = self._adopt_fixture("adopt-new-submodule")
+        try:
+            (worktree / "README.md").write_text("adopted\n")
+            git(worktree, "update-index", "--add", "--cacheinfo", f"160000,{submodule_head},sub")
+
+            with self.assertRaisesRegex(HarnessError, "does not support submodules"):
+                adopt(run, home=self.home)
+
+            self.assertEqual("before\n", (self.repo / "README.md").read_text())
+            self.assertFalse((self.repo / "sub").exists())
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+
+    def test_adopt_applies_tracked_and_untracked_changes_and_records_fingerprints(self):
+        run, worktree = self._adopt_fixture()
+        try:
+            (worktree / "README.md").write_text("adopted\n")
+            (worktree / "new.txt").write_text("new\n")
+
+            result = adopt(run, home=self.home)
+
+            self.assertEqual(["README.md", "new.txt"], result["changed_files"])
+            self.assertEqual("adopted\n", (self.repo / "README.md").read_text())
+            self.assertEqual("new\n", (self.repo / "new.txt").read_text())
+            records = json.loads(
+                (self.home / ".local/state/cross-harness/delegated-changes.json").read_text()
+            )
+            self.assertEqual(
+                {
+                    "README.md": sha256(self.repo / "README.md"),
+                    "new.txt": sha256(self.repo / "new.txt"),
+                },
+                records[str(self.repo.resolve())],
+            )
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+
+    def test_adopt_uses_git_filter_comparison_for_a_clean_root_file(self):
+        git(self.repo, "config", "filter.roundtrip.clean", "sed s/SMUDGE$//")
+        git(self.repo, "config", "filter.roundtrip.smudge", "sed s/$/SMUDGE/")
+        (self.repo / ".gitattributes").write_text("f.txt filter=roundtrip\n")
+        (self.repo / "f.txt").write_text("base\n")
+        git(self.repo, "add", ".gitattributes", "f.txt")
+        git(self.repo, "commit", "-m", "filtered file")
+        git(self.repo, "rm", "f.txt")
+        git(self.repo, "checkout", "HEAD", "--", "f.txt")
+        self.assertEqual(b"baseSMUDGE\n", (self.repo / "f.txt").read_bytes())
+        run, worktree = self._adopt_fixture("adopt-filter")
+        try:
+            (worktree / "f.txt").write_text("adopted\n")
+
+            result = adopt(run, home=self.home)
+
+            self.assertEqual(["f.txt"], result["changed_files"])
+            self.assertEqual("adopted\n", (self.repo / "f.txt").read_text())
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+
+    def test_adopt_ignores_umask_only_mode_difference(self):
+        run, worktree = self._adopt_fixture("adopt-mode")
+        try:
+            (worktree / "README.md").write_text("adopted\n")
+            (worktree / "README.md").chmod(0o664)
+
+            result = adopt(run, home=self.home)
+
+            self.assertEqual(["README.md"], result["changed_files"])
+            self.assertEqual("adopted\n", (self.repo / "README.md").read_text())
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+
+    def test_adopt_handles_tracked_symlink_changes(self):
+        (self.repo / "target.txt").write_text("target\n")
+        (self.repo / "link").symlink_to("target.txt")
+        git(self.repo, "add", "target.txt", "link")
+        git(self.repo, "commit", "-m", "symlink")
+        run, worktree = self._adopt_fixture("adopt-symlink")
+        try:
+            (worktree / "link").unlink()
+            (worktree / "link").symlink_to("README.md")
+
+            result = adopt(run, home=self.home)
+
+            self.assertEqual(["link"], result["changed_files"])
+            self.assertEqual("README.md", os.readlink(self.repo / "link"))
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+
+    def test_adopt_rejects_a_run_without_a_finalized_summary(self):
+        run, worktree = self._adopt_fixture("adopt-incomplete")
+        try:
+            (run / "summary.json").unlink()
+
+            with self.assertRaisesRegex(HarnessError, "summary is not finalized"):
+                adopt(run, home=self.home)
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+
+    def test_adopt_rejects_a_live_run(self):
+        run, worktree = self._adopt_fixture("adopt-running")
+        try:
+            (run / "supervisor.pid").write_text(f"{os.getpid()}\n")
+
+            with self.assertRaisesRegex(HarnessError, "run is still in progress"):
+                adopt(run, home=self.home)
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+
+    def test_adopt_rejects_a_live_run_sharing_the_isolated_worktree(self):
+        run, worktree = self._adopt_fixture("adopt-shared-live")
+        live_run = run.parent / "adopt-shared-live-other-run"
+        live_run.mkdir()
+        try:
+            (live_run / "ISOLATED_WORKTREE").write_text(str(worktree) + "\n")
+            (live_run / "supervisor.pid").write_text(f"{os.getpid()}\n")
+            (worktree / "new.txt").write_text("new\n")
+
+            with self.assertRaisesRegex(HarnessError, "another live run shares"):
+                adopt(run, home=self.home)
+
+            self.assertFalse((self.repo / "new.txt").exists())
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+
+    def test_adopt_rejects_when_shared_worktree_runs_cannot_be_enumerated(self):
+        run, worktree = self._adopt_fixture("adopt-shared-enumeration-error")
+        try:
+            with patch.object(Path, "iterdir", side_effect=OSError("runs unavailable")):
+                with self.assertRaisesRegex(HarnessError, "could not inspect runs"):
+                    runner._adopt_reject_live_shared_worktree(
+                        self.home / ".local/state/cross-harness", run, worktree
+                    )
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+
+    def test_adopt_rejects_when_shared_worktree_marker_cannot_be_read(self):
+        runtime_root = self.home / ".local/state/cross-harness"
+        runs_root = runtime_root / "runs"
+        run = runs_root / "adopt-shared-marker-error-run"
+        candidate = runs_root / "adopt-shared-marker-error-other-run"
+        run.mkdir(parents=True)
+        candidate.mkdir()
+        worktree = runs_root / "adopt-shared-marker-error-run" / "worktree"
+        marker = candidate / "ISOLATED_WORKTREE"
+        marker.write_text(str(worktree) + "\n")
+        try:
+            with patch.object(Path, "read_text", side_effect=OSError("marker unavailable")):
+                with self.assertRaisesRegex(HarnessError, "could not read shared-worktree marker"):
+                    runner._adopt_reject_live_shared_worktree(runtime_root, run, worktree)
+        finally:
+            marker.unlink()
+            candidate.rmdir()
+            run.rmdir()
+
+    def test_adopt_rollback_does_not_erase_a_parallel_record(self):
+        run, worktree = self._adopt_fixture("adopt-rollback")
+        runtime_root = self.home / ".local/state/cross-harness"
+        ready = self.root / "adopt-rollback-ready"
+        try:
+            (worktree / "new.txt").write_text("new\n")
+            records_path = runtime_root / "delegated-changes.json"
+            records_path.parent.mkdir(parents=True, exist_ok=True)
+            records_path.write_text(json.dumps({str(self.repo.resolve()): {}}))
+            record_changes_locked = runner._record_delegated_changes_locked
+
+            def fail_after_parallel_record(*args, **kwargs):
+                pid = os.fork()
+                if pid == 0:
+                    ready.touch()
+                    try:
+                        descriptor = runner._acquire_delegated_changes_lock(runtime_root)
+                        try:
+                            record_changes_locked(
+                            runtime_root, self.root, self.repo,
+                            [{"file": "parallel.txt", "fingerprint": "parallel"}],
+                            [{"file": "parallel.txt", "fingerprint": "parallel"}],
+                            )
+                        finally:
+                            runner._release_lock(descriptor)
+                    except BaseException:
+                        os._exit(1)
+                    os._exit(0)
+                deadline = time.monotonic() + 2
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists())
+                raise OSError("adoption write failed")
+
+            with patch.object(runner, "_record_delegated_changes_locked", side_effect=fail_after_parallel_record):
+                with self.assertRaisesRegex(HarnessError, "adopt failed"):
+                    adopt(run, home=self.home)
+
+            _, status = os.waitpid(-1, 0)
+            self.assertEqual(0, os.waitstatus_to_exitcode(status))
+            records = json.loads(records_path.read_text())
+            self.assertEqual("parallel", records[str(self.repo.resolve())]["parallel.txt"])
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+
+    def test_adopt_reports_conflicts_without_changing_root_worktree(self):
+        run, worktree = self._adopt_fixture("adopt-conflict")
+        try:
+            (worktree / "README.md").write_text("isolated\n")
+            (self.repo / "README.md").write_text("user\n")
+
+            with self.assertRaisesRegex(HarnessError, r"conflict[\s\S]*README\.md"):
+                adopt(run, home=self.home)
+
+            self.assertEqual("user\n", (self.repo / "README.md").read_text())
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+
+    def test_adopt_blocks_when_root_lock_is_owned(self):
+        run, worktree = self._adopt_fixture("adopt-lock")
+        runtime_root = self.home / ".local/state/cross-harness"
+        try:
+            (worktree / "new.txt").write_text("new\n")
+            self.assertTrue(runner._acquire_root_lock(runtime_root, self.repo))
+            try:
+                with self.assertRaisesRegex(HarnessError, "another write delegation owns the root worktree"):
+                    adopt(run, home=self.home)
+            finally:
+                runner._release_root_lock(runtime_root, self.repo)
+            self.assertFalse((self.repo / "new.txt").exists())
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+
+    def test_adopt_rolls_back_when_post_write_verification_reports_missing_paths(self):
+        run, worktree = self._adopt_fixture("adopt-missing-path")
+        original_diff_details = runner._diff_details
+        try:
+            (worktree / "new.txt").write_text("new\n")
+            with patch.object(
+                runner,
+                "_diff_details",
+                side_effect=[original_diff_details(worktree), ("", [], [])],
+            ):
+                with self.assertRaisesRegex(HarnessError, "missing paths:[\\s\\S]*new\\.txt"):
+                    adopt(run, home=self.home)
+
+            self.assertFalse((self.repo / "new.txt").exists())
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
 
     def test_last_declared_check_execution_controls_the_result(self):
         run = self.root / "last-check-execution-run"
@@ -1549,6 +2061,35 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
         blocked_runs = list((self.home / ".local/state/cross-harness/runs").iterdir())
         state = json.loads((blocked_runs[0] / "state.json").read_text())
         self.assertEqual("dirty_worktree", state["blocked_category"])
+        runtime_root = self.home / ".local/state/cross-harness"
+        try:
+            self.assertTrue(runner._acquire_root_lock(runtime_root, self.repo))
+        finally:
+            runner._release_root_lock(runtime_root, self.repo)
+
+    @patch("cross_harness.runner.verify_codex_chatgpt")
+    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_retry_root_lock_blocks_without_isolated_worktree(self, invoke, ownership, verify):
+        previous = self._failed_write_run("retry-root-lock", "delegated.txt", "delegated\n")
+        runtime_root = self.home / ".local/state/cross-harness"
+        self.assertTrue(runner._acquire_root_lock(runtime_root, self.repo))
+        try:
+            with self.assertRaisesRegex(DirtyWorktreeError, "another write delegation owns the root worktree"):
+                retry(previous, self.task, home=self.home)
+        finally:
+            runner._release_root_lock(runtime_root, self.repo)
+
+        invoke.assert_not_called()
+        verify.assert_not_called()
+        ownership.assert_not_called()
+        blocked_runs = list((runtime_root / "runs").iterdir())
+        self.assertEqual(1, len(blocked_runs))
+        state = json.loads((blocked_runs[0] / "state.json").read_text())
+        self.assertEqual("blocked", state["status"])
+        self.assertEqual("dirty_worktree", state["blocked_category"])
+        self.assertIn("another write delegation owns the root worktree", state["blocked_reason"])
+        self.assertFalse((blocked_runs[0] / "ISOLATED_WORKTREE").exists())
 
     @patch("cross_harness.runner.verify_codex_chatgpt")
     @patch("cross_harness.runner.verify_codex_config_ownership")
@@ -1563,6 +2104,27 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
 
         self.assertEqual("success", summary["status"])
         self.assertEqual(1, invoke.call_count)
+        runtime_root = self.home / ".local/state/cross-harness"
+        try:
+            self.assertTrue(runner._acquire_root_lock(runtime_root, self.repo))
+        finally:
+            runner._release_root_lock(runtime_root, self.repo)
+
+    @patch("cross_harness.runner.verify_codex_chatgpt")
+    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner._invoke_safe", side_effect=RuntimeError("executor failed"))
+    def test_retry_releases_root_lock_on_executor_exception(self, invoke, ownership, verify):
+        previous = self._failed_write_run("retry-exception", "delegated.txt", "delegated\n")
+        verify.return_value = (Path("/usr/bin/true"), False)
+
+        with self.assertRaisesRegex(RuntimeError, "executor failed"):
+            retry(previous, self.task, home=self.home)
+
+        runtime_root = self.home / ".local/state/cross-harness"
+        try:
+            self.assertTrue(runner._acquire_root_lock(runtime_root, self.repo))
+        finally:
+            runner._release_root_lock(runtime_root, self.repo)
 
     @patch("cross_harness.runner.verify_codex_chatgpt")
     @patch("cross_harness.runner.verify_codex_config_ownership")
@@ -1635,6 +2197,7 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
     def test_retry_records_git_inspection_failures_before_raising(self):
         previous = self._failed_write_run("failed-git-inspection", "delegated.txt", "delegated\n")
         role = default_config()["roles"]["implementer"]
+        runtime_root = self.root / "runtime"
 
         for index, (target, failure) in enumerate((
             ("_dirty", HarnessError("could not inspect Git worktree")),
@@ -1644,12 +2207,16 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
             with self.subTest(target=target):
                 retry_run = self.root / f"blocked-{index}-{target}"
                 retry_run.mkdir()
-                with patch.object(runner, target, side_effect=failure):
-                    with self.assertRaisesRegex(DirtyWorktreeError, "could not inspect Git worktree changes"):
-                        runner._prepare_retry_execution(
-                            default_config(), "implementer", role, "implementation", self.repo,
-                            retry_run, previous, attempts=1, thread_id="session-1", signatures=[],
-                        )
+                try:
+                    with patch.object(runner, target, side_effect=failure):
+                        with self.assertRaisesRegex(DirtyWorktreeError, "could not inspect Git worktree changes"):
+                            runner._prepare_retry_execution(
+                                default_config(), "implementer", role, "implementation", self.repo,
+                                retry_run, previous, runtime_root=runtime_root,
+                                attempts=1, thread_id="session-1", signatures=[],
+                            )
+                finally:
+                    runner._release_root_lock(runtime_root, self.repo)
                 state = json.loads((retry_run / "state.json").read_text())
                 self.assertEqual("blocked", state["status"])
                 self.assertEqual("dirty_worktree", state["blocked_category"])
@@ -1855,6 +2422,60 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
         records = json.loads((runtime_root / "delegated-changes.json").read_text())
         self.assertIn("partial.txt", records[str(self.repo.resolve())])
 
+    def test_delegated_change_records_are_process_locked_read_modify_writes(self):
+        runtime_root = self.root / "runtime"
+        ready_one = self.root / "record-one-ready"
+        ready_two = self.root / "record-two-ready"
+        go = self.root / "record-go"
+
+        def worker(file_name: str, ready: Path) -> None:
+            original_read = runner._read_delegated_changes
+
+            def delayed_read(runtime: Path):
+                records = original_read(runtime)
+                ready.touch()
+                while not go.exists():
+                    time.sleep(0.01)
+                return records
+
+            runner._read_delegated_changes = delayed_read
+            try:
+                runner._record_delegated_changes(
+                    runtime_root, self.root, self.repo,
+                    [
+                        {"file": "one.txt", "fingerprint": "one.txt"},
+                        {"file": "two.txt", "fingerprint": "two.txt"},
+                    ],
+                    [{"file": file_name, "fingerprint": file_name}],
+                )
+            except BaseException:
+                os._exit(1)
+            os._exit(0)
+
+        first_pid = os.fork()
+        if first_pid == 0:
+            worker("one.txt", ready_one)
+        deadline = time.monotonic() + 2
+        while not ready_one.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(ready_one.exists())
+
+        second_pid = os.fork()
+        if second_pid == 0:
+            worker("two.txt", ready_two)
+        time.sleep(0.2)
+        self.assertFalse(ready_two.exists())
+        go.touch()
+
+        _, first_status = os.waitpid(first_pid, 0)
+        _, second_status = os.waitpid(second_pid, 0)
+        self.assertEqual(0, os.waitstatus_to_exitcode(first_status))
+        self.assertEqual(0, os.waitstatus_to_exitcode(second_status))
+        records = json.loads((runtime_root / "delegated-changes.json").read_text())
+        self.assertEqual(
+            {"one.txt", "two.txt"}, set(records[str(self.repo.resolve())]),
+        )
+
     def test_finalize_records_delegated_changes_only_for_allow_delegated_policy(self):
         runtime_root = self.root / "runtime"
         role = {"model": "gpt-5.6-terra", "effort": "high", "output_limit_chars": 8000, "write": True}
@@ -1898,6 +2519,59 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
             {"delegated-change.txt"}, set(records[str(self.repo.resolve())])
         )
 
+    def test_delegated_changes_record_and_match_non_ascii_tracked_path(self):
+        file_name = "日本語\tdelegated.txt"
+        (self.repo / file_name).write_text("before\n")
+        git(self.repo, "add", file_name)
+        git(self.repo, "commit", "-m", "delegated special path")
+        (self.repo / file_name).write_text("after\n")
+        runtime_root = self.root / "delegated-special-runtime"
+        run = self.root / "delegated-special-run"
+        run.mkdir()
+
+        _, current, changed = runner._diff_details(self.repo)
+        self.assertEqual([file_name], changed)
+        runner._record_delegated_changes(runtime_root, run, self.repo, current, current)
+
+        self.assertTrue(runner._delegated_changes_match(
+            runtime_root, self.repo, runner._dirty(self.repo), current,
+        ))
+        records = json.loads((runtime_root / "delegated-changes.json").read_text())
+        self.assertEqual({file_name}, set(records[str(self.repo.resolve())]))
+
+    def test_finalize_records_invalid_utf8_path_and_writes_readable_json(self):
+        file_name = os.fsdecode(b"bad-\xff-delegated.txt")
+        path = self.repo / file_name
+        path.write_bytes(b"before\n")
+        git(self.repo, "add", file_name)
+        git(self.repo, "commit", "-m", "invalid utf8 delegated path")
+
+        runtime_root = self.root / "invalid-utf8-runtime"
+        run = self.root / "invalid-utf8-finalize"
+        run.mkdir()
+        _write_baseline(run, self.repo)
+        path.write_bytes(b"after\n")
+        (run / "events.jsonl").write_text('{"type":"turn.completed","usage":{}}\n')
+        (run / "stderr.log").write_text("")
+        (run / "final.json").write_text(json.dumps({
+            "status": "success", "work_completed": "done", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+        }))
+        role = {"model": "gpt-5.6-terra", "effort": "high", "output_limit_chars": 8000, "write": True}
+
+        finalize_run(
+            run, "implementer", role, "review", self.repo, 0, 1,
+            runtime_root=runtime_root, dirty_worktree_policy="allow_delegated",
+        )
+
+        summary = load_json(run / "summary.json", {})
+        records = load_json(runtime_root / "delegated-changes.json", {})
+        self.assertEqual(file_name, summary["changed_files"][0])
+        self.assertEqual(file_name, summary["diff_summary"][0]["file"])
+        self.assertEqual({file_name}, set(records[str(self.repo.resolve())]))
+        (run / "summary.json").read_bytes().decode("utf-8")
+        (run / "summary.txt").read_bytes().decode("utf-8")
+
     def test_finalize_does_not_record_isolated_write_runs(self):
         runtime_root = self.root / "runtime"
         records_path = runtime_root / "delegated-changes.json"
@@ -1929,8 +2603,14 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
         previous = self._failed_write_run("retry-escalation", "existing.txt", "existing\n")
         verify.return_value = (Path("/usr/bin/true"), False)
 
+        release = None
+
         def fail_with_change(command, task, env, cwd, run_dir, timeout):
             (self.repo / "delegated.txt").write_text("delegated\n")
+            if invoke.call_count == 2:
+                lock_path = runner._root_lock_path(self.home / ".local/state/cross-harness", self.repo)
+                self.assertIsNone(runner._try_lock(lock_path))
+                self.assertEqual(0, release.call_count)
             (run_dir / "events.jsonl").write_text('{"type":"turn.failed","error":{"message":"failed"}}\n')
             (run_dir / "stderr.log").write_text("failed")
             (run_dir / "final.json").write_text(json.dumps({
@@ -1940,7 +2620,9 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
             return 1
 
         invoke.side_effect = fail_with_change
-        result = retry(previous, self.task, home=self.home)
+        with patch.object(runner, "_release_root_lock", wraps=runner._release_root_lock) as release:
+            result = retry(previous, self.task, home=self.home)
+            self.assertEqual(1, release.call_count)
         self.assertEqual(2, invoke.call_count)
         self.assertTrue(all(call.args[1].startswith(CODEX_EXECUTOR_CHARTER) for call in invoke.call_args_list))
         self.assertTrue(json.loads((Path(result["run_dir"]) / "state.json").read_text())["escalated"])

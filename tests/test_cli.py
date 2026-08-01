@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 from cross_harness.cli import main
+from cross_harness.errors import HarnessError
 from cross_harness.paths import source_root
 from cross_harness.errors import SupervisorDiedError
 
@@ -81,6 +82,17 @@ class CliWaitTests(unittest.TestCase):
             ):
                 self.assertEqual(5, main(["wait", "--run", str(run), "--timeout-seconds", "1"]))
             self.assertIn("supervisor died", error.getvalue())
+
+    def test_adopt_harness_error_returns_nonzero_exit_code(self):
+        with tempfile.TemporaryDirectory() as folder:
+            run = Path(folder) / "run"
+            error = StringIO()
+            with redirect_stderr(error), patch(
+                "cross_harness.cli.adopt",
+                side_effect=HarnessError("adopt conflict(s); worktree unchanged"),
+            ):
+                self.assertEqual(2, main(["adopt", "--run", str(run)]))
+            self.assertIn("adopt conflict(s)", error.getvalue())
 
 
 if __name__ == "__main__":

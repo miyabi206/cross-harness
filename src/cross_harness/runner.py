@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import errno
+import fcntl
+import hashlib
 import json
 import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -83,6 +87,9 @@ JSON schema: status, work_completed, changed_files, tests, error, and
 next_decision. On failure, include exit code, cause, file, line, expected value,
 and actual value whenever those facts exist. Do not narrate intermediate work."""
 _DETACHED_SUPERVISORS: dict[int, subprocess.Popen] = {}
+_HELD_ROOT_LOCKS: dict[Path, int] = {}
+_DELEGATED_CHANGES_LOCK_TIMEOUT_SECONDS = 5.0
+_LOCK_POLL_INTERVAL_SECONDS = 0.01
 
 
 def _filtered_executor_stderr(stderr: str) -> str:
@@ -93,7 +100,16 @@ def _filtered_executor_stderr(stderr: str) -> str:
 
 
 def _git(cwd: Path, args: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False)
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="surrogateescape",
+        timeout=timeout,
+        check=False,
+    )
 
 
 def _git_root(cwd: Path) -> Path:
@@ -114,13 +130,85 @@ def _delegated_changes_path(runtime_root: Path) -> Path:
     return runtime_root / "delegated-changes.json"
 
 
+def _root_lock_path(runtime_root: Path, root: Path) -> Path:
+    resolved_root = root.resolve()
+    digest = hashlib.sha256(str(resolved_root).encode("utf-8")).hexdigest()
+    return runtime_root / "locks" / f"root-{digest}.lock"
+
+
+def _delegated_changes_lock_path(runtime_root: Path) -> Path:
+    return runtime_root / "locks" / "delegated-changes.lock"
+
+
+def _try_lock(lock_path: Path) -> int | None:
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        raise HarnessError(f"could not open lock file: {lock_path}") from exc
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        if exc.errno in {errno.EACCES, errno.EAGAIN}:
+            return None
+        raise HarnessError(f"could not acquire lock: {lock_path}") from exc
+    return descriptor
+
+
+def _acquire_root_lock(runtime_root: Path, root: Path) -> bool:
+    lock_path = _root_lock_path(runtime_root, root)
+    if lock_path in _HELD_ROOT_LOCKS:
+        return False
+    descriptor = _try_lock(lock_path)
+    if descriptor is None:
+        return False
+    _HELD_ROOT_LOCKS[lock_path] = descriptor
+    return True
+
+
+def _release_root_lock(runtime_root: Path, root: Path) -> None:
+    lock_path = _root_lock_path(runtime_root, root)
+    descriptor = _HELD_ROOT_LOCKS.get(lock_path)
+    if descriptor is None:
+        return
+    try:
+        _release_lock(descriptor)
+    finally:
+        if _HELD_ROOT_LOCKS.get(lock_path) == descriptor:
+            _HELD_ROOT_LOCKS.pop(lock_path, None)
+
+
+def _acquire_delegated_changes_lock(runtime_root: Path) -> int:
+    lock_path = _delegated_changes_lock_path(runtime_root)
+    deadline = time.monotonic() + _DELEGATED_CHANGES_LOCK_TIMEOUT_SECONDS
+    while True:
+        descriptor = _try_lock(lock_path)
+        if descriptor is not None:
+            return descriptor
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise HarnessError(f"timed out waiting for lock: {lock_path}")
+        time.sleep(min(_LOCK_POLL_INTERVAL_SECONDS, remaining))
+
+
+def _release_lock(descriptor: int) -> None:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
 def _effective_dirty_worktree_policy(config: dict, root: Path) -> str:
     """Return the project-specific write-worktree policy for a repository."""
     return project_config(config, root).get("dirty_worktree_policy", config["dirty_worktree_policy"])
 
 
-def _load_delegated_changes(runtime_root: Path) -> dict[str, dict[str, str]] | None:
-    """Load the trusted delegated-change fingerprints, failing closed on bad data."""
+def _read_delegated_changes(runtime_root: Path) -> dict[str, dict[str, str]] | None:
+    """Read trusted delegated-change fingerprints, failing closed on bad data."""
     path = _delegated_changes_path(runtime_root)
     if not path.exists():
         return {}
@@ -138,6 +226,15 @@ def _load_delegated_changes(runtime_root: Path) -> dict[str, dict[str, str]] | N
             return None
         records[root] = changes
     return records
+
+
+def _load_delegated_changes(runtime_root: Path) -> dict[str, dict[str, str]] | None:
+    """Load trusted delegated changes while excluding an in-progress update."""
+    descriptor = _acquire_delegated_changes_lock(runtime_root)
+    try:
+        return _read_delegated_changes(runtime_root)
+    finally:
+        _release_lock(descriptor)
 
 
 def _delegated_changes_match(
@@ -164,11 +261,11 @@ def _delegated_changes_match(
     return current_fingerprints == recorded
 
 
-def _record_delegated_changes(
+def _record_delegated_changes_locked(
     runtime_root: Path, run_dir: Path, cwd: Path, current: list[dict], execution_delta: list[dict]
 ) -> None:
-    """Record only this run's changes and still-current trusted changes."""
-    records = _load_delegated_changes(runtime_root) or {}
+    """Record delegated changes while the delegated-changes lock is held."""
+    records = _read_delegated_changes(runtime_root) or {}
     root = str(_git_root(cwd))
     current_fingerprints = {
         item["file"]: item["fingerprint"]
@@ -190,6 +287,26 @@ def _record_delegated_changes(
     atomic_write(_delegated_changes_path(runtime_root), dump_json(records))
 
 
+def _record_delegated_changes(
+    runtime_root: Path,
+    run_dir: Path,
+    cwd: Path,
+    current: list[dict],
+    execution_delta: list[dict],
+    *,
+    lock_descriptor: int | None = None,
+) -> None:
+    """Record only this run's changes and still-current trusted changes."""
+    if lock_descriptor is not None:
+        _record_delegated_changes_locked(runtime_root, run_dir, cwd, current, execution_delta)
+        return
+    descriptor = _acquire_delegated_changes_lock(runtime_root)
+    try:
+        _record_delegated_changes_locked(runtime_root, run_dir, cwd, current, execution_delta)
+    finally:
+        _release_lock(descriptor)
+
+
 def _prepare_write_execution(
     config: dict,
     role_name: str,
@@ -206,13 +323,27 @@ def _prepare_write_execution(
 ) -> Path:
     """Apply the shared write-worktree policy and return the execution root."""
     policy = _effective_dirty_worktree_policy(config, root)
-    if not role["write"] or policy == "allow":
+    if not role["write"]:
+        return root
+    if policy == "isolate":
+        return _create_isolated_worktree(root, run_dir)
+    if not _acquire_root_lock(runtime_root, root):
+        if policy == "stop":
+            reason = "write delegation blocked: another write delegation owns the root worktree"
+            finalize_blocked_run(
+                run_dir, role_name, role, kind, root, reason, "dirty_worktree",
+                attempts=attempts,
+                thread_id=thread_id,
+                signatures=signatures,
+                defaulted_settings=defaulted_settings,
+            )
+            raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
+        return _create_isolated_worktree(root, run_dir)
+    if policy == "allow":
         return root
     dirty = _dirty(root)
     if not dirty:
         return root
-    if policy == "isolate":
-        return _create_isolated_worktree(root, run_dir)
     _, current, _ = _diff_details(root)
     allowed = policy == "allow_delegated" and _delegated_changes_match(runtime_root, root, dirty, current)
     if policy != "isolate" and not allowed:
@@ -296,10 +427,12 @@ def _prepare_retry_execution(
     run_dir: Path,
     previous_run: Path,
     *,
+    runtime_root: Path,
     attempts: int,
     thread_id: str | None,
     signatures: list[str] | None,
     defaulted_settings: list[str] | None = None,
+    root_lock_held: bool = False,
 ) -> Path:
     """Prepare a retry from its predecessor's recorded worktree state."""
     if not role["write"]:
@@ -320,6 +453,20 @@ def _prepare_retry_execution(
         atomic_write(run_dir / "ISOLATED_WORKTREE", str(execution_root) + "\n")
     else:
         execution_root = root
+        lock_path = _root_lock_path(runtime_root, root)
+        if root_lock_held:
+            if lock_path not in _HELD_ROOT_LOCKS:
+                raise HarnessError("root worktree lock was lost before escalation")
+        elif not _acquire_root_lock(runtime_root, root):
+            reason = "retry blocked: another write delegation owns the root worktree"
+            finalize_blocked_run(
+                run_dir, role_name, role, kind, root, reason, "dirty_worktree",
+                attempts=attempts,
+                thread_id=thread_id,
+                signatures=signatures,
+                defaulted_settings=defaulted_settings,
+            )
+            raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
 
     policy = _effective_dirty_worktree_policy(config, root)
     if policy == "allow":
@@ -375,13 +522,15 @@ def _diff_details(cwd: Path) -> tuple[str, list[dict], list[str]]:
     stat_result = _git(cwd, ["diff", "HEAD", "--stat", "--", "."])
     if stat_result.returncode:
         stat_result = _git(cwd, ["diff", "--stat", "--", "."])
-    numstat = _git(cwd, ["diff", "HEAD", "--numstat", "--no-renames", "--", "."])
+    numstat = _git(cwd, ["diff", "HEAD", "--numstat", "--no-renames", "-z", "--", "."])
     if numstat.returncode:
-        numstat = _git(cwd, ["diff", "--numstat", "--no-renames", "--", "."])
+        numstat = _git(cwd, ["diff", "--numstat", "--no-renames", "-z", "--", "."])
     details: list[dict] = []
     changed: list[str] = []
-    for line in numstat.stdout.splitlines():
-        parts = line.split("\t", 2)
+    for record in numstat.stdout.split("\0"):
+        if not record:
+            continue
+        parts = record.split("\t", 2)
         if len(parts) != 3:
             continue
         added, deleted, file_name = parts
@@ -410,11 +559,406 @@ def _diff_details(cwd: Path) -> tuple[str, list[dict], list[str]]:
     return stat_result.stdout, details, changed
 
 
+def _adopt_snapshot(path: Path) -> tuple[str, bytes | str | None, int | None]:
+    """Capture a file-system path without following symlinks."""
+    try:
+        metadata = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return "missing", None, None
+    except OSError as exc:
+        raise HarnessError(f"could not inspect path for adoption: {path}") from exc
+    try:
+        mode = stat.S_IMODE(metadata.st_mode)
+        if stat.S_ISLNK(metadata.st_mode):
+            return "symlink", os.readlink(path), mode
+        if stat.S_ISREG(metadata.st_mode):
+            return "file", path.read_bytes(), mode
+        if stat.S_ISDIR(metadata.st_mode):
+            return "directory", None, mode
+        return "unsupported", None, mode
+    except OSError as exc:
+        raise HarnessError(f"could not read path for adoption: {path}") from exc
+
+
+def _adopt_git_snapshot(
+    root: Path,
+    revision: str,
+    file_name: str,
+    *,
+    index: bool = False,
+) -> tuple[str, bytes | str | None, int | None]:
+    """Read a tracked path from Git for adopt's conflict comparison."""
+    if index:
+        listed = _git(root, ["--literal-pathspecs", "ls-files", "--stage", "--", file_name])
+    else:
+        listed = _git(root, ["--literal-pathspecs", "ls-tree", revision, "--", file_name])
+    if listed.returncode:
+        raise HarnessError(f"could not inspect Git path for adoption: {file_name}")
+    entries = [line for line in listed.stdout.splitlines() if line]
+    if not entries:
+        return "missing", None, None
+    fields = entries[0].split(None, 3)
+    if len(fields) < 3:
+        raise HarnessError(f"could not inspect Git path for adoption: {file_name}")
+    raw_mode = int(fields[0], 8)
+    if raw_mode == 0o160000:
+        raise HarnessError(f"adopt does not support submodules: {file_name}")
+    if index:
+        return "index", None, raw_mode & 0o777
+    if raw_mode == 0o120000:
+        shown = subprocess.run(
+            ["git", "show", f"{revision}:{file_name}"],
+            cwd=root,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if shown.returncode:
+            raise HarnessError(f"could not read Git path for adoption: {file_name}")
+        return "symlink", shown.stdout.decode("utf-8", errors="surrogateescape"), 0o777
+    mode = raw_mode & 0o777
+    shown = subprocess.run(
+        ["git", "show", f"{revision}:{file_name}"],
+        cwd=root,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if shown.returncode:
+        raise HarnessError(f"could not read Git path for adoption: {file_name}")
+    return "file", shown.stdout, mode
+
+
+def _adopt_target_matches_head(
+    root: Path,
+    file_name: str,
+    base_snapshot: tuple[str, bytes | str | None, int | None],
+    target_snapshot: tuple[str, bytes | str | None, int | None],
+) -> bool:
+    """Compare a root path with HEAD using Git's working-tree filters."""
+    if base_snapshot[0] == "missing":
+        return _adopt_snapshot_equal(target_snapshot, base_snapshot)
+    compared = _git(root, ["--literal-pathspecs", "diff", "--quiet", "HEAD", "--", file_name])
+    if compared.returncode not in {0, 1}:
+        raise HarnessError(f"could not compare Git path for adoption: {file_name}")
+    return compared.returncode == 0
+
+
+def _adopt_snapshot_equal(
+    left: tuple[str, bytes | str | None, int | None],
+    right: tuple[str, bytes | str | None, int | None],
+) -> bool:
+    if left[:2] != right[:2]:
+        return False
+    if left[0] == "symlink":
+        return True
+    if left[0] != "file":
+        return left[2] == right[2]
+    if left[2] is None or right[2] is None:
+        return left[2] == right[2]
+    return bool(left[2] & 0o111) == bool(right[2] & 0o111)
+
+
+def _adopt_remove(path: Path) -> None:
+    kind, _, _ = _adopt_snapshot(path)
+    if kind == "missing":
+        return
+    if kind == "directory":
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _adopt_write(
+    path: Path,
+    snapshot: tuple[str, bytes | str | None, int | None],
+) -> None:
+    kind, contents, mode = snapshot
+    if kind == "missing":
+        _adopt_remove(path)
+        return
+    if kind == "file":
+        atomic_write(path, contents if isinstance(contents, bytes) else b"", mode or 0o644)
+        return
+    if kind == "symlink":
+        _adopt_remove(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(str(contents), path)
+        return
+    raise HarnessError(f"unsupported path type while adopting: {path}")
+
+
+def _adopt_worktree_roots(worktree: Path) -> tuple[Path, Path]:
+    """Return (isolated worktree, primary worktree) after validating registration."""
+    try:
+        isolated = _git_root(worktree)
+    except HarnessError as exc:
+        raise HarnessError("ISOLATED_WORKTREE does not point to a Git worktree") from exc
+    listing = _git(worktree, ["worktree", "list", "--porcelain"])
+    if listing.returncode:
+        raise HarnessError("could not inspect Git worktrees for adoption")
+    roots = [
+        Path(line[9:]).resolve()
+        for line in listing.stdout.splitlines()
+        if line.startswith("worktree ")
+    ]
+    if isolated not in roots:
+        raise HarnessError("ISOLATED_WORKTREE is not a registered Git worktree")
+    if not roots or roots[0] == isolated:
+        raise HarnessError("run does not have an isolated worktree; root runs need no adoption")
+    return isolated, roots[0]
+
+
+def _adopt_reject_live_shared_worktree(
+    runtime_root: Path,
+    run_dir: Path,
+    worktree: Path,
+) -> None:
+    """Reject adoption while another live run points at the same worktree."""
+    runs_root = runtime_root / "runs"
+    try:
+        candidates = list(runs_root.iterdir())
+    except OSError as exc:
+        raise HarnessError(f"could not inspect runs for shared worktrees: {runs_root}") from exc
+    target_run = run_dir.resolve()
+    for candidate in candidates:
+        try:
+            if not candidate.is_dir() or candidate.resolve() == target_run:
+                continue
+            marker = candidate / "ISOLATED_WORKTREE"
+            if not marker.is_file():
+                continue
+            try:
+                raw_marker_path = marker.read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeError) as exc:
+                raise HarnessError(
+                    f"could not read shared-worktree marker: {marker}"
+                ) from exc
+            marker_path = Path(raw_marker_path)
+            if not raw_marker_path or not marker_path.is_absolute():
+                continue
+            if marker_path.resolve() != worktree:
+                continue
+            if _supervisor_alive(candidate):
+                raise HarnessError(
+                    "cannot adopt: another live run shares the isolated worktree "
+                    f"{worktree}: {candidate}"
+                )
+        except HarnessError:
+            raise
+        except OSError as exc:
+            raise HarnessError(
+                f"could not inspect run for shared worktree: {candidate}"
+            ) from exc
+        except (RuntimeError, UnicodeError, ValueError):
+            continue
+
+
+def adopt(
+    run_dir: Path,
+    config_path: Path | None = None,
+    home: Path | None = None,
+) -> dict:
+    """Adopt an isolated run's worktree delta into the primary worktree."""
+    run_dir = run_dir.resolve()
+    if not run_dir.is_dir():
+        raise HarnessError(f"run directory not found: {run_dir}")
+    if _supervisor_alive(run_dir):
+        raise HarnessError("cannot adopt: run is still in progress")
+    try:
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        state = None
+    completed_summary = _completed_summary(run_dir)
+    completed_statuses = {"success", "failed", "blocked", "partial"}
+    if (
+        not isinstance(state, dict)
+        or state.get("status") not in completed_statuses
+        or not isinstance(completed_summary, dict)
+        or completed_summary.get("status") not in completed_statuses
+    ):
+        raise HarnessError("cannot adopt: run summary is not finalized")
+    marker = run_dir / "ISOLATED_WORKTREE"
+    if not marker.is_file():
+        raise HarnessError(
+            "run does not have an ISOLATED_WORKTREE marker; root worktree runs need no adoption"
+        )
+    try:
+        raw_marker_path = marker.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as exc:
+        raise HarnessError(f"could not read ISOLATED_WORKTREE: {exc}") from exc
+    runtime_root = Path(load_config(config_path, user_paths(home).home)["runtime_root"]).resolve()
+    marker_path = Path(raw_marker_path)
+    if not raw_marker_path or not marker_path.is_absolute():
+        raise HarnessError("ISOLATED_WORKTREE must contain an absolute worktree path")
+    marker_path = marker_path.resolve()
+    try:
+        marker_path.relative_to(runtime_root / "runs")
+    except ValueError as exc:
+        raise HarnessError(
+            "unsafe isolated worktree marker outside runtime_root/runs (outside run directory)"
+        ) from exc
+    if not marker_path.is_dir():
+        raise HarnessError(f"isolated worktree not found: {marker_path}")
+    isolated, root = _adopt_worktree_roots(marker_path)
+    _adopt_reject_live_shared_worktree(runtime_root, run_dir, isolated)
+    isolated_head = _git(isolated, ["rev-parse", "HEAD"])
+    root_head = _git(root, ["rev-parse", "HEAD"])
+    if isolated_head.returncode or root_head.returncode or isolated_head.stdout.strip() != root_head.stdout.strip():
+        raise HarnessError("cannot adopt: isolated and root worktrees have different HEADs")
+    added_paths = _git(
+        isolated,
+        ["diff", "--cached", "--diff-filter=A", "--name-only", "--no-renames", "-z", "--", "."],
+    )
+    if added_paths.returncode:
+        raise HarnessError("could not inspect staged Git paths for adoption")
+    for file_name in added_paths.stdout.split("\0"):
+        if file_name:
+            _adopt_git_snapshot(isolated, "HEAD", file_name, index=True)
+
+    _, source_details, source_paths = _diff_details(isolated)
+    source_paths = list(dict.fromkeys(source_paths))
+    safe_paths: list[Path] = []
+    for file_name in source_paths:
+        relative = Path(file_name)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise HarnessError(f"unsafe path in isolated worktree changes: {file_name}")
+        safe_paths.append(relative)
+
+    source_snapshots: dict[str, tuple[str, bytes | str | None, int | None]] = {}
+    target_snapshots: dict[str, tuple[str, bytes | str | None, int | None]] = {}
+    conflicts: set[str] = set()
+    for relative in safe_paths:
+        file_name = relative.as_posix()
+        source_snapshot = _adopt_snapshot(isolated / relative)
+        base_snapshot = _adopt_git_snapshot(root, "HEAD", file_name)
+        if base_snapshot[0] == "missing":
+            _adopt_git_snapshot(isolated, "HEAD", file_name, index=True)
+        target_snapshot = _adopt_snapshot(root / relative)
+        source_snapshots[file_name] = source_snapshot
+        target_snapshots[file_name] = target_snapshot
+        if not _adopt_target_matches_head(root, file_name, base_snapshot, target_snapshot) and not _adopt_snapshot_equal(
+            target_snapshot, source_snapshot
+        ):
+            conflicts.add(file_name)
+        for parent in relative.parents:
+            if str(parent) == ".":
+                break
+            parent_name = parent.as_posix()
+            target_parent = _adopt_snapshot(root / parent)
+            if target_parent[0] not in {"missing", "directory"}:
+                conflicts.add(parent_name)
+    if conflicts:
+        paths = "\n- ".join(sorted(conflicts))
+        raise HarnessError(f"adopt conflict(s); worktree unchanged:\n- {paths}")
+
+    lock_path = _root_lock_path(runtime_root, root)
+    if lock_path in _HELD_ROOT_LOCKS or not _acquire_root_lock(runtime_root, root):
+        raise HarnessError("adopt blocked: another write delegation owns the root worktree")
+
+    records_path = _delegated_changes_path(runtime_root)
+    delegated_changes_descriptor: int | None = None
+    records_snapshot: tuple[str, bytes | str | None, int | None] | None = None
+    applied: list[str] = []
+    created_directories: list[Path] = []
+    try:
+        delegated_changes_descriptor = _acquire_delegated_changes_lock(runtime_root)
+        records_snapshot = _adopt_snapshot(records_path)
+        conflicts = set()
+        for relative in safe_paths:
+            file_name = relative.as_posix()
+            base_snapshot = _adopt_git_snapshot(root, "HEAD", file_name)
+            if base_snapshot[0] == "missing":
+                _adopt_git_snapshot(isolated, "HEAD", file_name, index=True)
+            target_snapshot = _adopt_snapshot(root / relative)
+            target_snapshots[file_name] = target_snapshot
+            if not _adopt_target_matches_head(root, file_name, base_snapshot, target_snapshot) and not _adopt_snapshot_equal(
+                target_snapshot, source_snapshots[file_name]
+            ):
+                conflicts.add(file_name)
+            for parent in relative.parents:
+                if str(parent) == ".":
+                    break
+                parent_name = parent.as_posix()
+                if _adopt_snapshot(root / parent)[0] not in {"missing", "directory"}:
+                    conflicts.add(parent_name)
+        if conflicts:
+            paths = "\n- ".join(sorted(conflicts))
+            raise HarnessError(f"adopt conflict(s); worktree unchanged:\n- {paths}")
+        _adopt_reject_live_shared_worktree(runtime_root, run_dir, isolated)
+        for relative in safe_paths:
+            file_name = relative.as_posix()
+            source_snapshot = source_snapshots[file_name]
+            target_snapshot = target_snapshots[file_name]
+            if _adopt_snapshot_equal(source_snapshot, target_snapshot):
+                continue
+            parent = (root / relative).parent
+            missing_parents: list[Path] = []
+            while parent != root and _adopt_snapshot(parent)[0] == "missing":
+                missing_parents.append(parent)
+                parent = parent.parent
+            for directory in reversed(missing_parents):
+                directory.mkdir()
+                created_directories.append(directory)
+            _adopt_write(root / relative, source_snapshot)
+            applied.append(file_name)
+        _, current_details, _ = _diff_details(root)
+        current_by_path = {
+            item["file"]: item for item in current_details if isinstance(item.get("file"), str)
+        }
+        missing_paths = sorted(set(source_paths) - set(current_by_path))
+        if missing_paths:
+            paths = "\n- ".join(missing_paths)
+            raise HarnessError(
+                "adopt could not verify all isolated worktree changes; missing paths:\n- " + paths
+            )
+        adopted_details = [
+            current_by_path[file_name]
+            for file_name in applied
+            if file_name in current_by_path
+        ]
+        if delegated_changes_descriptor is None:
+            raise HarnessError("adopt lost the delegated-changes lock")
+        _record_delegated_changes(
+            runtime_root,
+            run_dir,
+            root,
+            current_details,
+            adopted_details,
+            lock_descriptor=delegated_changes_descriptor,
+        )
+    except BaseException as exc:
+        rollback_error: BaseException | None = None
+        try:
+            for file_name in reversed(applied):
+                _adopt_write(root / file_name, target_snapshots[file_name])
+            for directory in reversed(created_directories):
+                if _adopt_snapshot(directory)[0] == "directory" and not any(directory.iterdir()):
+                    directory.rmdir()
+            if records_snapshot is not None:
+                if records_snapshot[0] == "missing":
+                    _adopt_remove(records_path)
+                else:
+                    _adopt_write(records_path, records_snapshot)
+        except BaseException as rollback_exc:
+            rollback_error = rollback_exc
+        if rollback_error is not None:
+            raise HarnessError(f"adopt failed and rollback failed: {rollback_error}") from exc
+        if isinstance(exc, HarnessError):
+            raise
+        raise HarnessError(f"adopt failed: {exc}") from exc
+    finally:
+        if delegated_changes_descriptor is not None:
+            _release_lock(delegated_changes_descriptor)
+        _release_root_lock(runtime_root, root)
+    return {"root": str(root), "worktree": str(isolated), "changed_files": applied}
+
+
 def _write_baseline(run_dir: Path, cwd: Path) -> None:
-    stat, details, changed = _diff_details(cwd)
+    diff_stat, details, changed = _diff_details(cwd)
     atomic_write(run_dir / "baseline.json", dump_json({
         "cwd": str(cwd),
-        "diff_stat": stat,
+        "diff_stat": diff_stat,
         "diff_summary": details,
         "changed_files": changed,
     }))
@@ -979,82 +1523,88 @@ def delegate(
     root = _git_root(cwd)
     effective_policy = _effective_dirty_worktree_policy(config, root)
     runtime_root = Path(config["runtime_root"])
+    lock_path = _root_lock_path(runtime_root, root)
+    held_before = lock_path in _HELD_ROOT_LOCKS
     run_dir = run_dir or _new_run_dir(runtime_root)
     if not run_dir.is_dir():
         raise HarnessError(f"run directory not found: {run_dir}")
     run_task = run_dir / "task.md"
     if task_file.resolve() != run_task.resolve():
         shutil.copy2(task_file, run_task)
-    execution_root = _prepare_write_execution(
-        config,
-        role_name,
-        role,
-        kind,
-        root,
-        runtime_root,
-        run_dir,
-        defaulted_settings=defaulted_settings,
-    )
-    _write_baseline(run_dir, execution_root)
     try:
-        if role["harness"] == "codex":
-            verify_codex_config_ownership(paths.home, root, execution_root)
-            executor, cached = verify_codex_chatgpt(runtime_root, paths.home, config["auth_cache_hours"])
-        elif role["harness"] == "claude":
-            verify_claude_config_ownership(paths.home, root)
-            executor, cached = verify_claude_subscription(runtime_root, paths.home, config["auth_cache_hours"])
-        else:
-            raise ConfigError(f"unsupported harness: {role['harness']}")
-    except AuthError as exc:
-        return finalize_blocked_run(
-            run_dir,
+        execution_root = _prepare_write_execution(
+            config,
             role_name,
             role,
             kind,
-            execution_root,
-            str(exc),
-            "authentication",
+            root,
+            runtime_root,
+            run_dir,
             defaulted_settings=defaulted_settings,
         )
-    environment = sanitized_environment(paths.home, {
-        "CROSS_HARNESS_ACTIVE": "1",
-        "CROSS_HARNESS_EXECUTOR": role["harness"],
-        "CROSS_HARNESS_PARENT": config["parent_harness"],
-        "CROSS_HARNESS_RUN_DIR": str(run_dir),
-    })
-    if role["write"]:
-        environment["CROSS_HARNESS_WRITE"] = "1"
-    else:
-        environment.pop("CROSS_HARNESS_WRITE", None)
-    command = _command(executor, role_name, role, execution_root, run_dir, paths.claude / "agents")
-    command, sandbox_exec = _contain_claude_write_command(
-        command, role, execution_root, run_dir, paths.home
-    )
-    _write_execution_record(
-        run_dir, role_name, role, kind, execution_root, config["parent_harness"]
-    )
-    atomic_write(run_dir / "command.json", dump_json({
-        "argv": command,
-        "auth_cached": cached,
-        "cwd": str(execution_root),
-        "sandbox_exec": sandbox_exec,
-    }))
-    exit_code = _invoke_safe(
-        command,
-        _executor_task(task, role["harness"]),
-        environment,
-        execution_root,
-        run_dir,
-        role["timeout_seconds"],
-    )
-    if role["harness"] == "claude":
-        _write_claude_final_from_events(run_dir)
-    return finalize_run(
-        run_dir, role_name, role, kind, execution_root, exit_code, attempt=1,
-        runtime_root=runtime_root,
-        dirty_worktree_policy=effective_policy,
-        defaulted_settings=defaulted_settings,
-    )
+        _write_baseline(run_dir, execution_root)
+        try:
+            if role["harness"] == "codex":
+                verify_codex_config_ownership(paths.home, root, execution_root)
+                executor, cached = verify_codex_chatgpt(runtime_root, paths.home, config["auth_cache_hours"])
+            elif role["harness"] == "claude":
+                verify_claude_config_ownership(paths.home, root)
+                executor, cached = verify_claude_subscription(runtime_root, paths.home, config["auth_cache_hours"])
+            else:
+                raise ConfigError(f"unsupported harness: {role['harness']}")
+        except AuthError as exc:
+            return finalize_blocked_run(
+                run_dir,
+                role_name,
+                role,
+                kind,
+                execution_root,
+                str(exc),
+                "authentication",
+                defaulted_settings=defaulted_settings,
+            )
+        environment = sanitized_environment(paths.home, {
+            "CROSS_HARNESS_ACTIVE": "1",
+            "CROSS_HARNESS_EXECUTOR": role["harness"],
+            "CROSS_HARNESS_PARENT": config["parent_harness"],
+            "CROSS_HARNESS_RUN_DIR": str(run_dir),
+        })
+        if role["write"]:
+            environment["CROSS_HARNESS_WRITE"] = "1"
+        else:
+            environment.pop("CROSS_HARNESS_WRITE", None)
+        command = _command(executor, role_name, role, execution_root, run_dir, paths.claude / "agents")
+        command, sandbox_exec = _contain_claude_write_command(
+            command, role, execution_root, run_dir, paths.home
+        )
+        _write_execution_record(
+            run_dir, role_name, role, kind, execution_root, config["parent_harness"]
+        )
+        atomic_write(run_dir / "command.json", dump_json({
+            "argv": command,
+            "auth_cached": cached,
+            "cwd": str(execution_root),
+            "sandbox_exec": sandbox_exec,
+        }))
+        exit_code = _invoke_safe(
+            command,
+            _executor_task(task, role["harness"]),
+            environment,
+            execution_root,
+            run_dir,
+            role["timeout_seconds"],
+        )
+        if role["harness"] == "claude":
+            _write_claude_final_from_events(run_dir)
+        return finalize_run(
+            run_dir, role_name, role, kind, execution_root, exit_code, attempt=1,
+            runtime_root=runtime_root,
+            dirty_worktree_policy=effective_policy,
+            defaulted_settings=defaulted_settings,
+        )
+    finally:
+        if not held_before and lock_path in _HELD_ROOT_LOCKS:
+            _release_root_lock(runtime_root, root)
 
 
 def start_detached_delegate(
@@ -1555,7 +2105,7 @@ def finalize_run(
     summary_text = ""
     for _ in range(4):
         summary_text = render_summary(summary, role["output_limit_chars"])
-        byte_count = len(summary_text.encode("utf-8"))
+        byte_count = len(summary_text.encode("utf-8", errors="backslashreplace"))
         percent = (
             (1 - byte_count / summary["raw_artifact_bytes"]) * 100
             if summary["raw_artifact_bytes"]
@@ -1588,6 +2138,39 @@ def _escalated_role(role: dict, config: dict) -> dict:
 
 
 def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home: Path | None = None) -> dict:
+    """Retry while releasing any root lock acquired by the retry path."""
+    if os.environ.get("CROSS_HARNESS_ACTIVE") == "1":
+        raise HarnessError("nested cross-harness retry from an active executor is blocked")
+    paths = user_paths(home)
+    config = load_config(config_path, paths.home)
+    root: Path | None = None
+    runtime_root: Path | None = None
+    lock_path: Path | None = None
+    held_before = False
+    state_path = run_dir / "state.json"
+    if state_path.exists():
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        role = config.get("roles", {}).get(state.get("role"))
+        state_cwd = state.get("cwd")
+        if (
+            isinstance(role, dict)
+            and role.get("write")
+            and isinstance(state_cwd, str)
+            and not (run_dir / "ISOLATED_WORKTREE").exists()
+        ):
+            root = _git_root(Path(state_cwd))
+            runtime_root = Path(config["runtime_root"])
+            lock_path = _root_lock_path(runtime_root, root)
+            held_before = lock_path in _HELD_ROOT_LOCKS
+    try:
+        return _retry_impl(run_dir, task_file, config_path=config_path, home=home)
+    finally:
+        if root is not None and runtime_root is not None and lock_path is not None:
+            if not held_before and lock_path in _HELD_ROOT_LOCKS:
+                _release_root_lock(runtime_root, root)
+
+
+def _retry_impl(run_dir: Path, task_file: Path, config_path: Path | None = None, home: Path | None = None) -> dict:
     if os.environ.get("CROSS_HARNESS_ACTIVE") == "1":
         raise HarnessError("nested cross-harness retry from an active executor is blocked")
     paths = user_paths(home)
@@ -1635,10 +2218,16 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
     shutil.copy2(task_file, retry_root / "task.md")
     execution_root = _prepare_retry_execution(
         config, role_name, role, state["kind"], source_root, retry_root, run_dir,
+        runtime_root=runtime_root,
         attempts=state["attempts"],
         thread_id=state["thread_id"],
         signatures=state.get("signatures", []),
         defaulted_settings=defaulted_settings,
+    )
+    root_lock_held = (
+        role["write"]
+        and not (retry_root / "ISOLATED_WORKTREE").exists()
+        and _root_lock_path(runtime_root, source_root) in _HELD_ROOT_LOCKS
     )
     _write_baseline(retry_root, execution_root)
     try:
@@ -1721,9 +2310,11 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
         shutil.copy2(task_file, escalation_root / "task.md")
         escalation_execution_root = _prepare_retry_execution(
             config, role_name, escalation, state["kind"], source_root, escalation_root, retry_root,
+            runtime_root=runtime_root,
             attempts=new_state["attempts"], thread_id=summary.get("thread_id"),
             signatures=new_state.get("signatures", []),
             defaulted_settings=defaulted_settings,
+            root_lock_held=root_lock_held,
         )
         _write_baseline(escalation_root, escalation_execution_root)
         command = _command(
