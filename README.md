@@ -6,8 +6,8 @@ requirements, planning, review, testing, and reporting, while Codex performs
 bounded implementation, debugging, and security-review work through one wrapper.
 Every delegated role has a `harness` setting and can be placed on either
 harness, but this does not make Codex an orchestrator. The current defaults put
-explorer, reviewer, and tester on Claude; implementer, debugger, and
-security_reviewer on Codex.
+explorer, reviewer, and tester on Claude; implementer, implementer_complex,
+debugger, and security_reviewer on Codex.
 
 The harness uses saved ChatGPT subscription authentication only. It rejects any
 `*_API_KEY` environment variable, non-OpenAI provider override, custom OpenAI
@@ -131,10 +131,19 @@ warns when it is outside the known values: Codex supports `minimal`, `low`,
 `medium`, `high`, and `xhigh`; Claude supports `low`, `medium`, `high`, `xhigh`,
 and `max`.
 
-Codex role changes apply to the next `delegate`. Claude role changes require a
-new Claude session, because its session-start hook synchronizes
+For Codex roles, changes to role settings apply to the next `delegate`,
+including `model`, `effort`, `retries`, `timeout_seconds`, `write`, and
+`delegate_kinds`. Files under `~/.codex/agents/` are not read by `delegate`;
+they are display-only definitions synchronized during install and when a
+Claude session starts.
+Claude role changes require a new Claude session,
+because its session-start hook synchronizes
 `~/.claude/agents/cross-harness-*.md`. `orchestrator` is the session itself,
 so its `model` and `effort` settings currently have no effect.
+
+The implementer effort expanded into the orchestrator `SKILL.md` is fixed only
+when `install` runs. Changing the configuration without reinstalling leaves
+the previously installed value in place.
 
 Check the configuration with:
 

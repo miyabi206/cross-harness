@@ -15,7 +15,7 @@ from .errors import ConfigError
 from .files import atomic_write, dump_json
 from .maintenance import cleanup
 from .paths import user_paths
-from .installer import synchronize_claude_agent_roles
+from .installer import synchronize_claude_agent_roles, synchronize_codex_agent_roles
 from .selfupdate import self_update
 from .taskfile import contains_secret
 
@@ -385,9 +385,17 @@ def claude_session_start(home: Path | None = None) -> int:
                 "cross-harness is disabled for this cwd; ignore the managed orchestrator instructions in CLAUDE.md."
             )
         if (paths.claude / "agents").exists():
-            warnings.extend(synchronize_claude_agent_roles(paths, config))
-    except Exception as exc:  # hooks must not hide the session for synchronization failure
-        warnings.append(f"Claude agent configuration sync warning: {exc}")
+            try:
+                warnings.extend(synchronize_claude_agent_roles(paths, config))
+            except Exception as exc:
+                warnings.append(f"Claude agent configuration sync warning: {exc}")
+        if (paths.codex / "agents").exists():
+            try:
+                warnings.extend(synchronize_codex_agent_roles(paths, config))
+            except Exception as exc:
+                warnings.append(f"Codex agent configuration sync warning: {exc}")
+    except Exception as exc:  # hooks must not hide configuration loading/mode failures
+        warnings.append(f"configuration loading or mode detection warning: {exc}")
     keys = detected_api_keys()
     if keys:
         warnings.append("API-key environment detected; Codex delegation is disabled until removed: " + ", ".join(keys))

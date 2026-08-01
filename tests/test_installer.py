@@ -10,7 +10,15 @@ from unittest.mock import patch
 from cross_harness.files import MARKER_START, sha256
 from cross_harness.errors import ConfigError, HarnessError
 from cross_harness.config import load_config
-from cross_harness.installer import _git_hooks_path, install, synchronize_claude_agent_roles, uninstall
+from cross_harness.installer import (
+    _remove_codex_agent_role_keys,
+    _render_codex_agent_role,
+    _git_hooks_path,
+    install,
+    synchronize_claude_agent_roles,
+    synchronize_codex_agent_roles,
+    uninstall,
+)
 from cross_harness.paths import source_root, user_paths
 
 
@@ -189,6 +197,13 @@ class InstallerTests(unittest.TestCase):
                 .replace("max_parallel = 2", "max_parallel = 5"),
                 encoding="utf-8",
             )
+            config.write_text(
+                config.read_text(encoding="utf-8").replace(
+                    '[roles.implementer]\nharness = "codex"\nmodel = "gpt-5.6-terra"\neffort = "high"',
+                    '[roles.implementer]\nharness = "codex"\nmodel = "gpt-5.6-terra"\neffort = "custom-effort"',
+                ),
+                encoding="utf-8",
+            )
             for source in (
                 repo / "assets/shared/safety.md",
                 repo / "assets/codex/AGENTS.md",
@@ -216,6 +231,9 @@ class InstallerTests(unittest.TestCase):
             self.assertIn("Parallel limit: 5", codex_content)
             self.assertNotIn("{{MAX_PARALLEL}}", codex_content)
             self.assertIn("Parallel limit: 5", (home / ".claude/skills/cross-harness-orchestrator/SKILL.md").read_text(encoding="utf-8"))
+            installed_skill = (home / ".claude/skills/cross-harness-orchestrator/SKILL.md").read_text(encoding="utf-8")
+            self.assertIn("effort custom-effort", installed_skill)
+            self.assertNotIn("{{IMPLEMENTER_EFFORT}}", installed_skill)
 
     def test_install_materializes_claude_agent_role_models_and_efforts_from_config(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -315,6 +333,162 @@ class InstallerTests(unittest.TestCase):
             self.assertIn("model: sonnet", explorer)
             self.assertIn("effort: medium", explorer)
 
+    def test_codex_agent_role_sync_updates_removes_and_warns(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            config = home / ".config/cross-harness/config.toml"
+            config.parent.mkdir(parents=True)
+            contents = (repo / "config/default.toml").read_text(encoding="utf-8")
+            contents = contents.replace(
+                '[roles.explorer]\nharness = "claude"\nmodel = "haiku"\neffort = "low"',
+                '[roles.explorer]\nharness = "codex"\nmodel = "custom-codex"\neffort = "custom-effort"',
+            )
+            contents = contents.replace(
+                '[roles.implementer]\nharness = "codex"\nmodel = "gpt-5.6-terra"\neffort = "high"',
+                '[roles.implementer]\nharness = "claude"\nmodel = "sonnet"\neffort = "medium"',
+            )
+            config.write_text(contents, encoding="utf-8")
+
+            install(home, repo)
+            explorer = home / ".codex/agents/cross-harness-explorer.toml"
+            implementer = home / ".codex/agents/cross-harness-implementer.toml"
+            explorer_text = explorer.read_text(encoding="utf-8")
+            self.assertIn('model = "custom-codex"', explorer_text)
+            self.assertIn('model_reasoning_effort = "custom-effort"', explorer_text)
+            implementer_text = implementer.read_text(encoding="utf-8")
+            self.assertNotIn("model =", implementer_text)
+            self.assertNotIn("model_reasoning_effort =", implementer_text)
+
+            warnings = synchronize_codex_agent_roles(user_paths(home), load_config(config, home))
+            self.assertIn("roles 'implementer'", " ".join(warnings))
+
+            updated = contents.replace('model = "custom-codex"', 'model = "new-codex"').replace(
+                'effort = "custom-effort"', 'effort = "new-effort"'
+            )
+            config.write_text(updated, encoding="utf-8")
+            synchronize_codex_agent_roles(user_paths(home), load_config(config, home))
+            self.assertIn('model = "new-codex"', explorer.read_text(encoding="utf-8"))
+            self.assertIn('model_reasoning_effort = "new-effort"', explorer.read_text(encoding="utf-8"))
+
+    def test_codex_agent_role_sync_preserves_unmanaged_agent_fields(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            install(home, repo)
+            config = home / ".config/cross-harness/config.toml"
+            before = (home / ".codex/agents/cross-harness-implementer.toml").read_text(encoding="utf-8")
+
+            synchronize_codex_agent_roles(user_paths(home), load_config(config, home))
+
+            after = (home / ".codex/agents/cross-harness-implementer.toml").read_text(encoding="utf-8")
+            for key in ("name", "sandbox_mode", "developer_instructions"):
+                before_line = next(line for line in before.splitlines() if line.startswith(f"{key} ="))
+                self.assertIn(before_line, after)
+
+    def test_codex_agent_role_sync_skips_missing_definition_and_continues(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            config = home / ".config/cross-harness/config.toml"
+            config.parent.mkdir(parents=True)
+            contents = (repo / "config/default.toml").read_text(encoding="utf-8").replace(
+                '[roles.explorer]\nharness = "claude"\nmodel = "haiku"\neffort = "low"',
+                '[roles.explorer]\nharness = "codex"\nmodel = "custom-explorer"\neffort = "custom-effort"',
+            ).replace('model = "gpt-5.6-terra"\neffort = "high"', 'model = "updated-implementer"\neffort = "updated-effort"', 1)
+            config.write_text(contents, encoding="utf-8")
+            install(home, repo)
+            missing = home / ".codex/agents/cross-harness-explorer.toml"
+            missing.unlink()
+
+            warnings = synchronize_codex_agent_roles(user_paths(home), load_config(config, home))
+
+            self.assertTrue(any("explorer" in warning and "Missing Codex agent definition" in warning for warning in warnings))
+            implementer = (home / ".codex/agents/cross-harness-implementer.toml").read_text(encoding="utf-8")
+            self.assertIn('model = "updated-implementer"', implementer)
+            self.assertIn('model_reasoning_effort = "updated-effort"', implementer)
+
+    def test_codex_agent_role_sync_limits_managed_keys_to_before_table_header(self):
+        text = (
+            'name = "agent"\n'
+            'model = "before"\n'
+            'model_reasoning_effort = "before-effort"\n'
+            'sandbox_mode = "workspace-write"\n'
+            'developer_instructions = """\n'
+            'Keep this instruction.\n'
+            '"""\n'
+            '[metadata]\n'
+            'model = "after"\n'
+            'model_reasoning_effort = "after-effort"\n'
+        )
+        rendered = _render_codex_agent_role(text, {"model": "new", "effort": "new-effort"})
+        self.assertIn('model = "new"\nmodel_reasoning_effort = "new-effort"', rendered)
+        self.assertIn('[metadata]\nmodel = "after"\nmodel_reasoning_effort = "after-effort"', rendered)
+
+        removed = _remove_codex_agent_role_keys(text)
+        self.assertNotIn('model = "before"', removed)
+        self.assertNotIn('model_reasoning_effort = "before-effort"', removed)
+        self.assertIn('[metadata]\nmodel = "after"\nmodel_reasoning_effort = "after-effort"', removed)
+
+    def test_codex_agent_role_sync_does_not_update_indented_table_fields(self):
+        text = 'name = "a"\n  [metadata]\n  model = "inner"\n'
+
+        rendered = _render_codex_agent_role(text, {"model": "new", "effort": "new-effort"}, "implementer")
+
+        self.assertIn('model = "new"\nmodel_reasoning_effort = "new-effort"\n  [metadata]', rendered)
+        self.assertIn('  [metadata]\n  model = "inner"\n', rendered)
+        self.assertNotIn('  model_reasoning_effort = "new-effort"', rendered)
+
+    def test_claude_agent_role_sync_skips_missing_definition_and_continues(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            config = home / ".config/cross-harness/config.toml"
+            config.parent.mkdir(parents=True)
+            contents = (repo / "config/default.toml").read_text(encoding="utf-8").replace(
+                '[roles.explorer]\nharness = "claude"\nmodel = "haiku"\neffort = "low"',
+                '[roles.explorer]\nharness = "claude"\nmodel = "custom-explorer"\neffort = "custom-effort"',
+            ).replace(
+                '[roles.implementer]\nharness = "codex"\nmodel = "gpt-5.6-terra"\neffort = "high"',
+                '[roles.implementer]\nharness = "claude"\nmodel = "custom-implementer"\neffort = "custom-effort"',
+            )
+            config.write_text(contents, encoding="utf-8")
+            install(home, repo)
+            missing = home / ".claude/agents/cross-harness-explorer.md"
+            missing.unlink()
+
+            warnings = synchronize_claude_agent_roles(user_paths(home), load_config(config, home))
+
+            self.assertTrue(any("explorer" in warning and "Missing Claude agent definition" in warning for warning in warnings))
+            implementer = (home / ".claude/agents/cross-harness-implementer.md").read_text(encoding="utf-8")
+            self.assertIn("model: custom-implementer", implementer)
+            self.assertIn("effort: custom-effort", implementer)
+
+    def test_codex_agent_role_sync_ignores_table_like_lines_inside_multiline_strings(self):
+        text = (
+            'name = "a"\n'
+            'developer_instructions = """\n'
+            '[note] keep\n'
+            '"""\n'
+            'model = "old"\n'
+            'model_reasoning_effort = "old-effort"\n'
+        )
+        rendered = _render_codex_agent_role(text, {"model": "new", "effort": "new-effort"}, "implementer")
+        self.assertIn('model = "new"\nmodel_reasoning_effort = "new-effort"', rendered)
+        self.assertIn("[note] keep", rendered)
+
     def test_dry_run_does_not_touch_home(self):
         with tempfile.TemporaryDirectory() as folder:
             home = Path(folder) / "home"
@@ -369,8 +543,8 @@ class InstallerTests(unittest.TestCase):
             config.parent.mkdir(parents=True)
             contents = 'retention_days = 14\n[roles.tester]\ntimeout_seconds = 321\n'
             config.write_text(contents, encoding="utf-8")
-            # The partial config supplies two of 75 default leaf settings.
-            expected_defaulted_count = 73
+            # The partial config supplies two of 84 default leaf settings.
+            expected_defaulted_count = 82
             expected_default_action = "default: roles.tester.model"
 
             dry_run_actions = install(home, repo, dry_run=True)

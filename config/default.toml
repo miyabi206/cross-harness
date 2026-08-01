@@ -41,6 +41,10 @@ delegate_kinds = ["exploration", "implementation", "test", "debug", "review", "s
 #   codex roles   the next delegate
 #   claude roles  the next Claude session (the session-start hook syncs
 #                 ~/.claude/agents/cross-harness-*.md)
+#   Codex agent definitions under ~/.codex/agents/*.toml are also synchronized
+#                 when a Claude session starts.
+#   The implementer effort rendered into the orchestrator SKILL.md is fixed at
+#                 install time; changing it requires reinstalling to update it.
 #
 # orchestrator is the running session itself, so its model and effort describe
 # the parent session rather than a delegated agent.
@@ -74,6 +78,19 @@ delegate_kinds = ["exploration"]
 [roles.implementer]
 harness = "codex"
 model = "gpt-5.6-terra"
+effort = "high"
+max_parallel = 1
+retries = 2
+timeout_seconds = 3600
+write = true
+output_limit_chars = 8000
+delegate_kinds = ["implementation", "test"]
+
+[roles.implementer_complex]
+# implementer_complex takes the changes that cannot be split and the ones that
+# turn on judgment, so its default model must outrank the implementer default.
+harness = "codex"
+model = "gpt-5.6-sol"
 effort = "high"
 max_parallel = 1
 retries = 2

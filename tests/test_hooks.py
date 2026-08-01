@@ -1,5 +1,6 @@
 from contextlib import nullcontext
 from io import StringIO
+from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 import json
@@ -651,7 +652,37 @@ class HookTests(unittest.TestCase):
             explorer = (home / ".claude/agents/cross-harness-explorer.md").read_text()
             self.assertNotIn("model:", explorer)
             self.assertNotIn("effort:", explorer)
-            self.assertIn("harness is 'codex', not 'claude'", stdout.getvalue())
+            self.assertIn("roles 'explorer'", stdout.getvalue())
+            self.assertIn("harness is not 'claude'", stdout.getvalue())
+
+    def test_session_start_continues_codex_sync_when_claude_sync_fails(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder) / "home"
+            (home / ".claude/agents").mkdir(parents=True)
+            (home / ".codex/agents").mkdir(parents=True)
+            config = {
+                "runtime_root": str(Path(folder) / "runtime"),
+                "auth_cache_hours": 24,
+                "mode": "on",
+                "projects": {},
+            }
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch("cross_harness.hooks.load_config", return_value=config),
+                patch("cross_harness.hooks.self_update", return_value=SimpleNamespace(state="ok", warnings=[])),
+                patch("cross_harness.hooks.synchronize_claude_agent_roles", side_effect=RuntimeError("claude failed")),
+                patch("cross_harness.hooks.synchronize_codex_agent_roles", return_value=[]) as codex_sync,
+                patch("cross_harness.hooks.detected_api_keys", return_value=[]),
+                patch("cross_harness.hooks.subprocess.run", return_value=subprocess.CompletedProcess([], 0, '{"loggedIn": true}', "")),
+                patch("cross_harness.hooks.verify_codex_chatgpt"),
+                patch("cross_harness.hooks.cleanup"),
+                patch("sys.stdin", StringIO('{"cwd":"/tmp/project"}')),
+                patch("sys.stdout", new_callable=StringIO) as stdout,
+            ):
+                self.assertEqual(0, claude_session_start(home))
+
+            codex_sync.assert_called_once()
+            self.assertIn("Claude agent configuration sync warning: claude failed", stdout.getvalue())
 
 
 if __name__ == "__main__":

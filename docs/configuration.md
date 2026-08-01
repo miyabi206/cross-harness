@@ -45,14 +45,21 @@ globally or in a project override, where the project value takes precedence.
 
 Every role has `harness`, `model`, `effort`, `max_parallel`, `retries`,
 `timeout_seconds`, `write`, `output_limit_chars`, and `delegate_kinds`.
-The required roles are orchestrator, explorer, implementer, tester, reviewer,
-debugger, and security_reviewer.
+The required roles are orchestrator, explorer, implementer, implementer_complex,
+tester, reviewer, debugger, and security_reviewer. `implementer` handles changes
+that can be split into independently verifiable units, while
+`implementer_complex` handles unsplittable changes or changes involving
+judgment or policy.
 
 The checked-in defaults implement plan section 6. Codex uses the explicit
 model IDs `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`; Claude uses the
 personal aliases from the plan. Change these only in the personal file.
 The read-only `security_reviewer` may perform a `review` without high-risk
 confirmation; `security_review` still requires `--confirm-high-risk`.
+
+The effort expanded into the orchestrator `SKILL.md` is fixed only at install
+time. Changing the configuration alone leaves the installed value unchanged;
+run install again to render a new effort.
 
 ## Orchestrator direct-edit scope
 

@@ -12,6 +12,7 @@ REQUIRED_ROLES = {
     "orchestrator",
     "explorer",
     "implementer",
+    "implementer_complex",
     "tester",
     "reviewer",
     "debugger",

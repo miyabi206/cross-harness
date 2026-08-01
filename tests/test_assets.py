@@ -23,6 +23,7 @@ class AssetTests(unittest.TestCase):
         assets = source_root() / "assets/claude/agents"
         expected = {
             "implementer.md": (None, None, "Read, Glob, Grep, Bash, Edit, Write"),
+            "implementer_complex.md": (None, None, "Read, Glob, Grep, Bash, Edit, Write"),
             "tester.md": ("haiku", "medium", "Read, Glob, Grep, Bash"),
             "debugger.md": (None, None, "Read, Glob, Grep, Bash, Edit, Write"),
             "security_reviewer.md": (None, None, "Read, Glob, Grep, Bash"),
@@ -55,6 +56,7 @@ class AssetTests(unittest.TestCase):
         expected = {
             "explorer.toml": ("gpt-5.6-luna", "medium"),
             "implementer.toml": ("gpt-5.6-terra", "high"),
+            "implementer_complex.toml": ("gpt-5.6-sol", "high"),
             "tester.toml": ("gpt-5.6-luna", "medium"),
             "reviewer.toml": ("gpt-5.6-sol", "xhigh"),
             "debugger.toml": ("gpt-5.6-sol", "high"),
@@ -67,6 +69,22 @@ class AssetTests(unittest.TestCase):
             self.assertIn(f'model_reasoning_effort = "{effort}"', content)
             self.assertIn("launch Claude", content)
             self.assertIn("delegate", content)
+
+        implementer_description = re.search(
+            r'^description = "(.*)"$', (root / "implementer.toml").read_text(), re.MULTILINE
+        ).group(1)
+        complex_description = re.search(
+            r'^description = "(.*)"$', (root / "implementer_complex.toml").read_text(), re.MULTILINE
+        ).group(1)
+        self.assertNotEqual(implementer_description, complex_description)
+        claude_root = source_root() / "assets/claude/agents"
+        implementer_description = re.search(
+            r"^description: (.*)$", (claude_root / "implementer.md").read_text(), re.MULTILINE
+        ).group(1)
+        complex_description = re.search(
+            r"^description: (.*)$", (claude_root / "implementer_complex.md").read_text(), re.MULTILINE
+        ).group(1)
+        self.assertNotEqual(implementer_description, complex_description)
 
     def test_codex_agents_file_is_safe_for_interactive_sessions(self):
         content = (source_root() / "assets/codex/AGENTS.md").read_text()
@@ -82,6 +100,14 @@ class AssetTests(unittest.TestCase):
         for action in ("task create", "delegate", "retry"):
             self.assertIn(f"{{{{CROSS_HARNESS_BIN}}}} {action}", skill)
         self.assertIsNone(re.search(r"`cross-harness (?:task|delegate|retry)", skill))
+
+    def test_orchestrator_routes_complex_changes_and_templates_effort(self):
+        skill = (source_root() / "assets/claude/skills/cross-harness-orchestrator/SKILL.md").read_text()
+        normalized_skill = " ".join(skill.split())
+        self.assertIn("{{IMPLEMENTER_EFFORT}}", skill)
+        self.assertIn("implementer_complex", skill)
+        self.assertIn("cannot be verified independently", normalized_skill)
+        self.assertIn("turns on judgment or policy", normalized_skill)
 
 
 if __name__ == "__main__":

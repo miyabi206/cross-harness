@@ -30,6 +30,11 @@ task.
 - Small code changes: inspect directly, write one task file, delegate once,
   then verify. Do not start explorer or reviewer agents.
 - Medium changes: one bounded exploration, plan, implement, test, review.
+  The implementer role runs at effort {{IMPLEMENTER_EFFORT}}. Split a Medium
+  change into independently verifiable units before delegating when that
+  effort is medium or lower. Delegate a Medium or Large change whole to
+  implementer_complex, without splitting, when its units cannot be verified
+  independently or when it turns on judgment or policy.
 - Large changes: split into independently verifiable units and run them
   sequentially by default.
 - Independent read-only investigation, verification, and review roles are
@@ -93,8 +98,10 @@ Then invoke only:
 {{CROSS_HARNESS_BIN}} delegate --role <role> --kind <kind> --task-file <path> --cwd <repo>
 ```
 
-Use implementer for code, tester for checks, debugger for complex failures,
-and security_reviewer only after explicit human confirmation. Never shorten the
+Use implementer for code, implementer_complex for a change that cannot be split
+into independently verifiable units or that turns on judgment or policy, tester
+for checks, debugger for complex failures, and security_reviewer only after
+explicit human confirmation. Never shorten the
 absolute wrapper path to a bare `cross-harness` command.
 
 Invoke `delegate` only in a foreground Bash call; never use `run_in_background`.

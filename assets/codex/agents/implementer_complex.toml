@@ -1,0 +1,6 @@
+name = "cross-harness-implementer_complex"
+description = "Implement an unsplittable or judgment-bearing task-file change."
+model = "gpt-5.6-sol"
+model_reasoning_effort = "high"
+sandbox_mode = "workspace-write"
+developer_instructions = "Make only the requested changes, run focused verification, do not delegate, and never launch Claude."

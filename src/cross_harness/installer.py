@@ -108,16 +108,27 @@ def _write_text(
     records.append(record)
 
 
-def _template(text: str, executable: Path, context_threshold_percent: int, max_parallel: int) -> str:
+def _template(
+    text: str,
+    executable: Path,
+    context_threshold_percent: int,
+    max_parallel: int,
+    implementer_effort: str,
+) -> str:
     return (
         text.replace("{{CROSS_HARNESS_BIN}}", str(executable))
         .replace("{{CONTEXT_THRESHOLD_PERCENT}}", str(context_threshold_percent))
         .replace("{{MAX_PARALLEL}}", str(max_parallel))
+        .replace("{{IMPLEMENTER_EFFORT}}", implementer_effort)
     )
 
 
 def _materialize_templates(
-    path: Path, executable: Path, context_threshold_percent: int, max_parallel: int
+    path: Path,
+    executable: Path,
+    context_threshold_percent: int,
+    max_parallel: int,
+    implementer_effort: str,
 ) -> None:
     candidates = [path] if path.is_file() else [item for item in path.rglob("*") if item.is_file()]
     for candidate in candidates:
@@ -125,7 +136,7 @@ def _materialize_templates(
             text = candidate.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
-        rendered = _template(text, executable, context_threshold_percent, max_parallel)
+        rendered = _template(text, executable, context_threshold_percent, max_parallel, implementer_effort)
         if rendered != text:
             atomic_write(candidate, rendered, candidate.stat().st_mode & 0o777)
 
@@ -133,10 +144,21 @@ def _materialize_templates(
 CLAUDE_AGENT_ROLES = {
     "cross-harness-explorer.md": "explorer",
     "cross-harness-implementer.md": "implementer",
+    "cross-harness-implementer_complex.md": "implementer_complex",
     "cross-harness-tester.md": "tester",
     "cross-harness-reviewer.md": "reviewer",
     "cross-harness-debugger.md": "debugger",
     "cross-harness-security_reviewer.md": "security_reviewer",
+}
+
+CODEX_AGENT_ROLES = {
+    "cross-harness-explorer.toml": "explorer",
+    "cross-harness-implementer.toml": "implementer",
+    "cross-harness-implementer_complex.toml": "implementer_complex",
+    "cross-harness-tester.toml": "tester",
+    "cross-harness-reviewer.toml": "reviewer",
+    "cross-harness-debugger.toml": "debugger",
+    "cross-harness-security_reviewer.toml": "security_reviewer",
 }
 
 
@@ -147,7 +169,7 @@ def _frontmatter_scalar(value: str) -> str:
     return json.dumps(value)
 
 
-def _render_claude_agent_role(text: str, role: dict) -> str:
+def _render_claude_agent_role(text: str, role: dict, role_name: str = "unknown") -> str:
     if not text.startswith("---\n"):
         raise HarnessError("Claude agent template is missing YAML frontmatter")
     closing = text.find("\n---\n", 4)
@@ -157,7 +179,7 @@ def _render_claude_agent_role(text: str, role: dict) -> str:
     for key in ("model", "effort"):
         value = role.get(key)
         if not isinstance(value, str) or not value:
-            raise HarnessError(f"Claude agent role has invalid {key}")
+            raise HarnessError(f"Claude agent role {role_name!r} has invalid {key}")
         rendered, count = re.subn(
             rf"(?m)^{key}:.*$",
             f"{key}: {_frontmatter_scalar(value)}",
@@ -184,25 +206,139 @@ def synchronize_claude_agent_roles(paths: UserPaths, config: dict) -> list[str]:
     if not isinstance(roles, dict):
         raise HarnessError("configuration roles are unavailable for Claude agent synchronization")
     warnings: list[str] = []
+    skipped: list[str] = []
     for filename, role_name in CLAUDE_AGENT_ROLES.items():
         role = roles.get(role_name)
         if not isinstance(role, dict):
             raise HarnessError(f"configuration role {role_name!r} is unavailable for Claude agent synchronization")
         harness = role.get("harness")
         path = paths.claude / "agents" / filename
-        text = path.read_text(encoding="utf-8")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            warnings.append(f"Missing Claude agent definition for role {role_name!r}: {path}")
+            continue
         if harness != "claude":
             rendered = _remove_claude_agent_role_keys(text)
             if rendered != text:
                 atomic_write(path, rendered, path.stat().st_mode & 0o777)
-            warnings.append(
-                f"Skipped Claude agent synchronization for role {role_name!r}: "
-                f"harness is {harness!r}, not 'claude'"
-            )
+            skipped.append(role_name)
             continue
-        rendered = _render_claude_agent_role(text, role)
+        rendered = _render_claude_agent_role(text, role, role_name)
         if rendered != text:
             atomic_write(path, rendered, path.stat().st_mode & 0o777)
+    if skipped:
+        warnings.append(
+            f"Skipped Claude agent synchronization for roles {', '.join(repr(role) for role in skipped)}: "
+            "harness is not 'claude'"
+        )
+    return warnings
+
+
+def _codex_agent_header_offset(text: str) -> int:
+    """Return the start of the first TOML table, or the end of the file."""
+    offset = 0
+    multiline: str | None = None
+    for line in text.splitlines(keepends=True):
+        if multiline is None and line.lstrip().startswith("["):
+            return offset
+        position = 0
+        while position < len(line):
+            if multiline is not None:
+                closing = line.find(multiline, position)
+                if closing < 0:
+                    break
+                if multiline == '"""':
+                    backslashes = 0
+                    index = closing - 1
+                    while index >= 0 and line[index] == "\\":
+                        backslashes += 1
+                        index -= 1
+                    if backslashes % 2:
+                        position = closing + len(multiline)
+                        continue
+                position = closing + len(multiline)
+                multiline = None
+                continue
+            basic = line.find('"""', position)
+            literal = line.find("'''", position)
+            candidates = [candidate for candidate in (basic, literal) if candidate >= 0]
+            if not candidates:
+                break
+            opening = min(candidates)
+            multiline = '"""' if opening == basic else "'''"
+            position = opening + 3
+        offset += len(line)
+    if multiline is not None:
+        raise HarnessError("Codex agent template has unterminated multiline string")
+    return len(text)
+
+
+def _codex_agent_role_prefix(text: str) -> tuple[str, str]:
+    offset = _codex_agent_header_offset(text)
+    return text[:offset], text[offset:]
+
+
+def _render_codex_agent_role(text: str, role: dict, role_name: str = "unknown") -> str:
+    prefix, suffix = _codex_agent_role_prefix(text)
+    for key, config_key in (("model", "model"), ("model_reasoning_effort", "effort")):
+        value = role.get(config_key)
+        if not isinstance(value, str) or not value:
+            raise HarnessError(f"Codex agent role {role_name!r} has invalid {config_key}")
+        rendered, count = re.subn(
+            rf"(?m)^{key}\s*=.*$",
+            f"{key} = {json.dumps(value)}",
+            prefix,
+        )
+        if count > 1:
+            raise HarnessError(f"Codex agent template has duplicate {key} keys")
+        if count:
+            prefix = rendered
+        else:
+            base = prefix.rstrip("\n")
+            separator = "\n" if base else ""
+            prefix = base + separator + f"{key} = {json.dumps(value)}\n"
+    return prefix + suffix
+
+
+def _remove_codex_agent_role_keys(text: str) -> str:
+    """Remove managed role keys from a Codex agent TOML file."""
+    prefix, suffix = _codex_agent_role_prefix(text)
+    return re.sub(r"(?m)^(?:model|model_reasoning_effort)\s*=.*\n?", "", prefix) + suffix
+
+
+def synchronize_codex_agent_roles(paths: UserPaths, config: dict) -> list[str]:
+    """Apply Codex role settings to installed agents and return skipped-role warnings."""
+    roles = config.get("roles")
+    if not isinstance(roles, dict):
+        raise HarnessError("configuration roles are unavailable for Codex agent synchronization")
+    warnings: list[str] = []
+    skipped: list[str] = []
+    for filename, role_name in CODEX_AGENT_ROLES.items():
+        role = roles.get(role_name)
+        if not isinstance(role, dict):
+            raise HarnessError(f"configuration role {role_name!r} is unavailable for Codex agent synchronization")
+        harness = role.get("harness")
+        path = paths.codex / "agents" / filename
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            warnings.append(f"Missing Codex agent definition for role {role_name!r}: {path}")
+            continue
+        if harness != "codex":
+            rendered = _remove_codex_agent_role_keys(text)
+            if rendered != text:
+                atomic_write(path, rendered, path.stat().st_mode & 0o777)
+            skipped.append(role_name)
+            continue
+        rendered = _render_codex_agent_role(text, role, role_name)
+        if rendered != text:
+            atomic_write(path, rendered, path.stat().st_mode & 0o777)
+    if skipped:
+        warnings.append(
+            f"Skipped Codex agent synchronization for roles {', '.join(repr(role) for role in skipped)}: "
+            "harness is not 'codex'"
+        )
     return warnings
 
 
@@ -215,10 +351,13 @@ def _merge_markdown(
     executable: Path,
     context_threshold_percent: int,
     max_parallel: int,
+    implementer_effort: str,
 ) -> None:
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
     content = "\n\n".join(
-        _template(source.read_text(encoding="utf-8"), executable, context_threshold_percent, max_parallel).rstrip()
+        _template(
+            source.read_text(encoding="utf-8"), executable, context_threshold_percent, max_parallel, implementer_effort
+        ).rstrip()
         for source in sources
     )
     _write_text(path, append_marker(existing, content), paths, backup, records, management="marker")
@@ -521,10 +660,12 @@ def _install(
     _merge_markdown(
         paths.claude / "CLAUDE.md", [repo / "assets/claude/CLAUDE.md", shared], paths,
         backup_root, records, paths.executable, config["context_threshold_percent"], config["max_parallel"],
+        config["roles"]["implementer"]["effort"],
     )
     _merge_markdown(
         paths.codex / "AGENTS.md", [repo / "assets/codex/AGENTS.md", shared], paths,
         backup_root, records, paths.executable, config["context_threshold_percent"], config["max_parallel"],
+        config["roles"]["implementer"]["effort"],
     )
 
     settings = paths.claude / "settings.json"
@@ -544,6 +685,7 @@ def _install(
         (repo / "assets/claude/skills/cross-harness-orchestrator", paths.claude / "skills/cross-harness-orchestrator"),
         (repo / "assets/claude/agents/explorer.md", paths.claude / "agents/cross-harness-explorer.md"),
         (repo / "assets/claude/agents/implementer.md", paths.claude / "agents/cross-harness-implementer.md"),
+        (repo / "assets/claude/agents/implementer_complex.md", paths.claude / "agents/cross-harness-implementer_complex.md"),
         (repo / "assets/claude/agents/tester.md", paths.claude / "agents/cross-harness-tester.md"),
         (repo / "assets/claude/agents/reviewer.md", paths.claude / "agents/cross-harness-reviewer.md"),
         (repo / "assets/claude/agents/debugger.md", paths.claude / "agents/cross-harness-debugger.md"),
@@ -560,7 +702,13 @@ def _install(
         else:
             shutil.copy2(source, destination)
             _finish_record(record, destination)
-        _materialize_templates(destination, paths.executable, config["context_threshold_percent"], config["max_parallel"])
+        _materialize_templates(
+            destination,
+            paths.executable,
+            config["context_threshold_percent"],
+            config["max_parallel"],
+            config["roles"]["implementer"]["effort"],
+        )
         _finish_record(record, destination)
         records.append(record)
     synchronize_claude_agent_roles(paths, config)
@@ -579,6 +727,14 @@ def _install(
         shutil.copy2(source, destination)
         _finish_record(record, destination)
         records.append(record)
+    synchronize_codex_agent_roles(paths, config)
+    codex_agent_paths = {
+        str(paths.codex / "agents" / filename)
+        for filename in CODEX_AGENT_ROLES
+    }
+    for record in records:
+        if record["path"] in codex_agent_paths:
+            _finish_record(record, Path(record["path"]))
 
     if git_hooks is not None:
         for source in sorted((repo / "assets/git").glob("*")):

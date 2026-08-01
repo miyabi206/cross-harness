@@ -33,13 +33,14 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "orchestrator", "explorer", "implementer", "tester",
+        "orchestrator", "explorer", "implementer", "implementer_complex", "tester",
         "reviewer", "debugger", "security_reviewer"
       ],
       "properties": {
         "orchestrator": {"$ref": "#/$defs/role"},
         "explorer": {"$ref": "#/$defs/role"},
         "implementer": {"$ref": "#/$defs/role"},
+        "implementer_complex": {"$ref": "#/$defs/role"},
         "tester": {"$ref": "#/$defs/role"},
         "reviewer": {"$ref": "#/$defs/role"},
         "debugger": {"$ref": "#/$defs/role"},
