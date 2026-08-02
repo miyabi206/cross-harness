@@ -118,6 +118,66 @@ folder. Remove it with `cross-harness project remove --cwd /path/to/repository`.
 Use `--dry-run` with either command to inspect the planned change without
 writing files.
 
+## Apply to another project
+
+Installation is user-scoped rather than repository-scoped, so one install
+covers all repositories and nothing is added to the target repository. Apply
+it to another project by pointing these two delegation commands at it:
+
+```sh
+~/.local/bin/cross-harness task create \
+  --role implementer \
+  --kind implementation \
+  --cwd /path/to/repository \
+  --goal "Implement the requested change" \
+  --done-when "The requested change is complete" \
+  --check "scripts/test.sh"
+~/.local/bin/cross-harness delegate \
+  --role implementer \
+  --kind implementation \
+  --task-file /absolute/path/to/task.md \
+  --cwd /path/to/repository
+```
+
+Pass the absolute path printed by `task create` unchanged as `--task-file`,
+provide checks as executable command lines; `delegate` resolves
+the Git root from `--cwd` and stops when the target is not a Git repository.
+
+The default `dirty_worktree_policy = "allow_delegated"` blocks a write role
+when uncommitted changes were not recorded by a previous write delegation,
+which is the most common first-delegation snag in an existing project. To
+isolate it, add this project override to
+`~/.config/cross-harness/config.toml`:
+
+```toml
+[projects."/path/to/repository"]
+dirty_worktree_policy = "isolate"
+```
+
+`isolate` runs the write role in a separate worktree; import its results
+afterward:
+
+```sh
+~/.local/bin/cross-harness adopt --run <run_dir>
+```
+
+Project overrides accept only `checks`, `delegate_kinds`,
+`dirty_worktree_policy`, and `mode`; the most specific matching path wins,
+`mode = "off"` excludes that repository from enforcement, and models,
+authentication, and sandbox settings cannot be overridden.
+
+Optional checks and setup:
+
+```sh
+cross-harness doctor
+cross-harness validate --config ~/.config/cross-harness/config.toml
+cross-harness project setup --cwd /path/to/repository
+```
+
+Use `doctor` for an initial health check and `validate` only after editing
+configuration. `project setup` writes only to the target's `.vscode/tasks.json`;
+it is the optional VS Code watcher described above in Watch delegated runs.
+
 ## Change role settings
 
 Edit `~/.config/cross-harness/config.toml`. The repository's
