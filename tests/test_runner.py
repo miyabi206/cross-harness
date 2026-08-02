@@ -250,6 +250,186 @@ class RunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(HarnessError, "timed out waiting for lock"):
                 runner._acquire_delegated_changes_lock(runtime_root)
 
+    def test_live_supervisor_counts_toward_global_parallel_limit(self):
+        config = default_config()
+        runtime_root = self.root / "runtime"
+        config["runtime_root"] = str(runtime_root)
+        config["max_parallel"] = 1
+        run_dir = runtime_root / "runs" / "live"
+        run_dir.mkdir(parents=True)
+        runner._write_execution_record(run_dir, "tester", config["roles"]["tester"], "test", self.repo, "claude")
+        (run_dir / "supervisor.pid").write_text("123\n")
+        with patch.object(runner, "_supervisor_alive", return_value=True):
+            mutex = runner._acquire_parallel_mutex(runtime_root)
+            try:
+                error = runner._parallel_limit_error(config, runtime_root, "reviewer")
+            finally:
+                runner._release_lock(mutex)
+        self.assertIn("global max_parallel limit 1", error)
+        self.assertIn("'reviewer'", error)
+
+    def test_exited_supervisor_no_longer_counts_toward_parallel_limit(self):
+        config = default_config()
+        runtime_root = self.root / "runtime"
+        config["runtime_root"] = str(runtime_root)
+        config["max_parallel"] = 1
+        run_dir = runtime_root / "runs" / "dead"
+        run_dir.mkdir(parents=True)
+        runner._write_execution_record(run_dir, "tester", config["roles"]["tester"], "test", self.repo, "claude")
+        (run_dir / "supervisor.pid").write_text("123\n")
+        with patch.object(runner, "_supervisor_alive", return_value=False):
+            mutex = runner._acquire_parallel_mutex(runtime_root)
+            try:
+                error = runner._parallel_limit_error(config, runtime_root, "reviewer")
+            finally:
+                runner._release_lock(mutex)
+        self.assertIsNone(error)
+
+    def test_role_parallel_limit_counts_only_the_same_role(self):
+        config = default_config()
+        runtime_root = self.root / "runtime"
+        config["runtime_root"] = str(runtime_root)
+        config["max_parallel"] = 3
+        config["roles"]["tester"]["max_parallel"] = 1
+        run_dir = runtime_root / "runs" / "tester"
+        run_dir.mkdir(parents=True)
+        runner._write_execution_record(run_dir, "tester", config["roles"]["tester"], "test", self.repo, "claude")
+        (run_dir / "supervisor.pid").write_text("123\n")
+        with patch.object(runner, "_supervisor_alive", return_value=True):
+            mutex = runner._acquire_parallel_mutex(runtime_root)
+            try:
+                tester_error = runner._parallel_limit_error(config, runtime_root, "tester")
+                reviewer_error = runner._parallel_limit_error(config, runtime_root, "reviewer")
+            finally:
+                runner._release_lock(mutex)
+        self.assertIn("role 'tester' max_parallel limit 1", tester_error)
+        self.assertIsNone(reviewer_error)
+
+    def test_foreground_process_exit_does_not_release_live_supervisor_capacity(self):
+        config = default_config()
+        runtime_root = self.root / "runtime"
+        config["runtime_root"] = str(runtime_root)
+        config["max_parallel"] = 1
+        run_dir = runtime_root / "runs" / "interrupted-foreground"
+        run_dir.mkdir(parents=True)
+        runner._write_execution_record(run_dir, "tester", config["roles"]["tester"], "test", self.repo, "claude")
+        (run_dir / "supervisor.pid").write_text("123\n")
+        (run_dir / "executor.pid").write_text("999\n")  # The foreground executor may be gone.
+        with patch.object(runner, "_supervisor_alive", return_value=True):
+            mutex = runner._acquire_parallel_mutex(runtime_root)
+            try:
+                error = runner._parallel_limit_error(config, runtime_root, "reviewer")
+            finally:
+                runner._release_lock(mutex)
+        self.assertIn("global max_parallel limit 1", error)
+
+    def test_live_run_without_execution_record_counts_toward_its_role_limit(self):
+        config = default_config()
+        runtime_root = self.root / "runtime"
+        config["runtime_root"] = str(runtime_root)
+        config["max_parallel"] = 2
+        config["roles"]["tester"]["max_parallel"] = 1
+        run_dir = runtime_root / "runs" / "reserved"
+        run_dir.mkdir(parents=True)
+        (run_dir / "role").write_text("tester\n")
+        (run_dir / "supervisor.pid").write_text("123\n")
+        with patch.object(runner, "_supervisor_alive", return_value=True):
+            error = runner._parallel_limit_error(config, runtime_root, "tester")
+        self.assertIn("role 'tester' max_parallel limit 1", error)
+
+    def test_live_run_with_empty_recorded_role_counts_toward_target_role_limit(self):
+        config = default_config()
+        runtime_root = self.root / "runtime"
+        config["runtime_root"] = str(runtime_root)
+        config["max_parallel"] = 2
+        config["roles"]["tester"]["max_parallel"] = 1
+        run_dir = runtime_root / "runs" / "unknown-empty"
+        run_dir.mkdir(parents=True)
+        (run_dir / "role").write_text("\n")
+        (run_dir / "execution.json").write_text(json.dumps({"role_name": ""}))
+        (run_dir / "supervisor.pid").write_text("123\n")
+        with patch.object(runner, "_supervisor_alive", return_value=True):
+            error = runner._parallel_limit_error(config, runtime_root, "tester")
+        self.assertIn("role 'tester' max_parallel limit 1", error)
+
+    def test_live_run_with_unknown_recorded_role_counts_toward_target_role_limit(self):
+        config = default_config()
+        runtime_root = self.root / "runtime"
+        config["runtime_root"] = str(runtime_root)
+        config["max_parallel"] = 2
+        config["roles"]["tester"]["max_parallel"] = 1
+        run_dir = runtime_root / "runs" / "unknown-role"
+        run_dir.mkdir(parents=True)
+        (run_dir / "role").write_text("unconfigured\n")
+        (run_dir / "supervisor.pid").write_text("123\n")
+        with patch.object(runner, "_supervisor_alive", return_value=True):
+            error = runner._parallel_limit_error(config, runtime_root, "tester")
+        self.assertIn("role 'tester' max_parallel limit 1", error)
+
+    def test_orphaned_live_run_does_not_consume_parallel_capacity(self):
+        config = default_config()
+        runtime_root = self.root / "runtime"
+        config["runtime_root"] = str(runtime_root)
+        config["max_parallel"] = 1
+        run_dir = runtime_root / "runs" / "orphaned"
+        run_dir.mkdir(parents=True)
+        (run_dir / "role").write_text("tester\n")
+        (run_dir / "supervisor.pid").write_text("123\n")
+        (run_dir / "ORPHANED").write_text("marked\n")
+        with patch.object(runner, "_supervisor_alive", return_value=True):
+            self.assertIsNone(runner._parallel_limit_error(config, runtime_root, "reviewer"))
+
+    @patch("cross_harness.runner.verify_codex_chatgpt")
+    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_synchronous_delegate_blocks_at_parallel_limit(self, invoke, ownership, verify):
+        config = default_config()
+        runtime_root = self.home / ".local/state/cross-harness"
+        config["runtime_root"] = str(runtime_root)
+        config["max_parallel"] = 1
+        config["roles"]["tester"]["harness"] = "codex"
+        live = runtime_root / "runs" / "live"
+        live.mkdir(parents=True)
+        (live / "role").write_text("tester\n")
+        (live / "supervisor.pid").write_text("123\n")
+        verify.return_value = (Path("/usr/bin/true"), False)
+        with patch.object(runner, "load_config", return_value=config), patch.object(
+            runner, "_supervisor_alive", return_value=True
+        ):
+            summary = delegate("tester", "test", self.task, self.repo, home=self.home)
+        self.assertEqual("blocked", summary["status"])
+        self.assertIn("global max_parallel limit 1", summary["error"])
+        invoke.assert_not_called()
+
+    @patch("cross_harness.runner.verify_codex_chatgpt")
+    @patch("cross_harness.runner.verify_codex_config_ownership")
+    @patch("cross_harness.runner._invoke_safe")
+    def test_retry_blocks_at_parallel_limit(self, invoke, ownership, verify):
+        config = default_config()
+        runtime_root = self.home / ".local/state/cross-harness"
+        config["runtime_root"] = str(runtime_root)
+        config["max_parallel"] = 1
+        config["roles"]["tester"]["harness"] = "codex"
+        previous = self.root / "retry-limit"
+        previous.mkdir()
+        (previous / "state.json").write_text(json.dumps({
+            "role": "tester", "kind": "test", "cwd": str(self.repo),
+            "thread_id": None, "attempts": 0, "signatures": [], "escalated": False,
+            "status": "failed", "model": "haiku", "effort": "medium",
+        }))
+        live = runtime_root / "runs" / "live"
+        live.mkdir(parents=True)
+        (live / "role").write_text("tester\n")
+        (live / "supervisor.pid").write_text("123\n")
+        verify.return_value = (Path("/usr/bin/true"), False)
+        with patch.object(runner, "load_config", return_value=config), patch.object(
+            runner, "_supervisor_alive", return_value=True
+        ):
+            summary = retry(previous, self.task, home=self.home)
+        self.assertEqual("blocked", summary["status"])
+        self.assertIn("global max_parallel limit 1", summary["error"])
+        invoke.assert_not_called()
+
     @patch("cross_harness.runner.verify_codex_chatgpt")
     @patch("cross_harness.runner.verify_codex_config_ownership")
     @patch("cross_harness.runner._invoke_safe")

@@ -94,6 +94,18 @@ class CliWaitTests(unittest.TestCase):
                 self.assertEqual(2, main(["adopt", "--run", str(run)]))
             self.assertIn("adopt conflict(s)", error.getvalue())
 
+    def test_supervisor_requires_run_dir(self):
+        error = StringIO()
+        with redirect_stderr(error):
+            self.assertEqual(
+                2,
+                main([
+                    "delegate", "--role", "tester", "--kind", "test",
+                    "--task-file", "/missing/task.md", "--cwd", ".", "--supervisor",
+                ]),
+            )
+        self.assertIn("--supervisor requires --run-dir", error.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

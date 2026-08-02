@@ -138,6 +138,9 @@ including `model`, `effort`, `retries`, `timeout_seconds`, `write`, and
 `delegate_kinds`. Files under `~/.codex/agents/` are not read by `delegate`;
 they are display-only definitions synchronized during install and when a
 Claude session starts.
+`max_parallel` is enforced at runtime: a delegation that would exceed the
+global limit, or its non-orchestrator role's own limit, is immediately recorded
+as blocked rather than queued.
 Claude role changes require a new Claude session,
 because its session-start hook synchronizes
 `~/.claude/agents/cross-harness-*.md`. `orchestrator` is the session itself,

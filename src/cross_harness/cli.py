@@ -176,6 +176,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.check and not args.from_hook and result.state == "drift":
                 return 1
         elif args.command == "delegate":
+            if args.supervisor and args.run_dir is None:
+                raise HarnessError("--supervisor requires --run-dir")
             if args.supervisor or args.no_detach:
                 summary = delegate(
                     args.role,
@@ -186,6 +188,7 @@ def main(argv: list[str] | None = None) -> int:
                     home,
                     args.confirm_high_risk,
                     args.run_dir.resolve() if args.run_dir else None,
+                    args.supervisor,
                 )
                 print((Path(summary["run_dir"]) / "summary.txt").read_text(encoding="utf-8"), end="")
                 return 0 if summary["status"] == "success" else 1

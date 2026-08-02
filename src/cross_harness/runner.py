@@ -90,6 +90,7 @@ _DETACHED_SUPERVISORS: dict[int, subprocess.Popen] = {}
 _HELD_ROOT_LOCKS: dict[Path, int] = {}
 _DELEGATED_CHANGES_LOCK_TIMEOUT_SECONDS = 5.0
 _LOCK_POLL_INTERVAL_SECONDS = 0.01
+_ROLE_MARKER = "role"
 
 
 def _filtered_executor_stderr(stderr: str) -> str:
@@ -138,6 +139,103 @@ def _root_lock_path(runtime_root: Path, root: Path) -> Path:
 
 def _delegated_changes_lock_path(runtime_root: Path) -> Path:
     return runtime_root / "locks" / "delegated-changes.lock"
+
+
+def _parallel_mutex_path(runtime_root: Path) -> Path:
+    """Return the single mutex for checking and reserving delegation capacity."""
+    return runtime_root / "locks" / "parallel.lock"
+
+
+def _acquire_parallel_mutex(runtime_root: Path) -> int:
+    lock_path = _parallel_mutex_path(runtime_root)
+    deadline = time.monotonic() + _DELEGATED_CHANGES_LOCK_TIMEOUT_SECONDS
+    while True:
+        descriptor = _try_lock(lock_path)
+        if descriptor is not None:
+            return descriptor
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise HarnessError(f"timed out waiting for lock: {lock_path}")
+        time.sleep(min(_LOCK_POLL_INTERVAL_SECONDS, remaining))
+
+
+def _run_role(run_dir: Path, roles: dict) -> str | None:
+    """Return the configured role recorded by a live run, or None if unknown."""
+    try:
+        role_name = (run_dir / _ROLE_MARKER).read_text(encoding="utf-8").strip()
+    except OSError:
+        role_name = ""
+    if not role_name:
+        try:
+            execution = json.loads((run_dir / "execution.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        role_name = execution.get("role_name")
+    return role_name if isinstance(role_name, str) and role_name in roles else None
+
+
+def _is_terminal_run(run_dir: Path) -> bool:
+    return any((run_dir / name).exists() for name in ("summary.json", "BLOCKED", "INTERRUPTED"))
+
+
+def _active_delegation_roles(runtime_root: Path, retention_days: int, roles: dict) -> list[str | None]:
+    """Return roles for live, non-terminal runs still within their retention period."""
+    runs = runtime_root / "runs"
+    if not runs.is_dir():
+        return []
+    cutoff = time.time() - retention_days * 24 * 60 * 60
+    active_roles: list[str | None] = []
+    for run_dir in runs.iterdir():
+        if not run_dir.is_dir() or (run_dir / "ORPHANED").exists() or _is_terminal_run(run_dir):
+            continue
+        try:
+            if run_dir.stat().st_mtime < cutoff:
+                continue
+        except OSError:
+            continue
+        if _supervisor_alive(run_dir):
+            active_roles.append(_run_role(run_dir, roles))
+    return active_roles
+
+
+def _parallel_limit_error(config: dict, runtime_root: Path, role_name: str) -> str | None:
+    """Check capacity while the caller holds the parallel mutex."""
+    active_roles = _active_delegation_roles(runtime_root, config["retention_days"], config["roles"])
+    global_limit = config["max_parallel"]
+    if len(active_roles) >= global_limit:
+        return f"delegation blocked: global max_parallel limit {global_limit} reached for role {role_name!r}"
+    if role_name == "orchestrator":
+        return None
+    role_limit = config["roles"][role_name]["max_parallel"]
+    if sum(active_role == role_name or active_role is None for active_role in active_roles) >= role_limit:
+        return f"delegation blocked: role {role_name!r} max_parallel limit {role_limit} reached"
+    return None
+
+
+def _reserve_parallel_capacity(
+    config: dict, runtime_root: Path, run_dir: Path, role_name: str, record_supervisor
+) -> str | None:
+    """Atomically check capacity and make a run visible to concurrent starters."""
+    mutex = _acquire_parallel_mutex(runtime_root)
+    try:
+        error = _parallel_limit_error(config, runtime_root, role_name)
+        if error is not None:
+            return error
+        # The role marker must be written before the supervisor PID, so a live
+        # reservation is never counted without a role when execution.json is absent.
+        atomic_write(run_dir / _ROLE_MARKER, role_name + "\n")
+        record_supervisor()
+        return None
+    finally:
+        _release_lock(mutex)
+
+
+def _release_parallel_reservation(run_dir: Path) -> None:
+    """Release a synchronous reservation when execution cannot remain live."""
+    try:
+        (run_dir / "supervisor.pid").unlink()
+    except FileNotFoundError:
+        pass
 
 
 def _try_lock(lock_path: Path) -> int | None:
@@ -1498,6 +1596,7 @@ def delegate(
     home: Path | None = None,
     confirm_high_risk: bool = False,
     run_dir: Path | None = None,
+    supervisor_reserved: bool = False,
 ) -> dict:
     if os.environ.get("CROSS_HARNESS_ACTIVE") == "1":
         raise HarnessError("nested cross-harness delegation from an active executor is blocked")
@@ -1588,25 +1687,48 @@ def delegate(
             "cwd": str(execution_root),
             "sandbox_exec": sandbox_exec,
         }))
-        exit_code = _invoke_safe(
-            command,
-            _executor_task(task, role["harness"]),
-            environment,
-            execution_root,
-            run_dir,
-            role["timeout_seconds"],
+        if supervisor_reserved:
+            return _run_delegate_executor(
+                command, task, environment, execution_root, run_dir, role_name, role, kind,
+                runtime_root, effective_policy, defaulted_settings,
+            )
+        parallel_error = _reserve_parallel_capacity(
+            config, runtime_root, run_dir, role_name,
+            lambda: atomic_write(run_dir / "supervisor.pid", f"{os.getpid()}\n"),
         )
-        if role["harness"] == "claude":
-            _write_claude_final_from_events(run_dir)
-        return finalize_run(
-            run_dir, role_name, role, kind, execution_root, exit_code, attempt=1,
-            runtime_root=runtime_root,
-            dirty_worktree_policy=effective_policy,
-            defaulted_settings=defaulted_settings,
-        )
+        if parallel_error is not None:
+            return finalize_blocked_run(
+                run_dir, role_name, role, kind, execution_root, parallel_error, "parallel_limit",
+                defaulted_settings=defaulted_settings,
+            )
+        try:
+            return _run_delegate_executor(
+                command, task, environment, execution_root, run_dir, role_name, role, kind,
+                runtime_root, effective_policy, defaulted_settings,
+            )
+        finally:
+            _release_parallel_reservation(run_dir)
     finally:
         if not held_before and lock_path in _HELD_ROOT_LOCKS:
             _release_root_lock(runtime_root, root)
+
+
+def _run_delegate_executor(
+    command: list[str], task: str, environment: dict[str, str], execution_root: Path, run_dir: Path,
+    role_name: str, role: dict, kind: str, runtime_root: Path, effective_policy: str,
+    defaulted_settings: list[str],
+) -> dict:
+    exit_code = _invoke_safe(
+        command, _executor_task(task, role["harness"]), environment, execution_root, run_dir,
+        role["timeout_seconds"],
+    )
+    if role["harness"] == "claude":
+        _write_claude_final_from_events(run_dir)
+    return finalize_run(
+        run_dir, role_name, role, kind, execution_root, exit_code, attempt=1,
+        runtime_root=runtime_root, dirty_worktree_policy=effective_policy,
+        defaulted_settings=defaulted_settings,
+    )
 
 
 def start_detached_delegate(
@@ -1668,22 +1790,49 @@ def start_detached_delegate(
     environment["PYTHONPATH"] = os.pathsep.join(
         path for path in (package_root, existing_python_path) if path
     )
-    with (
-        (run_dir / "supervisor.stdin").open("w+b") as stdin,
-        (run_dir / "supervisor.stdout.log").open("wb") as stdout,
-        (run_dir / "supervisor.stderr.log").open("wb") as stderr,
-    ):
-        process = subprocess.Popen(
-            command,
-            stdin=stdin,
-            stdout=stdout,
-            stderr=stderr,
-            cwd=cwd,
-            env=environment,
-            start_new_session=True,
-            close_fds=True,
+    process: subprocess.Popen | None = None
+
+    def start_supervisor() -> None:
+        nonlocal process
+        with (
+            (run_dir / "supervisor.stdin").open("w+b") as stdin,
+            (run_dir / "supervisor.stdout.log").open("wb") as stdout,
+            (run_dir / "supervisor.stderr.log").open("wb") as stderr,
+        ):
+            process = subprocess.Popen(
+                command,
+                stdin=stdin,
+                stdout=stdout,
+                stderr=stderr,
+                cwd=cwd,
+                env=environment,
+                start_new_session=True,
+                close_fds=True,
+            )
+        try:
+            atomic_write(run_dir / "supervisor.pid", f"{process.pid}\n")
+        except BaseException:
+            # Do not leave an unrecorded supervisor that cannot be counted.
+            try:
+                process.terminate()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            raise
+
+    parallel_error = _reserve_parallel_capacity(
+        config, Path(config["runtime_root"]), run_dir, role_name, start_supervisor
+    )
+    if parallel_error is not None:
+        finalize_blocked_run(
+            run_dir, role_name, role, kind, cwd, parallel_error, "parallel_limit",
+            defaulted_settings=defaulted_config_paths(config_path, paths.home),
         )
-    atomic_write(run_dir / "supervisor.pid", f"{process.pid}\n")
+        return run_dir
+    assert process is not None
     _DETACHED_SUPERVISORS[process.pid] = process
     return run_dir
 
@@ -2285,22 +2434,30 @@ def _retry_impl(run_dir: Path, task_file: Path, config_path: Path | None = None,
         "resume": state["thread_id"],
         "sandbox_exec": sandbox_exec,
     }))
-    exit_code = _invoke_safe(
-        command,
-        _executor_task(task, role["harness"]),
-        environment,
-        execution_root,
-        retry_root,
-        role["timeout_seconds"],
+    parallel_error = _reserve_parallel_capacity(
+        config, runtime_root, retry_root, role_name,
+        lambda: atomic_write(retry_root / "supervisor.pid", f"{os.getpid()}\n"),
     )
-    if role["harness"] == "claude":
-        _write_claude_final_from_events(retry_root)
-    summary = finalize_run(
-        retry_root, state["role"], role, state["kind"], execution_root, exit_code, state["attempts"] + 1,
-        runtime_root=runtime_root,
-        dirty_worktree_policy=effective_policy,
-        defaulted_settings=defaulted_settings,
-    )
+    if parallel_error is not None:
+        return finalize_blocked_run(
+            retry_root, state["role"], role, state["kind"], execution_root, parallel_error,
+            "parallel_limit", attempts=state["attempts"], thread_id=state["thread_id"],
+            signatures=state.get("signatures", []), defaulted_settings=defaulted_settings,
+        )
+    try:
+        exit_code = _invoke_safe(
+            command, _executor_task(task, role["harness"]), environment, execution_root, retry_root,
+            role["timeout_seconds"],
+        )
+        if role["harness"] == "claude":
+            _write_claude_final_from_events(retry_root)
+        summary = finalize_run(
+            retry_root, state["role"], role, state["kind"], execution_root, exit_code, state["attempts"] + 1,
+            runtime_root=runtime_root, dirty_worktree_policy=effective_policy,
+            defaulted_settings=defaulted_settings,
+        )
+    finally:
+        _release_parallel_reservation(retry_root)
     new_state = json.loads((retry_root / "state.json").read_text(encoding="utf-8"))
     new_state["signatures"] = [*state.get("signatures", []), *new_state.get("signatures", [])]
     identical = summary.get("failure_signature") and new_state["signatures"].count(summary["failure_signature"]) >= 2
@@ -2345,22 +2502,33 @@ def _retry_impl(run_dir: Path, task_file: Path, config_path: Path | None = None,
             "previous_run": str(retry_root),
             "sandbox_exec": sandbox_exec,
         }))
-        code = _invoke_safe(
-            command,
-            _executor_task(task, escalation["harness"]),
-            environment | {"CROSS_HARNESS_RUN_DIR": str(escalation_root)},
-            escalation_execution_root,
-            escalation_root,
-            escalation["timeout_seconds"],
+        parallel_error = _reserve_parallel_capacity(
+            config, runtime_root, escalation_root, role_name,
+            lambda: atomic_write(escalation_root / "supervisor.pid", f"{os.getpid()}\n"),
         )
-        if escalation["harness"] == "claude":
-            _write_claude_final_from_events(escalation_root)
-        escalated_summary = finalize_run(
-            escalation_root, state["role"], escalation, state["kind"], escalation_execution_root,
-            code, new_state["attempts"] + 1, runtime_root=runtime_root,
-            dirty_worktree_policy=_effective_dirty_worktree_policy(config, source_root),
-            defaulted_settings=defaulted_settings,
-        )
+        if parallel_error is not None:
+            return finalize_blocked_run(
+                escalation_root, state["role"], escalation, state["kind"], escalation_execution_root,
+                parallel_error, "parallel_limit", attempts=new_state["attempts"],
+                thread_id=summary.get("thread_id"), signatures=new_state.get("signatures", []),
+                defaulted_settings=defaulted_settings,
+            )
+        try:
+            code = _invoke_safe(
+                command, _executor_task(task, escalation["harness"]),
+                environment | {"CROSS_HARNESS_RUN_DIR": str(escalation_root)},
+                escalation_execution_root, escalation_root, escalation["timeout_seconds"],
+            )
+            if escalation["harness"] == "claude":
+                _write_claude_final_from_events(escalation_root)
+            escalated_summary = finalize_run(
+                escalation_root, state["role"], escalation, state["kind"], escalation_execution_root,
+                code, new_state["attempts"] + 1, runtime_root=runtime_root,
+                dirty_worktree_policy=_effective_dirty_worktree_policy(config, source_root),
+                defaulted_settings=defaulted_settings,
+            )
+        finally:
+            _release_parallel_reservation(escalation_root)
         escalated_state = json.loads((escalation_root / "state.json").read_text(encoding="utf-8"))
         escalated_state["escalated"] = True
         escalated_state["signatures"] = [*new_state["signatures"], *escalated_state.get("signatures", [])]

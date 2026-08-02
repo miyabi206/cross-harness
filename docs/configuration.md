@@ -45,6 +45,11 @@ globally or in a project override, where the project value takes precedence.
 
 Every role has `harness`, `model`, `effort`, `max_parallel`, `retries`,
 `timeout_seconds`, `write`, `output_limit_chars`, and `delegate_kinds`.
+The top-level `max_parallel` is an enforced runtime limit across all delegated
+runs. Each non-orchestrator role's `max_parallel` is also enforced separately;
+when either limit is full, the delegation is recorded as blocked immediately
+without waiting or queueing.
+Parallel capacity is counted from non-terminal runs whose supervisor is alive; an executor left alive after its supervisor exits does not consume capacity. PID identity is not verified, so a reused PID may be conservatively counted until the run is marked `ORPHANED` or exceeds `retention_days`.
 The required roles are orchestrator, explorer, implementer, implementer_complex,
 tester, reviewer, debugger, and security_reviewer. `implementer` handles changes
 that can be split into independently verifiable units, while
