@@ -8,7 +8,16 @@ import re
 import tempfile
 import unittest
 
-from cross_harness.watch import EventLine, RunWatcher, describe_event, format_event, render_lines, run_header, watch
+from cross_harness.watch import (
+    EventLine,
+    RunWatcher,
+    _EXECUTION_METADATA_LIMIT,
+    describe_event,
+    format_event,
+    render_lines,
+    run_header,
+    watch,
+)
 
 
 class WatchTests(unittest.TestCase):
@@ -247,6 +256,43 @@ class WatchTests(unittest.TestCase):
         (active / "state.json").write_text(json.dumps({"status": "success"}))
         self.assertEqual(["  ✔ success"], watcher.poll())
 
+    def test_header_is_redrawn_when_execution_metadata_appears(self):
+        run = self.runs / "20260718T174442-22222222"
+        run.mkdir()
+        watcher = RunWatcher(self.runs)
+        self.assertRegex(watcher.poll()[0], r"· 20260718T174442-22222222 ──────$")
+
+        (run / "execution.json").write_text(json.dumps({
+            "role_name": "implementer",
+            "harness": "codex",
+            "model": "gpt-5.6",
+            "effort": "high",
+        }))
+        header = watcher.poll()[0]
+        self.assertRegex(header, r"· implementer · codex · gpt-5.6 · high ──────$")
+
+    def test_missing_execution_metadata_stops_being_polled_after_completion(self):
+        run = self.runs / "20260718T174442-22222222"
+        run.mkdir()
+        watcher = RunWatcher(self.runs)
+        self.assertRegex(watcher.poll()[0], r"· 20260718T174442-22222222 ──────$")
+        (run / "state.json").write_text(json.dumps({"status": "success"}))
+
+        self.assertEqual(["  ✔ success"], watcher.poll())
+        self.assertFalse(watcher._header_pending)
+        with patch("cross_harness.watch._run_header", side_effect=AssertionError("execution.json reread")):
+            self.assertEqual([], watcher.poll())
+
+    def test_header_is_not_redrawn_when_execution_metadata_exists(self):
+        run = self.runs / "20260718T174442-22222222"
+        run.mkdir()
+        (run / "execution.json").write_text(json.dumps({
+            "role_name": "implementer", "harness": "codex",
+        }))
+        watcher = RunWatcher(self.runs)
+        self.assertEqual(1, len(watcher.poll()))
+        self.assertEqual([], watcher.poll())
+
     def test_header_includes_safe_model_and_effort(self):
         run = self.runs / "20260718T174442-22222222"
         run.mkdir()
@@ -315,6 +361,14 @@ class WatchTests(unittest.TestCase):
         run.mkdir()
         self.assertRegex(run_header(run), r"· 20260719T151554-e73c766e ──────$")
         self.assertNotIn("20260719T151554-e73c766e · 20260719T151554-e73c766e", run_header(run))
+
+    def test_oversized_execution_metadata_is_treated_as_unreadable(self):
+        run = self.runs / "20260719T151554-e73c766e"
+        run.mkdir()
+        payload = json.dumps({"role_name": "not-the-directory", "padding": "x" * _EXECUTION_METADATA_LIMIT})
+        self.assertGreater(len(payload.encode("utf-8")), _EXECUTION_METADATA_LIMIT)
+        (run / "execution.json").write_text(payload, encoding="utf-8")
+        self.assertRegex(run_header(run), r"· 20260719T151554-e73c766e ──────$")
 
     def test_delegation_result_message_renders_all_fields_safely(self):
         payload = json.dumps({

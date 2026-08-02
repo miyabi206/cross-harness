@@ -44,6 +44,8 @@ Then install through the repository-owned installer:
 ~/.local/bin/cross-harness doctor
 ```
 
+Run `install` from the repository or explicitly provide its path with `--repo`; the installed runtime is not a valid repository source.
+
 The installer backs up non-credential settings, copies its runtime under
 `~/.local/share/cross-harness/current`, installs the personal configuration at
 `~/.config/cross-harness/config.toml`, and merges user assets. Markdown and TOML

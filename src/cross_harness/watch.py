@@ -17,6 +17,7 @@ from .paths import user_paths
 
 _VERDICTS = {"success", "failed", "blocked", "partial"}
 _DETAIL_LIMIT = 120
+_EXECUTION_METADATA_LIMIT = 64 * 1024
 _DEFAULT_WIDTH = 100
 _RESET = "\033[0m"
 _BOLD = "\033[1m"
@@ -328,12 +329,34 @@ def format_event(run_dir: Path, event: dict) -> str:
 
 def run_header(run_dir: Path, *, color: bool = False) -> str:
     """Return a defensive, human-readable header for an active run."""
+    header, _ = _run_header(run_dir, color=color)
+    return header
+
+
+def _run_header(run_dir: Path, *, color: bool = False) -> tuple[str, bool]:
+    """Return a run header and whether execution.json was read successfully."""
     role = run_dir.name
     harness = ""
     model = ""
     effort = ""
+    readable = False
     try:
-        record = json.loads((run_dir / "execution.json").read_text(encoding="utf-8"))
+        execution_path = run_dir / "execution.json"
+        with execution_path.open("rb") as handle:
+            if os.fstat(handle.fileno()).st_size > _EXECUTION_METADATA_LIMIT:
+                record = {}
+            else:
+                payload = handle.read(_EXECUTION_METADATA_LIMIT)
+                # The file may grow after it is opened.  Check the opened file
+                # descriptor so a replacement at the path cannot cause an
+                # unbounded read or make an oversized payload readable.
+                if os.fstat(handle.fileno()).st_size > _EXECUTION_METADATA_LIMIT:
+                    record = {}
+                else:
+                    record = json.loads(payload.decode("utf-8"))
+                    readable = True
+        if not readable:
+            record = {}
         if isinstance(record, dict):
             if isinstance(record.get("role_name"), str):
                 role = _safe_text(record["role_name"], collapse_whitespace=True)
@@ -350,7 +373,7 @@ def run_header(run_dir: Path, *, color: bool = False) -> str:
     if details:
         identity = " · ".join((identity, *details))
     value = f"── {time.strftime('%H:%M:%S')} · {identity} ──────"
-    return _styled(value, _BOLD, color)
+    return _styled(value, _BOLD, color), readable
 
 
 def newest_run(runs_root: Path) -> Path | None:
@@ -374,6 +397,7 @@ class RunWatcher:
         self._event_offset = 0
         self._verdict_rendered = False
         self._header_pending = False
+        self._header_rendered = False
         self._initial_scan = True
 
     def poll(self) -> list[str]:
@@ -386,8 +410,14 @@ class RunWatcher:
             return []
         lines: list[str] = []
         if self._header_pending:
-            self._header_pending = False
-            lines.append(run_header(self.run_dir, color=self.color))
+            header, readable = _run_header(self.run_dir, color=self.color)
+            if readable or not self._header_rendered:
+                self._header_rendered = True
+                lines.append(header)
+            if readable:
+                self._header_pending = False
+            elif self._state_status(self.run_dir) in _VERDICTS:
+                self._header_pending = False
         return [*lines, *self._event_lines(), *self._verdict_line()]
 
     def _attach(self, run_dir: Path | None, skip_existing: bool) -> None:
@@ -395,6 +425,7 @@ class RunWatcher:
         self._event_offset = 0
         self._verdict_rendered = False
         self._header_pending = False
+        self._header_rendered = False
         if run_dir is None:
             return
         status = self._state_status(run_dir)

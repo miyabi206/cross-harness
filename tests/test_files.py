@@ -2,7 +2,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from cross_harness.files import MARKER_START, append_marker, atomic_write, dump_json, load_json, remove_marker
+from cross_harness.files import MARKER_END, MARKER_START, append_marker, atomic_write, dump_json, extract_marker, load_json, remove_marker
 from cross_harness.summarize import command_matches_check, failure_signature, normalize_comparison_path, parse_events, render_summary
 
 
@@ -12,6 +12,18 @@ class FileTests(unittest.TestCase):
         merged = append_marker(before, "managed content")
         self.assertIn(MARKER_START, merged)
         self.assertEqual(before, remove_marker(merged))
+
+    def test_extract_marker_rejects_invalid_marker_structure(self):
+        managed = f"{MARKER_START}\nmanaged\n{MARKER_END}"
+        cases = (
+            f"prefix {MARKER_START}\nmanaged\n{MARKER_END}",
+            f"{managed}\n{managed}",
+            f"{MARKER_END}\n{MARKER_START}\nmanaged",
+        )
+
+        for content in cases:
+            with self.subTest(content=content):
+                self.assertIsNone(extract_marker(content))
 
     def test_atomic_write_permissions_and_content(self):
         with tempfile.TemporaryDirectory() as folder:

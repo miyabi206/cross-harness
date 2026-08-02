@@ -180,7 +180,7 @@ executor-initiated reversions.
 To update an existing installation after changing this repository, run:
 
 ```sh
-~/.local/bin/cross-harness install
+./bin/cross-harness install
 ```
 
 Install first verifies the recorded installed hashes and symlink targets. It
@@ -206,7 +206,10 @@ The install manifest checks installed hashes before restoring. If post-install
 user edits exist, uninstall stops without changing anything. To surgically
 remove managed marker/JSON/TOML entries while keeping later user changes, use
 `uninstall --preserve-user-changes`. Use `--force` only when exact restoration
-from the recorded backup is explicitly intended. `--purge-runtime` first backs
+from the recorded backup is explicitly intended. As with personal settings,
+the codex_config-managed file (`~/.codex/config.toml`) is never fully restored
+from backup by default, `--force`, or `--preserve-user-changes`; those modes
+only remove its cross-harness managed marker block. `--purge-runtime` first backs
 up run state into the install backup and then removes the default runtime root.
 Backups are under the source repository's ignored `.local/backups/` directory
 and exclude auth, credentials, logs, transcripts, `.env`, keys, and

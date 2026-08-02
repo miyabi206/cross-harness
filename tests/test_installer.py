@@ -1,17 +1,21 @@
 from pathlib import Path
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from cross_harness.files import MARKER_START, sha256
+from cross_harness.files import MARKER_START, marker_block, sha256
 from cross_harness.errors import ConfigError, HarnessError
 from cross_harness.config import load_config
 from cross_harness.installer import (
+    _installed_drift,
+    _reject_install_root_repo,
     _remove_codex_agent_role_keys,
+    _remove_codex_config,
     _render_codex_agent_role,
     _git_hooks_path,
     install,
@@ -23,6 +27,56 @@ from cross_harness.paths import source_root, user_paths
 
 
 class InstallerTests(unittest.TestCase):
+    def test_unreadable_generic_drift_is_reported_without_propagating_oserror(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder) / "home"
+            home.mkdir()
+            path = home / "managed"
+            path.write_text("content\n", encoding="utf-8")
+            with patch("cross_harness.installer.sha256", side_effect=PermissionError("denied")):
+                drift = _installed_drift(
+                    [{"path": str(path), "installed_hash": "expected"}],
+                    user_paths(home),
+                )
+            self.assertEqual([str(path)], drift)
+
+    def test_unreadable_installed_symlink_is_reported_as_drift(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "managed"
+            path.symlink_to("target")
+            with patch("cross_harness.installer.os.readlink", side_effect=PermissionError("denied")):
+                drift = _installed_drift(
+                    [{"path": str(path), "installed_symlink": "target"}],
+                    user_paths(Path(folder)),
+                )
+            self.assertEqual([str(path)], drift)
+
+    def test_unreadable_codex_config_hash_is_reported_as_drift(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder) / "home"
+            home.mkdir()
+            path = home / ".codex/config.toml"
+            path.parent.mkdir()
+            path.write_text("forced_login_method = \"chatgpt\"\n", encoding="utf-8")
+            with patch("cross_harness.installer.sha256", side_effect=PermissionError("denied")):
+                drift = _installed_drift(
+                    [{"path": str(path), "management": "codex_config", "installed_hash": "expected"}],
+                    user_paths(home),
+                )
+            self.assertEqual([str(path)], drift)
+
+    def test_install_root_rejection_removes_terminal_controls_from_message(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            home.mkdir()
+            repo = home / ".local/share/cross-harness/current/bad\x1b[31mrepo"
+            repo.mkdir(parents=True)
+            with self.assertRaises(HarnessError) as raised:
+                _reject_install_root_repo(repo, user_paths(home))
+            self.assertNotIn("\x1b", str(raised.exception))
+            self.assertNotIn("\x07", str(raised.exception))
+
     def test_global_core_hooks_path_is_ignored(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -180,6 +234,326 @@ class InstallerTests(unittest.TestCase):
                     self.assertEqual(sha256(path), record["installed_hash"])
 
             install(home, repo)
+
+    def test_reinstall_allows_codex_config_user_sections(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+
+            install(home, repo)
+            config = home / ".codex/config.toml"
+            with config.open("a", encoding="utf-8") as handle:
+                handle.write('\n[projects."/some/path"]\ntrust_level = "trusted"\n\n[hooks.state]\nenabled = true\n')
+
+            install(home, repo)
+
+    def test_default_uninstall_after_reinstall_preserves_codex_config_user_sections(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+
+            install(home, repo)
+            config = home / ".codex/config.toml"
+            with config.open("a", encoding="utf-8") as handle:
+                handle.write('\n[projects."/work"]\ntrust_level = "trusted"\n')
+
+            install(home, repo)
+            uninstall(home)
+
+            self.assertTrue(config.is_file())
+            remaining = config.read_text(encoding="utf-8")
+            self.assertIn('trust_level = "trusted"', remaining)
+            self.assertNotIn(MARKER_START, remaining)
+            self.assertNotIn("forced_login_method", remaining)
+
+    def test_default_uninstall_removes_new_codex_config_without_user_content(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+
+            install(home, repo)
+            config = home / ".codex/config.toml"
+            uninstall(home)
+
+            self.assertFalse(config.exists())
+
+    def test_default_uninstall_preserves_existing_codex_config(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            config = home / ".codex/config.toml"
+            config.parent.mkdir()
+            original = 'model = "gpt-5.6-sol"\n'
+            config.write_text(original, encoding="utf-8")
+
+            install(home, repo)
+            uninstall(home)
+
+            self.assertTrue(config.is_file())
+            self.assertEqual(original, config.read_text(encoding="utf-8"))
+
+    def test_uninstall_rejects_codex_config_user_sections_without_preserve_flag(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+
+            install(home, repo)
+            config = home / ".codex/config.toml"
+            addition = '\n[projects."/work"]\ntrust_level = "trusted"\n'
+            with config.open("a", encoding="utf-8") as handle:
+                handle.write(addition)
+
+            with self.assertRaisesRegex(HarnessError, "installed files changed"):
+                uninstall(home)
+            self.assertTrue(config.is_file())
+            self.assertIn(addition.strip(), config.read_text(encoding="utf-8"))
+
+    def test_uninstall_rejects_codex_config_directory_in_all_modes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            install(home, repo)
+            config = home / ".codex/config.toml"
+            config.unlink()
+            config.mkdir()
+            child = config / "must-remain"
+            child.write_text("content\n", encoding="utf-8")
+
+            for preserve in (False, True):
+                with self.subTest(preserve_user_changes=preserve):
+                    with self.assertRaisesRegex(HarnessError, "installed files changed"):
+                        uninstall(home, preserve_user_changes=preserve)
+                    self.assertTrue(config.is_dir())
+                    self.assertEqual("content\n", child.read_text(encoding="utf-8"))
+
+    def test_default_uninstall_handles_legacy_marker_codex_config(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            install(home, repo)
+            config = home / ".codex/config.toml"
+            user_section = '\n[projects."/work"]\ntrust_level = "trusted"\n'
+            with config.open("a", encoding="utf-8") as handle:
+                handle.write(user_section)
+            install(home, repo)
+
+            manifest_path = home / ".local/state/cross-harness/install-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for record in manifest["records"]:
+                if Path(record["path"]) == config:
+                    record["management"] = "marker"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            uninstall(home)
+            remaining = config.read_text(encoding="utf-8")
+            self.assertIn(user_section.strip(), remaining)
+            self.assertNotIn(MARKER_START, remaining)
+
+    def test_remove_codex_config_preserves_surrounding_bytes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config = Path(folder) / "config.toml"
+            user_content = b'model = "gpt-5.6-sol"  \n\n\n'
+            config.write_bytes(marker_block('forced_login_method = "chatgpt"').encode() + b"\n\n" + user_content)
+
+            _remove_codex_config(config)
+            self.assertEqual(user_content, config.read_bytes())
+
+    def test_reinstall_accepts_crlf_codex_config_marker(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            install(home, repo)
+            config = home / ".codex/config.toml"
+            config.write_bytes(config.read_bytes().replace(b"\n", b"\r\n"))
+
+            install(home, repo)
+
+    def test_reinstall_reports_non_utf8_codex_config_as_drift(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+
+            install(home, repo)
+            config = home / ".codex/config.toml"
+            config.write_bytes(b'forced_login_method = "chatgpt"\n\xff')
+
+            with self.assertRaisesRegex(HarnessError, "installed files changed"):
+                install(home, repo)
+
+    def test_reinstall_reports_fifo_codex_config_as_drift_without_reading_it(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("FIFO creation is unavailable on this platform")
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            install(home, repo)
+            config = home / ".codex/config.toml"
+            config.unlink()
+            try:
+                os.mkfifo(config)
+            except OSError as exc:
+                self.skipTest(f"cannot create FIFO: {exc}")
+
+            with self.assertRaisesRegex(HarnessError, "installed files changed"):
+                install(home, repo)
+
+    def test_first_install_rejects_fifo_codex_config_without_reading_it(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("FIFO creation is unavailable on this platform")
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            config = home / ".codex/config.toml"
+            config.parent.mkdir()
+            try:
+                os.mkfifo(config)
+            except OSError as exc:
+                self.skipTest(f"cannot create FIFO: {exc}")
+
+            with self.assertRaisesRegex(HarnessError, "cannot manage Codex config"):
+                install(home, repo)
+
+    def test_reinstall_reports_oversized_codex_config_as_drift(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            install(home, repo)
+            config = home / ".codex/config.toml"
+            config.write_bytes(b"#" * (1024 * 1024 + 1))
+
+            with self.assertRaisesRegex(HarnessError, "installed files changed"):
+                install(home, repo)
+
+    def test_reinstall_rejects_codex_config_marker_inside_multiline_string(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            config = home / ".codex/config.toml"
+            config.parent.mkdir()
+            config.write_text(
+                'instructions = """\n'
+                '# >>> cross-harness managed >>>\n'
+                'forced_login_method = "chatgpt"\n'
+                '# <<< cross-harness managed <<<\n'
+                '"""\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(HarnessError, "not in the root scope"):
+                install(home, repo)
+
+    def test_reinstall_accepts_root_marker_after_multiline_table_like_content(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            config = home / ".codex/config.toml"
+            config.parent.mkdir()
+            config.write_text(
+                'instructions = """\n'
+                '[not-a-table]\n'
+                '"""\n'
+                '# >>> cross-harness managed >>>\n'
+                'forced_login_method = "chatgpt"\n'
+                '# <<< cross-harness managed <<<\n',
+                encoding="utf-8",
+            )
+
+            install(home, repo)
+
+    def test_reinstall_allows_codex_config_user_content_over_64_kib(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            install(home, repo)
+            config = home / ".codex/config.toml"
+            with config.open("a", encoding="utf-8") as handle:
+                handle.write("# user content\n" * (64 * 1024 // len("# user content\n") + 1))
+
+            install(home, repo)
+
+    def test_reinstall_rejects_codex_config_marker_after_table_header(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            install(home, repo)
+            config = home / ".codex/config.toml"
+            config.write_text(
+                '[projects."/work"]\n' + config.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(HarnessError, "installed files changed"):
+                install(home, repo)
+            self.assertEqual(1, config.read_text(encoding="utf-8").count(MARKER_START))
+
+    def test_reinstall_rejects_modified_or_removed_codex_config_marker(self):
+        for modification in ("replace", "remove"):
+            with self.subTest(modification=modification), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                home = root / "home"
+                repo = root / "repo"
+                home.mkdir()
+                shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+
+                install(home, repo)
+                config = home / ".codex/config.toml"
+                content = config.read_text(encoding="utf-8")
+                if modification == "replace":
+                    content = content.replace('forced_login_method = "chatgpt"', 'forced_login_method = "api"')
+                else:
+                    content = content.replace(MARKER_START + '\nforced_login_method = "chatgpt"\n# <<< cross-harness managed <<<\n', "")
+                config.write_text(content, encoding="utf-8")
+
+                with self.assertRaisesRegex(HarnessError, "installed files changed"):
+                    install(home, repo)
 
     def test_install_materializes_context_threshold_in_all_template_paths(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -598,6 +972,63 @@ class InstallerTests(unittest.TestCase):
             uninstall(home)
             self.assertFalse((home / ".local/share/cross-harness/current").exists())
             self.assertTrue(config.read_text(encoding="utf-8").startswith("# personal setting\n"))
+
+    def test_install_rejects_install_root_without_changing_it_and_hints_recorded_repo(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            install_root = home / ".local/share/cross-harness/current"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+            install_root.mkdir(parents=True)
+            sentinel = install_root / "keep.txt"
+            sentinel.write_text("unchanged\n", encoding="utf-8")
+            manifest_path = home / ".local/state/cross-harness/install-manifest.json"
+            manifest_path.parent.mkdir(parents=True)
+            manifest_path.write_text(json.dumps({"repo": str(repo)}) + "\n", encoding="utf-8")
+
+            for dry_run in (False, True):
+                with self.subTest(dry_run=dry_run), self.assertRaises(HarnessError) as raised:
+                    install(home, install_root, dry_run=dry_run)
+                message = str(raised.exception)
+                self.assertIn("installation destination", message)
+                self.assertIn("--repo", message)
+                self.assertIn(str(repo.resolve()), message)
+                self.assertEqual("unchanged\n", sentinel.read_text(encoding="utf-8"))
+
+            manifest_path.write_text(json.dumps({"repo": str(install_root)}) + "\n", encoding="utf-8")
+            with self.assertRaises(HarnessError) as raised:
+                install(home, install_root)
+            self.assertNotIn("Try:", str(raised.exception))
+
+    def test_install_reject_hint_quotes_repository_path_with_spaces(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo with space"
+            install_root = home / ".local/share/cross-harness/current"
+            home.mkdir()
+            repo.mkdir(parents=True)
+            manifest_path = home / ".local/state/cross-harness/install-manifest.json"
+            manifest_path.parent.mkdir(parents=True)
+            manifest_path.write_text(json.dumps({"repo": str(repo)}) + "\n", encoding="utf-8")
+
+            with self.assertRaises(HarnessError) as raised:
+                install(home, install_root)
+            self.assertIn(f"--repo {shlex.quote(str(repo.resolve()))}", str(raised.exception))
+
+    def test_install_allows_explicit_repository_outside_install_root(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            shutil.copytree(source_root(), repo, ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"))
+
+            install(home, repo)
+
+            self.assertTrue((home / ".local/share/cross-harness/current/bin/cross-harness").is_file())
 
     def test_install_rejects_drift_without_writing_unless_forced(self):
         with tempfile.TemporaryDirectory() as folder:

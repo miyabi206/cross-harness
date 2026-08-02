@@ -70,6 +70,21 @@ def marker_block(content: str) -> str:
     return f"{MARKER_START}\n{content.rstrip()}\n{MARKER_END}"
 
 
+def extract_marker(existing: str) -> str | None:
+    lines = existing.splitlines(keepends=True)
+    starts = [index for index, line in enumerate(lines) if line.rstrip("\r\n") == MARKER_START]
+    ends = [index for index, line in enumerate(lines) if line.rstrip("\r\n") == MARKER_END]
+    if len(starts) != 1 or len(ends) != 1 or ends[0] < starts[0]:
+        return None
+    start = starts[0]
+    end = ends[0]
+    # Markers are generated with LF, but users may check their configuration
+    # out or edit it with CRLF.  The marker's contents are what matter here;
+    # its on-disk line ending convention must remain untouched.
+    marker = "".join(lines[start : end + 1]).rstrip("\r\n")
+    return marker.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def append_marker(existing: str, content: str) -> str:
     if MARKER_START in existing or MARKER_END in existing:
         raise ValueError("cross-harness marker already exists")

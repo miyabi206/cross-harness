@@ -7,13 +7,15 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tomllib
+import unicodedata
 import uuid
 
 from .config import defaulted_config_paths, load_config
 from .errors import ConfigError, HarnessError
-from .files import append_marker, atomic_write, dump_json, load_json, marker_block, remove_marker, sha256
+from .files import append_marker, atomic_write, dump_json, extract_marker, load_json, marker_block, remove_marker, sha256
 from .inventory import create_backup
 from .paths import UserPaths, source_root, user_paths
 
@@ -21,6 +23,16 @@ from .paths import UserPaths, source_root, user_paths
 MANIFEST_PATH = ".local/state/cross-harness/install-manifest.json"
 COPY_TREES = ("bin", "src", "config", "schema", "schemas", "assets")
 RUNTIME_TEMP_PREFIX = ".current.tmp-"
+_CODEX_CONFIG_READ_LIMIT = 1024 * 1024
+_ANSI_ESCAPE = re.compile(
+    r"\x1B(?:[@-_][0-?]*[ -/]*[@-~]|\][^\x1B\x07]*(?:\x07|\x1B\\)|[\x00-\x7F])"
+)
+
+
+def _safe_install_text(value: object) -> str:
+    """Remove terminal controls before inserting a value into an error message."""
+    text = _ANSI_ESCAPE.sub("", str(value or ""))
+    return "".join(char for char in text if unicodedata.category(char) != "Cc")
 
 
 def _runtime_temp_path(install_root: Path) -> Path:
@@ -44,6 +56,43 @@ def _cleanup_runtime_temporary_dirs(install_root: Path) -> None:
 
 def _manifest_path(paths: UserPaths) -> Path:
     return paths.home / MANIFEST_PATH
+
+
+def _is_install_root_repo(repo: Path, paths: UserPaths) -> bool:
+    install_root = paths.install_root.resolve()
+    return repo == install_root or install_root in repo.parents
+
+
+def _manifest_repo_hint(paths: UserPaths) -> Path | None:
+    """Return a usable previously recorded repository without trusting the manifest."""
+    try:
+        manifest = json.loads(_manifest_path(paths).read_text(encoding="utf-8"))
+        value = manifest.get("repo") if isinstance(manifest, dict) else None
+        if not isinstance(value, str) or not value:
+            return None
+        repo = Path(value).expanduser().resolve()
+        if _is_install_root_repo(repo, paths):
+            return None
+        return repo if repo.is_dir() else None
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return None
+
+
+def _reject_install_root_repo(repo: Path, paths: UserPaths) -> None:
+    """Prevent an installed wrapper from replacing its runtime with itself."""
+    if not _is_install_root_repo(repo, paths):
+        return
+    message = (
+        "cannot use the installation destination as a repository: "
+        f"{_safe_install_text(repo)}. "
+        "Specify the repository with --repo."
+    )
+    hint = _manifest_repo_hint(paths)
+    if hint is not None:
+        safe_hint = _safe_install_text(hint)
+        if safe_hint and Path(safe_hint).is_dir():
+            message += f" Try: cross-harness install --repo {shlex.quote(safe_hint)}"
+    raise HarnessError(message)
 
 
 def _record(path: Path, paths: UserPaths, backup_root: Path) -> dict:
@@ -417,8 +466,68 @@ def _merge_codex_hooks(path: Path, executable: Path) -> str:
     return dump_json(data)
 
 
+def _codex_config_marker_is_root_scoped(existing: str) -> bool:
+    """Return whether the managed block begins before every TOML table."""
+    multiline: str | None = None
+    for line in existing.splitlines():
+        if line == "# >>> cross-harness managed >>>":
+            return multiline is None
+        if multiline is None and line.lstrip().startswith("["):
+            return False
+        position = 0
+        while position < len(line):
+            if multiline is not None:
+                closing = line.find(multiline, position)
+                if closing < 0:
+                    break
+                if multiline == '\"\"\"':
+                    backslashes = 0
+                    index = closing - 1
+                    while index >= 0 and line[index] == "\\":
+                        backslashes += 1
+                        index -= 1
+                    if backslashes % 2:
+                        position = closing + len(multiline)
+                        continue
+                position = closing + len(multiline)
+                multiline = None
+                continue
+            basic = line.find('\"\"\"', position)
+            literal = line.find("'''", position)
+            candidates = [candidate for candidate in (basic, literal) if candidate >= 0]
+            if not candidates:
+                break
+            opening = min(candidates)
+            multiline = '\"\"\"' if opening == basic else "'''"
+            position = opening + len(multiline)
+    return False
+
+
+def _read_codex_config(path: Path) -> str | None:
+    """Read a manageable Codex config without following links or unbounded reads."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        with path.open("rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return None
+            if os.fstat(handle.fileno()).st_size > _CODEX_CONFIG_READ_LIMIT:
+                return None
+            payload = handle.read(_CODEX_CONFIG_READ_LIMIT)
+            if os.fstat(handle.fileno()).st_size > _CODEX_CONFIG_READ_LIMIT:
+                return None
+        return payload.decode("utf-8")
+    except (UnicodeDecodeError, OSError):
+        return None
+
+
 def _merge_codex_config(path: Path) -> str | None:
-    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    existing = "" if not path.exists() else _read_codex_config(path)
+    if existing is None:
+        raise HarnessError(
+            f"cannot manage Codex config: {path}; it must be a non-symlink regular UTF-8 file "
+            f"no larger than {_CODEX_CONFIG_READ_LIMIT // (1024 * 1024)} MiB."
+        )
     try:
         parsed = tomllib.loads(existing) if existing.strip() else {}
     except tomllib.TOMLDecodeError as exc:
@@ -426,6 +535,14 @@ def _merge_codex_config(path: Path) -> str | None:
     method = parsed.get("forced_login_method")
     if method not in {None, "chatgpt"}:
         raise HarnessError("existing forced_login_method is not 'chatgpt'; refusing to change authentication")
+    if "# >>> cross-harness managed >>>" in existing or "# <<< cross-harness managed <<<" in existing:
+        expected = marker_block('forced_login_method = "chatgpt"')
+        if extract_marker(existing) == expected and _codex_config_marker_is_root_scoped(existing):
+            return None
+        raise HarnessError(
+            f"cannot manage Codex config: {path}; an existing managed marker is invalid or not in the root scope. "
+            "Move or remove the marker block manually before installing."
+        )
     if method == "chatgpt":
         return None
     managed = marker_block('forced_login_method = "chatgpt"')
@@ -433,27 +550,43 @@ def _merge_codex_config(path: Path) -> str | None:
 
 
 def _remove_codex_config(path: Path) -> None:
-    lines = path.read_text(encoding="utf-8").splitlines()
-    result: list[str] = []
-    inside = False
-    for line in lines:
-        stripped = line.strip()
-        if stripped == "# >>> cross-harness managed >>>":
-            inside = True
-            continue
-        if stripped == "# <<< cross-harness managed <<<":
-            inside = False
-            continue
-        if inside and re.fullmatch(r'forced_login_method\s*=\s*"chatgpt"', stripped):
-            continue
-        result.append(line)
-    while result and not result[0].strip():
-        result.pop(0)
-    text = "\n".join(result).rstrip()
-    atomic_write(path, text + "\n" if text else "")
+    """Remove Codex-owned marker content without normalizing user bytes."""
+    existing = path.read_bytes()
+    start_pattern = re.compile(
+        rb"(?m)^[ \t]*" + re.escape(b"# >>> cross-harness managed >>>") + rb"[ \t]*(?:\r\n|\n|\r|$)"
+    )
+    end_pattern = re.compile(
+        rb"(?m)^[ \t]*" + re.escape(b"# <<< cross-harness managed <<<") + rb"[ \t]*(?:\r\n|\n|\r|$)"
+    )
+    start = start_pattern.search(existing)
+    if start is None:
+        return
+    end = end_pattern.search(existing, start.end())
+    if end is None:
+        return
+
+    # The installer inserts one blank-line separator after the block.  Remove
+    # exactly that one separator while retaining all user content verbatim.
+    remove_end = end.end()
+    if existing[remove_end : remove_end + 2] == b"\r\n":
+        remove_end += 2
+    elif existing[remove_end : remove_end + 1] in (b"\n", b"\r"):
+        remove_end += 1
+    # Older releases placed user settings inside this marker block.  Retain
+    # those settings, removing only the marker lines and our owned setting.
+    managed_setting = re.compile(
+        rb'(?m)^[ \t]*forced_login_method[ \t]*=[ \t]*"chatgpt"[ \t]*(?:\r\n|\n|\r|$)'
+    )
+    middle = managed_setting.sub(b"", existing[start.end() : end.start()])
+    atomic_write(path, existing[: start.start()] + middle + existing[remove_end:])
 
 
-def _installed_drift(records: list[dict], paths: UserPaths, preserve_personal_config: bool = False) -> list[str]:
+def _installed_drift(
+    records: list[dict],
+    paths: UserPaths,
+    preserve_personal_config: bool = False,
+    preserve_codex_config_user_sections: bool = False,
+) -> list[str]:
     """Return installed paths that no longer match their manifest records."""
     drift: list[str] = []
     for record in records:
@@ -462,11 +595,37 @@ def _installed_drift(records: list[dict], paths: UserPaths, preserve_personal_co
             continue
         if preserve_personal_config and _is_personal_config_record(record, paths):
             continue
+        if record.get("management") == "codex_config" and preserve_codex_config_user_sections:
+            expected = marker_block('forced_login_method = "chatgpt"')
+            existing = _read_codex_config(path)
+            matches_marker = existing is not None and (
+                extract_marker(existing) == expected
+                and _codex_config_marker_is_root_scoped(existing)
+            )
+            if not matches_marker:
+                drift.append(str(path))
+            continue
+        if record.get("management") == "codex_config" and "installed_hash" in record:
+            try:
+                matches_hash = not path.is_symlink() and path.is_file() and sha256(path) == record["installed_hash"]
+            except OSError:
+                matches_hash = False
+            if not matches_hash:
+                drift.append(str(path))
+            continue
         if "installed_hash" in record:
-            if path.is_symlink() or not path.is_file() or sha256(path) != record["installed_hash"]:
+            try:
+                matches_hash = not path.is_symlink() and path.is_file() and sha256(path) == record["installed_hash"]
+            except OSError:
+                matches_hash = False
+            if not matches_hash:
                 drift.append(str(path))
         if "installed_symlink" in record:
-            if not path.is_symlink() or os.readlink(path) != record["installed_symlink"]:
+            try:
+                matches_symlink = path.is_symlink() and os.readlink(path) == record["installed_symlink"]
+            except OSError:
+                matches_symlink = False
+            if not matches_symlink:
                 drift.append(str(path))
     return drift
 
@@ -556,6 +715,7 @@ def _install(
 ) -> list[str]:
     paths = user_paths(home)
     repo = (repo or source_root()).resolve()
+    _reject_install_root_repo(repo, paths)
     if not dry_run:
         _cleanup_runtime_temporary_dirs(paths.install_root)
     git_hooks = _git_hooks_path(repo)
@@ -570,7 +730,12 @@ def _install(
             raise HarnessError(f"invalid install manifest records: {manifest_path}")
         previous_records = {str(record["path"]): record for record in records if isinstance(record, dict) and "path" in record}
         if not force:
-            drift = _installed_drift(records, paths, preserve_personal_config=True)
+            drift = _installed_drift(
+                records,
+                paths,
+                preserve_personal_config=True,
+                preserve_codex_config_user_sections=True,
+            )
             if drift:
                 raise HarnessError("installed files changed; refusing to overwrite:\n- " + "\n- ".join(drift))
     backup_root = _backup_root(repo)
@@ -907,6 +1072,14 @@ def _is_personal_config_record(record: dict, paths: UserPaths) -> bool:
     return record.get("management") == "personal_config" or Path(record["path"]) == paths.config
 
 
+def _is_codex_config_record(record: dict, paths: UserPaths) -> bool:
+    """Recognize current and pre-codex_config manifests for config.toml."""
+    return (
+        record.get("management") == "codex_config"
+        or (record.get("management") == "marker" and Path(record["path"]) == paths.codex / "config.toml")
+    )
+
+
 def uninstall(
     home: Path | None = None,
     force: bool = False,
@@ -926,6 +1099,19 @@ def uninstall(
         safe_root = (paths.home / ".local/state/cross-harness").resolve()
         if runtime_root != safe_root:
             raise HarnessError(f"refusing to purge non-default runtime root: {runtime_root}")
+    # Never let a legacy fallback reach _restore_record for config.toml: it
+    # recursively deletes directories.  This must also apply to --force and
+    # --preserve-user-changes, which bypass the ordinary drift preflight.
+    codex_nonfiles = [
+        str(Path(record["path"]))
+        for record in records
+        if isinstance(record, dict)
+        and "path" in record
+        and _is_codex_config_record(record, paths)
+        and (not Path(record["path"]).is_file() or Path(record["path"]).is_symlink())
+    ]
+    if codex_nonfiles:
+        raise HarnessError("installed files changed; refusing to overwrite:\n- " + "\n- ".join(codex_nonfiles))
     if not force and not preserve_user_changes:
         drift = _installed_drift(records, paths)
         if drift:
@@ -938,10 +1124,7 @@ def uninstall(
             management = record.get("management", "owned")
             if _is_personal_config_record(record, paths):
                 restored.append(_preserve_personal_config(record, paths, Path(manifest["backup_root"])))
-            elif (
-                management == "codex_config"
-                or (management == "marker" and path == paths.codex / "config.toml")
-            ) and path.is_file():
+            elif _is_codex_config_record(record, paths):
                 _remove_codex_config(path)
                 if not record.get("existed") and not path.read_text(encoding="utf-8").strip():
                     path.unlink()
@@ -978,6 +1161,12 @@ def uninstall(
         for record in reversed(records):
             if _is_personal_config_record(record, paths):
                 restored.append(_preserve_personal_config(record, paths, Path(manifest["backup_root"])))
+            elif _is_codex_config_record(record, paths):
+                path = Path(record["path"])
+                _remove_codex_config(path)
+                if not record.get("existed") and not path.read_text(encoding="utf-8").strip():
+                    path.unlink()
+                restored.append(str(path))
             else:
                 restored.append(_restore_record(record))
     manifest_path.unlink()
