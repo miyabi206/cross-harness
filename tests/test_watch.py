@@ -34,14 +34,13 @@ class WatchTests(unittest.TestCase):
         first.mkdir()
         (first / "events.jsonl").write_text('{"type":"turn.started"}\n')
         watcher = RunWatcher(self.runs)
-        self.assertRegex(watcher.poll()[0], r"^── \d\d:\d\d:\d\d · 20260718T174441-11111111")
+        self.assertEqual([], watcher.poll())
 
         second = self.runs / "20260718T174442-22222222"
         second.mkdir()
         (second / "events.jsonl").write_text('{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}\n')
         lines = watcher.poll()
-        self.assertRegex(lines[0], r"^── \d\d:\d\d:\d\d · 20260718T174442-22222222")
-        self.assertEqual("  ⎿ 10 in / 2 out", lines[1])
+        self.assertEqual(["  ⎿ 10 in / 2 out"], lines)
 
     def test_initial_attach_skips_finished_run_history_and_verdict(self):
         run = self.runs / "20260718T174442-2d5c2ebf"
@@ -228,6 +227,7 @@ class WatchTests(unittest.TestCase):
         output = StringIO()
         run = self.runs / "20260718T174442-22222222"
         run.mkdir()
+        (run / "execution.json").write_text(json.dumps({"role_name": "implementer", "harness": "codex"}))
         with patch("cross_harness.watch.load_config", return_value={"runtime_root": str(self.runs.parent)}), patch(
             "cross_harness.watch.time.sleep", side_effect=KeyboardInterrupt
         ), patch.dict(os.environ, {"NO_COLOR": "1"}):
@@ -260,7 +260,7 @@ class WatchTests(unittest.TestCase):
         run = self.runs / "20260718T174442-22222222"
         run.mkdir()
         watcher = RunWatcher(self.runs)
-        self.assertRegex(watcher.poll()[0], r"· 20260718T174442-22222222 ──────$")
+        self.assertEqual([], watcher.poll())
 
         (run / "execution.json").write_text(json.dumps({
             "role_name": "implementer",
@@ -275,10 +275,13 @@ class WatchTests(unittest.TestCase):
         run = self.runs / "20260718T174442-22222222"
         run.mkdir()
         watcher = RunWatcher(self.runs)
-        self.assertRegex(watcher.poll()[0], r"· 20260718T174442-22222222 ──────$")
+        self.assertEqual([], watcher.poll())
         (run / "state.json").write_text(json.dumps({"status": "success"}))
 
-        self.assertEqual(["  ✔ success"], watcher.poll())
+        lines = watcher.poll()
+        self.assertEqual(2, len(lines))
+        self.assertRegex(lines[0], r"^── \d\d:\d\d:\d\d · 20260718T174442-22222222 ──────$")
+        self.assertEqual("  ✔ success", lines[1])
         self.assertFalse(watcher._header_pending)
         with patch("cross_harness.watch._run_header", side_effect=AssertionError("execution.json reread")):
             self.assertEqual([], watcher.poll())

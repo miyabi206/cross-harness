@@ -411,12 +411,17 @@ class RunWatcher:
         lines: list[str] = []
         if self._header_pending:
             header, readable = _run_header(self.run_dir, color=self.color)
-            if readable or not self._header_rendered:
-                self._header_rendered = True
-                lines.append(header)
             if readable:
+                if not self._header_rendered:
+                    self._header_rendered = True
+                    lines.append(header)
                 self._header_pending = False
             elif self._state_status(self.run_dir) in _VERDICTS:
+                # Preserve context for runs finalized before execution.json
+                # could be written, immediately before the verdict.
+                if not self._header_rendered:
+                    self._header_rendered = True
+                    lines.append(header)
                 self._header_pending = False
         return [*lines, *self._event_lines(), *self._verdict_line()]
 
