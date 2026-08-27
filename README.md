@@ -33,7 +33,7 @@ Run the non-mutating checks first:
 
 ```sh
 ./bin/cross-harness validate --config config/default.toml
-./bin/cross-harness inventory --output docs/inventory.md --backup .local/backups/pre-install
+./bin/cross-harness inventory --output ~/.local/state/cross-harness/inventory.md --backup .local/backups/pre-install
 ./bin/cross-harness install --dry-run
 ```
 
