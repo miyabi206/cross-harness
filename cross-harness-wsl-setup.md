@@ -171,7 +171,7 @@ cd ~/cross-harness
 # 5-1. 設定の妥当性チェック（非破壊）
 ./bin/cross-harness validate --config config/default.toml
 # 5-2. 既存設定のバックアップ目録（非破壊）
-./bin/cross-harness inventory --output docs/inventory.md --backup .local/backups/pre-install
+./bin/cross-harness inventory --output ~/.local/state/cross-harness/inventory.md --backup .local/backups/pre-install
 # 5-3. ドライラン（非破壊。何が起きるかの確認）
 ./bin/cross-harness install --dry-run
 ```
