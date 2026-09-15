@@ -12,6 +12,7 @@ from cross_harness.watch import (
     EventLine,
     RunWatcher,
     _EXECUTION_METADATA_LIMIT,
+    _HISTORY_LIMIT,
     describe_event,
     format_event,
     render_lines,
@@ -59,7 +60,10 @@ class WatchTests(unittest.TestCase):
                     newer = self.runs / (run.name + "-next")
                     newer.mkdir()
                     self.assertEqual([], watcher.poll())
-                    self.assertEqual([], watcher.set_width(20))
+                    self.assertEqual(render_lines(
+                        (*describe_event(event), EventLine("·", detail="turn.started", noise=True)),
+                        width=20, color=color, show_all=show_all,
+                    ) + last, watcher.set_width(20))
 
     def test_watch_tracks_tty_width_and_redraws_without_duplicate_events(self):
         for is_tty in (False, True):
@@ -69,6 +73,7 @@ class WatchTests(unittest.TestCase):
                 (run / "execution.json").write_text('{"role_name":"worker"}')
                 output = StringIO()
                 output.isatty = lambda: is_tty
+                output.fileno = lambda: 123
                 events = [
                     {"type": "item.completed", "item": {"type": "agent_message", "text": text}}
                     for text in ("one two three four five six seven eight", "new message at narrow width")
@@ -86,7 +91,7 @@ class WatchTests(unittest.TestCase):
 
                 with patch("cross_harness.watch.load_config", return_value={"runtime_root": str(self.runs.parent)}), patch(
                     "cross_harness.watch.time.sleep", side_effect=advance
-                ), patch("cross_harness.watch.shutil.get_terminal_size", side_effect=[
+                ), patch("cross_harness.watch.os.get_terminal_size", side_effect=[
                     os.terminal_size((40, 24)), os.terminal_size((40, 24)),
                     os.terminal_size((16, 24)), os.terminal_size((16, 24)),
                 ]) as size:
@@ -96,6 +101,7 @@ class WatchTests(unittest.TestCase):
                 header = chunks[0].splitlines()[0]
                 if is_tty:
                     self.assertEqual(4, size.call_count)
+                    size.assert_called_with(123)
                     self.assertEqual(2, len(chunks))
                     self.assertEqual(
                         [header, *render_lines(describe_event(events[0]), width=40)],
@@ -111,6 +117,77 @@ class WatchTests(unittest.TestCase):
                     self.assertEqual([header, *render_lines(
                         (*describe_event(events[0]), *describe_event(events[1])),
                     )], output.getvalue().splitlines())
+
+    def test_resize_history_is_bounded_across_run_switches(self):
+        watcher = RunWatcher(self.runs)
+        watcher.poll()
+        first = self.runs / "first"
+        first.mkdir()
+        events = [
+            {"type": "item.completed", "item": {"type": "agent_message", "text": str(i)}}
+            for i in range(_HISTORY_LIMIT + 2)
+        ]
+        (first / "events.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
+        self.assertEqual(_HISTORY_LIMIT + 2, len(watcher.poll()))
+        (self.runs / "second").mkdir()
+        watcher.poll()
+        self.assertEqual(_HISTORY_LIMIT, len(watcher._history))
+        redrawn = watcher.set_width(40)
+        self.assertEqual("  › 2", redrawn[0])
+        self.assertEqual(f"  › {_HISTORY_LIMIT + 1}", redrawn[-1])
+
+    @unittest.skipUnless(os.name == "posix", "requires a pseudo-terminal")
+    def test_watch_uses_output_terminal_despite_columns_environment(self):
+        import fcntl
+        import pty
+        import struct
+        import termios
+
+        master, slave = pty.openpty()
+        try:
+            with os.fdopen(os.dup(slave), "w") as output:
+                def resize(width):
+                    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, width, 0, 0))
+
+                resize(60)
+                steps = 0
+                event = {"type": "item.completed", "item": {
+                    "type": "agent_message", "text": "one two three four five six seven eight",
+                }}
+
+                def advance(_):
+                    nonlocal steps
+                    steps += 1
+                    if steps == 1:
+                        run = self.runs / "new"
+                        run.mkdir()
+                        (run / "events.jsonl").write_text(json.dumps(event) + "\n")
+                    elif steps == 2:
+                        resize(16)
+                    else:
+                        raise KeyboardInterrupt
+
+                with patch("cross_harness.watch.load_config", return_value={"runtime_root": str(self.runs.parent)}), patch(
+                    "cross_harness.watch.time.sleep", side_effect=advance
+                ), patch.dict(os.environ, {"COLUMNS": "60"}):
+                    self.assertEqual(0, watch(output=output, color="never"))
+                os.set_blocking(master, False)
+                captured = bytearray()
+                while True:
+                    try:
+                        chunk = os.read(master, 65536)
+                    except BlockingIOError:
+                        break
+                    if not chunk:
+                        break
+                    captured.extend(chunk)
+                chunks = captured.decode().replace("\r\n", "\n").split("\033[H\033[2J\033[3J")
+                self.assertEqual(2, len(chunks))
+                self.assertEqual(render_lines(describe_event(event), width=60), chunks[0].splitlines())
+                self.assertEqual(render_lines(describe_event(event), width=16), chunks[1].splitlines())
+        finally:
+            os.close(slave)
+            os.close(master)
 
     def test_auto_switches_to_a_newer_run(self):
         first = self.runs / "20260718T174441-11111111"
