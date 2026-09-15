@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, TextIO
 import json
 import os
 import re
-import shutil
 import textwrap
 import time
 import unicodedata
@@ -19,6 +19,7 @@ _VERDICTS = {"success", "failed", "blocked", "partial"}
 _DETAIL_LIMIT = 120
 _EXECUTION_METADATA_LIMIT = 64 * 1024
 _DEFAULT_WIDTH = 100
+_HISTORY_LIMIT = 3000
 _RESET = "\033[0m"
 _BOLD = "\033[1m"
 _DIM = "\033[2m"
@@ -399,10 +400,10 @@ class RunWatcher:
         self._header_pending = False
         self._header_rendered = False
         self._initial_scan = True
-        self._history: list[str | EventLine] = []
+        self._history: deque[str | EventLine] = deque(maxlen=_HISTORY_LIMIT)
 
     def set_width(self, width: int) -> list[str]:
-        """Re-render emitted output for the current run when its width changes."""
+        """Re-render retained output across runs when its width changes."""
         if width == self.width:
             return []
         self.width = width
@@ -447,7 +448,6 @@ class RunWatcher:
 
     def _attach(self, run_dir: Path | None, skip_existing: bool) -> None:
         self.run_dir = run_dir
-        self._history.clear()
         self._event_offset = 0
         self._verdict_rendered = False
         self._header_pending = False
@@ -542,7 +542,12 @@ def watch(
     try:
         while True:
             if is_tty:
-                width = shutil.get_terminal_size(fallback=(_DEFAULT_WIDTH, 24)).columns
+                try:
+                    width = os.get_terminal_size(stream.fileno()).columns
+                except (OSError, ValueError, AttributeError):
+                    width = _DEFAULT_WIDTH
+                if width <= 0:
+                    width = _DEFAULT_WIDTH
                 redrawn = watcher.set_width(width)
                 if redrawn:
                     stream.write("\033[H\033[2J\033[3J")
