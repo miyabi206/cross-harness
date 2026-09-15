@@ -399,6 +399,25 @@ class RunWatcher:
         self._header_pending = False
         self._header_rendered = False
         self._initial_scan = True
+        self._history: list[str | EventLine] = []
+
+    def set_width(self, width: int) -> list[str]:
+        """Re-render emitted output for the current run when its width changes."""
+        if width == self.width:
+            return []
+        self.width = width
+        lines: list[str] = []
+        for item in self._history:
+            if isinstance(item, str):
+                lines.append(item)
+            else:
+                lines.extend(render_lines((item,), width=width, color=self.color, show_all=self.show_all))
+        return lines
+
+    def _emit(self, items: Iterable[EventLine]) -> list[str]:
+        items = [item for item in items if self.show_all or not item.noise]
+        self._history.extend(items)
+        return render_lines(items, width=self.width, color=self.color, show_all=self.show_all)
 
     def poll(self) -> list[str]:
         newest = newest_run(self.runs_root)
@@ -423,10 +442,12 @@ class RunWatcher:
                     self._header_rendered = True
                     lines.append(header)
                 self._header_pending = False
+        self._history.extend(lines)
         return [*lines, *self._event_lines(), *self._verdict_line()]
 
     def _attach(self, run_dir: Path | None, skip_existing: bool) -> None:
         self.run_dir = run_dir
+        self._history.clear()
         self._event_offset = 0
         self._verdict_rendered = False
         self._header_pending = False
@@ -475,7 +496,7 @@ class RunWatcher:
             except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
             if isinstance(event, dict):
-                lines.extend(render_lines(describe_event(event), width=self.width, color=self.color, show_all=self.show_all))
+                lines.extend(self._emit(describe_event(event)))
         return lines
 
     def _verdict_line(self) -> list[str]:
@@ -492,7 +513,7 @@ class RunWatcher:
             "blocked": ("⚠", "yellow"),
             "partial": ("◐", "yellow"),
         }[status]
-        return render_lines((EventLine(marker, detail=status, tone=tone),), width=self.width, color=self.color)
+        return self._emit((EventLine(marker, detail=status, tone=tone),))
 
 
 def watch(
@@ -517,10 +538,16 @@ def watch(
         stream = sys.stdout
     is_tty = getattr(stream, "isatty", lambda: False)()
     use_color = color == "always" or (color == "auto" and "NO_COLOR" not in os.environ and is_tty)
-    width = shutil.get_terminal_size(fallback=(_DEFAULT_WIDTH, 24)).columns if is_tty else _DEFAULT_WIDTH
-    watcher = RunWatcher(Path(config["runtime_root"]) / "runs", show_all=show_all, color=use_color, width=width)
+    watcher = RunWatcher(Path(config["runtime_root"]) / "runs", show_all=show_all, color=use_color)
     try:
         while True:
+            if is_tty:
+                width = shutil.get_terminal_size(fallback=(_DEFAULT_WIDTH, 24)).columns
+                redrawn = watcher.set_width(width)
+                if redrawn:
+                    stream.write("\033[H\033[2J\033[3J")
+                    for line in redrawn:
+                        print(line, file=stream, flush=True)
             for line in watcher.poll():
                 print(line, file=stream, flush=True)
             time.sleep(poll_seconds)

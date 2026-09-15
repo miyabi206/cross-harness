@@ -29,6 +29,89 @@ class WatchTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_resize_replays_current_run_in_order_with_filters(self):
+        for show_all in (False, True):
+            for color in (False, True):
+                with self.subTest(show_all=show_all, color=color):
+                    watcher = RunWatcher(self.runs, show_all=show_all, color=color, width=40)
+                    self.assertEqual([], watcher.set_width(50))
+                    watcher.poll()
+                    run = self.runs / f"run-{int(show_all)}-{int(color)}"
+                    run.mkdir()
+                    event = {"type": "item.completed", "item": {
+                        "type": "agent_message", "text": "one two three four five six seven eight",
+                    }}
+                    (run / "events.jsonl").write_text(json.dumps(event) + '\n{"type":"turn.started"}\n')
+                    # Emit the event before the delayed header, preserving that order.
+                    first = watcher.poll()
+                    (run / "execution.json").write_text('{"role_name":"worker"}')
+                    (run / "state.json").write_text('{"status":"success"}')
+                    last = watcher.poll()
+                    self.assertEqual(2, len(last))
+                    expected = render_lines(
+                        (*describe_event(event), EventLine("·", detail="turn.started", noise=True)),
+                        width=16, color=color, show_all=show_all,
+                    ) + last
+                    self.assertEqual(expected, watcher.set_width(16))
+                    self.assertEqual([], watcher.set_width(16))
+                    self.assertEqual([], watcher.poll())
+                    self.assertEqual(first + last, watcher.set_width(50))
+                    newer = self.runs / (run.name + "-next")
+                    newer.mkdir()
+                    self.assertEqual([], watcher.poll())
+                    self.assertEqual([], watcher.set_width(20))
+
+    def test_watch_tracks_tty_width_and_redraws_without_duplicate_events(self):
+        for is_tty in (False, True):
+            with self.subTest(is_tty=is_tty):
+                run = self.runs / str(is_tty)
+                run.mkdir()
+                (run / "execution.json").write_text('{"role_name":"worker"}')
+                output = StringIO()
+                output.isatty = lambda: is_tty
+                events = [
+                    {"type": "item.completed", "item": {"type": "agent_message", "text": text}}
+                    for text in ("one two three four five six seven eight", "new message at narrow width")
+                ]
+                sleeps = 0
+
+                def advance(_):
+                    nonlocal sleeps
+                    if sleeps < 2:
+                        with (run / "events.jsonl").open("a") as handle:
+                            handle.write(json.dumps(events[sleeps]) + "\n")
+                    sleeps += 1
+                    if sleeps == 4:
+                        raise KeyboardInterrupt
+
+                with patch("cross_harness.watch.load_config", return_value={"runtime_root": str(self.runs.parent)}), patch(
+                    "cross_harness.watch.time.sleep", side_effect=advance
+                ), patch("cross_harness.watch.shutil.get_terminal_size", side_effect=[
+                    os.terminal_size((40, 24)), os.terminal_size((40, 24)),
+                    os.terminal_size((16, 24)), os.terminal_size((16, 24)),
+                ]) as size:
+                    self.assertEqual(0, watch(output=output, color="never"))
+                clear = "\033[H\033[2J\033[3J"
+                chunks = output.getvalue().split(clear)
+                header = chunks[0].splitlines()[0]
+                if is_tty:
+                    self.assertEqual(4, size.call_count)
+                    self.assertEqual(2, len(chunks))
+                    self.assertEqual(
+                        [header, *render_lines(describe_event(events[0]), width=40)],
+                        chunks[0].splitlines(),
+                    )
+                    expected = [header, *render_lines(
+                        (*describe_event(events[0]), *describe_event(events[1])), width=16,
+                    )]
+                    self.assertEqual(expected, chunks[1].splitlines())
+                else:
+                    size.assert_not_called()
+                    self.assertEqual(1, len(chunks))
+                    self.assertEqual([header, *render_lines(
+                        (*describe_event(events[0]), *describe_event(events[1])),
+                    )], output.getvalue().splitlines())
+
     def test_auto_switches_to_a_newer_run(self):
         first = self.runs / "20260718T174441-11111111"
         first.mkdir()
