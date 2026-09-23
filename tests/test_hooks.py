@@ -12,6 +12,7 @@ import unittest
 from cross_harness.hooks import claude_pre_tool_use, claude_session_start, codex_pre_tool_use
 from cross_harness.installer import install
 from cross_harness.paths import source_root, user_paths
+from cross_harness.project import remove as remove_project, setup as setup_project_cli
 
 
 @patch.dict("os.environ", {}, clear=True)
@@ -115,6 +116,345 @@ class HookTests(unittest.TestCase):
             {"HOME": str(home), "PATH": str(bin_dir)},
             clear=True,
         )
+
+    def _session_config(self, home, runtime_root, *, project_auto_setup=True, mode="on", project=None):
+        config_path = home / ".config/cross-harness/config.toml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        contents = (
+            f'runtime_root = "{runtime_root}"\n'
+            f'mode = "{mode}"\n'
+            f'project_auto_setup = {str(project_auto_setup).lower()}\n'
+        )
+        if project is not None:
+            project_path, enabled = project
+            contents += f'\n[projects.{json.dumps(str(project_path))}]\nproject_auto_setup = {str(enabled).lower()}\n'
+        config_path.write_text(contents, encoding="utf-8")
+        return config_path
+
+    def _start_session(self, home, cwd):
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("cross_harness.hooks.self_update", return_value=SimpleNamespace(state="ok", warnings=[])),
+            patch("cross_harness.hooks.detected_api_keys", return_value=[]),
+            patch("cross_harness.hooks.verify_codex_chatgpt"),
+            patch("cross_harness.hooks.cleanup"),
+            patch("sys.stdin", StringIO(json.dumps({"cwd": str(cwd)}))),
+            patch("sys.stdout", new_callable=StringIO) as stdout,
+        ):
+            code = claude_session_start(home)
+        return code, stdout.getvalue()
+
+    def _init_repo(self, repo):
+        repo.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+
+    def test_session_start_installs_task_and_excludes_it_from_git_status(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            cwd = repo / "src/package"
+            home.mkdir()
+            cwd.mkdir(parents=True)
+            self._init_repo(repo)
+            self._session_config(home, root / "runtime")
+
+            with patch("cross_harness.hooks._project_task_is_tracked", return_value=False) as tracked_check:
+                code, output = self._start_session(home, cwd)
+
+            tasks = repo / ".vscode/tasks.json"
+            exclude = repo / ".git/info/exclude"
+            self.assertEqual(0, code)
+            tracked_check.assert_called_once_with(repo)
+            self.assertTrue(tasks.is_file())
+            self.assertEqual(1, exclude.read_text(encoding="utf-8").splitlines().count("/.vscode/tasks.json"))
+            self.assertEqual("", subprocess.run(
+                ["git", "status", "--short"], cwd=repo, check=True, capture_output=True, text=True
+            ).stdout)
+            self.assertIn(str(tasks), output)
+            self.assertIn("allow automatic tasks", output)
+            self.assertIn("next opens", output)
+
+            original_tasks = tasks.read_text(encoding="utf-8")
+            original_exclude = exclude.read_text(encoding="utf-8")
+            code, second_output = self._start_session(home, cwd)
+
+            self.assertEqual(0, code)
+            self.assertEqual(original_tasks, tasks.read_text(encoding="utf-8"))
+            self.assertEqual(original_exclude, exclude.read_text(encoding="utf-8"))
+            self.assertNotIn("VS Code task ready", second_output)
+
+    def test_session_start_leaves_existing_untracked_tasks_file_unchanged(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            self._init_repo(repo)
+            self._session_config(home, root / "runtime")
+            tasks = repo / ".vscode/tasks.json"
+            tasks.parent.mkdir()
+            original = b'{"version":"2.0.0","tasks":[{"label":"my task"}]}\n'
+            tasks.write_bytes(original)
+
+            with patch("cross_harness.hooks.setup_project") as setup:
+                code, output = self._start_session(home, repo)
+
+            setup.assert_not_called()
+            self.assertEqual(0, code)
+            self.assertEqual(original, tasks.read_bytes())
+            self.assertNotIn("VS Code task ready", output)
+            self.assertEqual([], list((home / ".local/state/cross-harness/project-backups").glob("*")))
+
+    def test_session_start_skips_when_git_root_is_home(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder) / "home"
+            home.mkdir()
+            self._init_repo(home)
+            self._session_config(home, home / ".local/state/cross-harness")
+
+            with patch("cross_harness.hooks.setup_project") as setup:
+                code, output = self._start_session(home, home)
+
+            setup.assert_not_called()
+            self.assertEqual(0, code)
+            self.assertFalse((home / ".vscode/tasks.json").exists())
+            self.assertNotIn("VS Code task ready", output)
+
+    def test_session_start_project_remove_disables_setup_until_manual_setup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            self._init_repo(repo)
+            config_path = self._session_config(home, root / "runtime")
+            tasks = repo / ".vscode/tasks.json"
+
+            setup_project_cli(repo, config_path=config_path, home=home)
+            self.assertTrue(tasks.is_file())
+            remove_project(repo, config_path=config_path, home=home)
+            self.assertFalse(tasks.exists())
+
+            code, output = self._start_session(home, repo)
+            self.assertEqual(0, code)
+            self.assertFalse(tasks.exists())
+            self.assertNotIn("VS Code task ready", output)
+
+            state = json.loads((root / "runtime/project-state.json").read_text(encoding="utf-8"))
+            self.assertEqual([str(repo.resolve())], state["auto_setup_disabled"])
+
+            setup_project_cli(repo, config_path=config_path, home=home)
+            state = json.loads((root / "runtime/project-state.json").read_text(encoding="utf-8"))
+            self.assertEqual([], state["auto_setup_disabled"])
+            self.assertEqual([str(tasks.resolve())], state["created_tasks"])
+            self.assertTrue(tasks.is_file())
+
+    def test_session_start_uses_common_git_dir_for_linked_worktree_exclude(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            main_repo = root / "main"
+            worktree = root / "worktree"
+            home.mkdir()
+            self._init_repo(main_repo)
+            (main_repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=main_repo, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "base"],
+                cwd=main_repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "worktree", "add", "-qb", "session-worktree", str(worktree)],
+                cwd=main_repo,
+                check=True,
+            )
+            self._session_config(home, root / "runtime")
+
+            code, output = self._start_session(home, worktree)
+
+            common_dir_result = subprocess.run(
+                ["git", "rev-parse", "--git-common-dir"],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            common_dir = Path(common_dir_result.stdout.strip())
+            if not common_dir.is_absolute():
+                common_dir = worktree / common_dir
+            exclude = common_dir.resolve() / "info/exclude"
+            self.assertEqual(0, code)
+            self.assertIn("/.vscode/tasks.json", exclude.read_text(encoding="utf-8").splitlines())
+            self.assertEqual("", subprocess.run(
+                ["git", "status", "--short"], cwd=worktree, check=True, capture_output=True, text=True
+            ).stdout)
+            self.assertIn(str(worktree / ".vscode/tasks.json"), output)
+
+    def test_session_start_separates_exclude_entry_when_file_has_no_final_newline(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            self._init_repo(repo)
+            self._session_config(home, root / "runtime")
+            exclude = repo / ".git/info/exclude"
+            exclude.write_text("# local rule", encoding="utf-8")
+
+            code, _ = self._start_session(home, repo)
+
+            self.assertEqual(0, code)
+            self.assertEqual("# local rule\n/.vscode/tasks.json\n", exclude.read_text(encoding="utf-8"))
+
+    def test_session_start_does_not_write_through_symlinked_exclude(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            target = root / "external-exclude"
+            home.mkdir()
+            self._init_repo(repo)
+            self._session_config(home, root / "runtime")
+            target.write_text("# keep\n", encoding="utf-8")
+            exclude = repo / ".git/info/exclude"
+            exclude.unlink()
+            exclude.symlink_to(target)
+
+            code, _ = self._start_session(home, repo)
+
+            self.assertEqual(0, code)
+            self.assertTrue(exclude.is_symlink())
+            self.assertEqual("# keep\n", target.read_text(encoding="utf-8"))
+
+    def test_session_start_skips_project_setup_without_valid_git_cwd(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            project = root / "project"
+            home.mkdir()
+            project.mkdir()
+            self._session_config(home, root / "runtime")
+            with patch("cross_harness.hooks.setup_project") as setup:
+                code, output = self._start_session(home, project)
+            setup.assert_not_called()
+            self.assertEqual(0, code)
+            self.assertNotIn("VS Code task ready", output)
+
+    def test_session_start_skips_project_setup_when_mode_is_off(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            self._init_repo(repo)
+            self._session_config(home, root / "runtime", mode="off")
+            with patch("cross_harness.hooks.setup_project") as setup:
+                code, output = self._start_session(home, repo)
+            setup.assert_not_called()
+            self.assertEqual(0, code)
+            self.assertNotIn("VS Code task ready", output)
+
+    def test_session_start_honors_global_and_project_auto_setup_opt_out(self):
+        cases = ((False, None), (True, False))
+        for index, (global_enabled, project_setting) in enumerate(cases):
+            with self.subTest(global_enabled=global_enabled, project_setting=project_setting):
+                with tempfile.TemporaryDirectory() as folder:
+                    root = Path(folder)
+                    home = root / "home"
+                    repo = root / "repo"
+                    home.mkdir()
+                    self._init_repo(repo)
+                    project = (repo, project_setting) if project_setting is not None else None
+                    self._session_config(
+                        home,
+                        root / f"runtime-{index}",
+                        project_auto_setup=global_enabled,
+                        project=project,
+                    )
+                    with patch("cross_harness.hooks.setup_project") as setup:
+                        code, output = self._start_session(home, repo)
+                    setup.assert_not_called()
+                    self.assertEqual(0, code)
+                    self.assertFalse((repo / ".vscode/tasks.json").exists())
+                    self.assertNotIn("VS Code task ready", output)
+
+    def test_session_start_leaves_existing_jsonc_tasks_file_unchanged(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            self._init_repo(repo)
+            self._session_config(home, root / "runtime")
+            tasks = repo / ".vscode/tasks.json"
+            tasks.parent.mkdir()
+            original = '{\n  // keep this comment\n  "version": "2.0.0",\n  "tasks": []\n}\n'
+            tasks.write_text(original, encoding="utf-8")
+
+            code, output = self._start_session(home, repo)
+            self.assertEqual(0, code)
+            self.assertNotIn("project auto-setup warning:", output)
+            self.assertNotIn("VS Code task ready", output)
+            self.assertEqual(original, tasks.read_text(encoding="utf-8"))
+
+    def test_session_start_skips_a_git_tracked_tasks_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            self._init_repo(repo)
+            self._session_config(home, root / "runtime")
+            tasks = repo / ".vscode/tasks.json"
+            tasks.parent.mkdir()
+            original = '{"version":"2.0.0","tasks":[{"label":"project task"}]}\n'
+            tasks.write_text(original, encoding="utf-8")
+            subprocess.run(["git", "add", ".vscode/tasks.json"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "add tasks"],
+                cwd=repo,
+                check=True,
+            )
+            exclude = repo / ".git/info/exclude"
+            original_exclude = exclude.read_text(encoding="utf-8")
+            original_status = subprocess.run(
+                ["git", "status", "--short"], cwd=repo, check=True, capture_output=True, text=True
+            ).stdout
+
+            with patch("cross_harness.hooks.setup_project") as setup:
+                code, output = self._start_session(home, repo)
+
+            setup.assert_not_called()
+            self.assertEqual(0, code)
+            self.assertEqual(original, tasks.read_text(encoding="utf-8"))
+            self.assertEqual(original_exclude, exclude.read_text(encoding="utf-8"))
+            self.assertEqual(original_status, subprocess.run(
+                ["git", "status", "--short"], cwd=repo, check=True, capture_output=True, text=True
+            ).stdout)
+            self.assertNotIn("VS Code task ready", output)
+
+    def test_session_start_skips_auto_setup_when_tracked_state_is_unknown(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir()
+            self._init_repo(repo)
+            self._session_config(home, root / "runtime")
+
+            with (
+                patch("cross_harness.hooks._project_task_is_tracked", side_effect=RuntimeError("Git unavailable")),
+                patch("cross_harness.hooks.setup_project") as setup,
+            ):
+                code, output = self._start_session(home, repo)
+
+            setup.assert_not_called()
+            self.assertEqual(0, code)
+            self.assertFalse((repo / ".vscode/tasks.json").exists())
+            warnings = [line for line in output.splitlines() if line.startswith("project auto-setup warning:")]
+            self.assertEqual(["project auto-setup warning: Git unavailable"], warnings)
 
     def test_claude_direct_edit_and_direct_codex_are_blocked(self):
         code, message = self._run(claude_pre_tool_use, '{"tool_name":"Edit","tool_input":{}}')

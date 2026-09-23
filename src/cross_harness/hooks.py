@@ -10,11 +10,12 @@ import subprocess
 import sys
 
 from .auth import detected_api_keys, sanitized_environment, verify_codex_chatgpt
-from .config import effective_mode, load_config
+from .config import effective_mode, load_config, project_config
 from .errors import ConfigError
 from .files import atomic_write, dump_json
 from .maintenance import cleanup
 from .paths import user_paths
+from .project import is_auto_setup_disabled, setup as setup_project
 from .installer import synchronize_claude_agent_roles, synchronize_codex_agent_roles
 from .selfupdate import self_update
 from .taskfile import contains_secret
@@ -154,6 +155,110 @@ def _git_root_from_cwd(cwd: Path | None) -> Path | None:
             current = parent
     except (OSError, RuntimeError, ValueError):
         return None
+
+
+def _project_task_is_tracked(root: Path) -> bool:
+    """Return whether Git tracks the project task file, failing when uncertain."""
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", "--", ".vscode/tasks.json"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if tracked.returncode == 0:
+        return True
+    if tracked.returncode != 1:
+        message = tracked.stderr.strip() or "could not determine whether .vscode/tasks.json is tracked"
+        raise RuntimeError(message)
+    return False
+
+
+def _exclude_created_project_task(root: Path) -> None:
+    """Keep a newly created VS Code task file out of Git status."""
+    result = subprocess.run(
+        ["git", "rev-parse", "--git-common-dir"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    common_dir_text = result.stdout.strip()
+    if result.returncode or not common_dir_text:
+        message = result.stderr.strip() or "could not resolve the Git common directory"
+        raise RuntimeError(message)
+    common_dir = Path(common_dir_text)
+    if not common_dir.is_absolute():
+        common_dir = root / common_dir
+    exclude = common_dir.resolve() / "info/exclude"
+    if exclude.is_symlink():
+        return
+    line = "/.vscode/tasks.json"
+    existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+    if line in existing.splitlines():
+        return
+    separator = "" if not existing or existing.endswith(("\n", "\r")) else "\n"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    with exclude.open("a", encoding="utf-8", newline="") as handle:
+        handle.write(separator + line + "\n")
+
+
+def _project_setup_error(exc: Exception) -> str:
+    message = str(exc).splitlines()
+    return message[0] if message and message[0] else type(exc).__name__
+
+
+def _session_project_auto_setup(config: dict, data: dict | None, paths, warnings: list[str]) -> None:
+    """Install the VS Code task for an opted-in Git project, failing open."""
+    cwd = _cwd(data)
+    if cwd is None:
+        return
+    try:
+        if _mode_is_off(config, data):
+            return
+        root = _git_root_from_cwd(cwd)
+        if root is None or root.resolve() == paths.home.resolve():
+            return
+        project = project_config(config, cwd)
+        if project.get("project_auto_setup", config.get("project_auto_setup", True)) is False:
+            return
+        tasks_path = root / ".vscode/tasks.json"
+        if tasks_path.exists() or tasks_path.is_symlink() or tasks_path.parent.is_symlink():
+            return
+        runtime_root = Path(config["runtime_root"])
+        if is_auto_setup_disabled(root, runtime_root):
+            return
+        try:
+            if _project_task_is_tracked(root):
+                return
+        except Exception as exc:
+            warnings.append(f"project auto-setup warning: {_project_setup_error(exc)}")
+            return
+
+        actions: list[str] = []
+        setup_error: Exception | None = None
+        try:
+            actions = setup_project(root, config_path=paths.config, home=paths.home)
+        except Exception as exc:
+            setup_error = exc
+
+        created = tasks_path.is_file()
+        if created:
+            try:
+                _exclude_created_project_task(root)
+            except Exception as exc:
+                warnings.append(f"project auto-setup warning: {_project_setup_error(exc)}")
+        if actions or created:
+            warnings.append(
+                f"VS Code task ready at {tasks_path}; allow automatic tasks for this folder; "
+                "it runs when the folder next opens."
+            )
+        if setup_error is not None:
+            warnings.append(f"project auto-setup warning: {_project_setup_error(setup_error)}")
+    except Exception as exc:
+        warnings.append(f"project auto-setup warning: {_project_setup_error(exc)}")
 
 
 def _orchestrator_write_path_is_allowed(file_path: str | None, cwd: Path | None) -> bool:
@@ -384,6 +489,7 @@ def claude_session_start(home: Path | None = None) -> int:
             warnings.append(
                 "cross-harness is disabled for this cwd; ignore the managed orchestrator instructions in CLAUDE.md."
             )
+        _session_project_auto_setup(config, data, paths, warnings)
         if (paths.claude / "agents").exists():
             try:
                 warnings.extend(synchronize_claude_agent_roles(paths, config))

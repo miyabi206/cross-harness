@@ -917,8 +917,8 @@ class InstallerTests(unittest.TestCase):
             config.parent.mkdir(parents=True)
             contents = 'retention_days = 14\n[roles.tester]\ntimeout_seconds = 321\n'
             config.write_text(contents, encoding="utf-8")
-            # The partial config supplies two of 84 default leaf settings.
-            expected_defaulted_count = 82
+            # The partial config supplies two of 85 default leaf settings.
+            expected_defaulted_count = 83
             expected_default_action = "default: roles.tester.model"
 
             dry_run_actions = install(home, repo, dry_run=True)

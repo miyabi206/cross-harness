@@ -31,7 +31,10 @@ class SchemaContractTests(unittest.TestCase):
     def test_schema_keys_match_config_constants(self):
         properties = self.schema["properties"]
         self.assertEqual(config_module.TOP_KEYS, set(properties))
-        self.assertEqual(config_module.TOP_KEYS - {"projects", "mode"}, set(self.schema["required"]))
+        self.assertEqual(
+            config_module.TOP_KEYS - {"projects", "mode", "project_auto_setup"},
+            set(self.schema["required"]),
+        )
 
         roles = properties["roles"]
         self.assertEqual(config_module.REQUIRED_ROLES, set(roles["properties"]))

@@ -105,16 +105,22 @@ cross-harness watch
 
 For watch details, see [the runbook](docs/runbook.md).
 
-Optional project setup is for VS Code users. Run it once for each repository
-where you want to use it:
+For VS Code users, the Claude SessionStart hook automatically installs the
+delegation watch task when a session starts in a Git repository and
+`.vscode/tasks.json` is absent. Existing files are left unchanged. VS Code must
+allow automatic tasks for that folder; the task runs when you next open the
+folder. Set `project_auto_setup = false` in your personal config or project
+override, or run `cross-harness project remove --cwd /path/to/repository` to
+disable automatic setup for a repository. `project setup` enables it again.
+Repositories that commit `.vscode/tasks.json` are skipped automatically; use
+manual setup if you want to manage that file yourself:
 
 ```sh
 cross-harness project setup --cwd /path/to/repository
 ```
 
-This adds a task to the repository's `.vscode/tasks.json`. It starts only when
-VS Code opens that folder, and VS Code must allow automatic tasks for the
-folder. Remove it with `cross-harness project remove --cwd /path/to/repository`.
+This adds a task to the repository's `.vscode/tasks.json`. Remove it with
+`cross-harness project remove --cwd /path/to/repository`.
 Use `--dry-run` with either command to inspect the planned change without
 writing files.
 
@@ -162,7 +168,7 @@ afterward:
 ```
 
 Project overrides accept only `checks`, `delegate_kinds`,
-`dirty_worktree_policy`, and `mode`; the most specific matching path wins,
+`dirty_worktree_policy`, `mode`, and `project_auto_setup`; the most specific matching path wins,
 `mode = "off"` excludes that repository from enforcement, and models,
 authentication, and sandbox settings cannot be overridden.
 
@@ -175,8 +181,9 @@ cross-harness project setup --cwd /path/to/repository
 ```
 
 Use `doctor` for an initial health check and `validate` only after editing
-configuration. `project setup` writes only to the target's `.vscode/tasks.json`;
-it is the optional VS Code watcher described above in Watch delegated runs.
+configuration. `project setup` creates or updates the target's
+`.vscode/tasks.json`; it is the manual command for the VS Code watcher
+described above in Watch delegated runs.
 
 ## Change role settings
 

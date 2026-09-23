@@ -32,6 +32,7 @@ TOP_KEYS = {
     "roles",
     "projects",
     "mode",
+    "project_auto_setup",
 }
 ROLE_KEYS = {
     "harness",
@@ -44,7 +45,7 @@ ROLE_KEYS = {
     "output_limit_chars",
     "delegate_kinds",
 }
-PROJECT_KEYS = {"checks", "delegate_kinds", "dirty_worktree_policy", "mode"}
+PROJECT_KEYS = {"checks", "delegate_kinds", "dirty_worktree_policy", "mode", "project_auto_setup"}
 CODEX_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DELEGATE_KINDS = {"exploration", "implementation", "test", "debug", "review", "security_review"}
@@ -130,7 +131,7 @@ def _integer(config: dict, key: str, low: int, high: int, errors: list[str]) -> 
 def validate(config: dict) -> list[str]:
     errors: list[str] = []
     _unknown(set(config), TOP_KEYS, "root", errors)
-    for key in TOP_KEYS - {"projects", "mode"}:
+    for key in TOP_KEYS - {"projects", "mode", "project_auto_setup"}:
         if key not in config:
             errors.append(f"root: missing key {key!r}")
 
@@ -148,6 +149,8 @@ def validate(config: dict) -> list[str]:
         errors.append("dirty_worktree_policy: expected 'stop', 'isolate', 'allow', or 'allow_delegated'")
     if "mode" in config and config["mode"] not in {"on", "off"}:
         errors.append("mode: expected 'on' or 'off'")
+    if "project_auto_setup" in config and not isinstance(config["project_auto_setup"], bool):
+        errors.append("project_auto_setup: expected boolean")
     if not _string_list(config.get("delegate_kinds")):
         errors.append("delegate_kinds: expected a unique string array")
     elif unknown_kinds := set(config["delegate_kinds"]) - DELEGATE_KINDS:
@@ -226,6 +229,8 @@ def validate(config: dict) -> list[str]:
                 )
             if "mode" in project and project["mode"] not in {"on", "off"}:
                 errors.append(f"{location}.mode: expected 'on' or 'off'")
+            if "project_auto_setup" in project and not isinstance(project["project_auto_setup"], bool):
+                errors.append(f"{location}.project_auto_setup: expected boolean")
     return errors
 
 

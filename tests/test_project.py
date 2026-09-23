@@ -77,6 +77,60 @@ class ProjectTaskTests(unittest.TestCase):
             self.assertFalse(tasks_path.exists())
             self.assertFalse((home / ".local/state/cross-harness").exists())
 
+    def test_remove_disables_session_setup_and_setup_reenables_it(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            project = root / "project"
+            project.mkdir()
+            runtime = home / ".local/state/cross-harness"
+            state_path = runtime / "project-state.json"
+            tasks_path = project / ".vscode/tasks.json"
+
+            setup(project, home=home)
+            self.assertTrue(tasks_path.exists())
+            self.assertEqual(
+                {"created_tasks": [str(tasks_path.resolve())], "auto_setup_disabled": []},
+                json.loads(state_path.read_text(encoding="utf-8")),
+            )
+
+            remove(project, home=home)
+            self.assertFalse(tasks_path.exists())
+            self.assertEqual(
+                {"created_tasks": [], "auto_setup_disabled": [str(project.resolve())]},
+                json.loads(state_path.read_text(encoding="utf-8")),
+            )
+
+            setup(project, home=home)
+            self.assertTrue(tasks_path.exists())
+            self.assertEqual(
+                {"created_tasks": [str(tasks_path.resolve())], "auto_setup_disabled": []},
+                json.loads(state_path.read_text(encoding="utf-8")),
+            )
+
+    def test_setup_and_remove_dry_run_leave_project_state_unchanged(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "home"
+            project = root / "project"
+            project.mkdir()
+            runtime = home / ".local/state/cross-harness"
+            state_path = runtime / "project-state.json"
+            tasks_path = project / ".vscode/tasks.json"
+
+            setup(project, home=home)
+            created_state = state_path.read_bytes()
+            remove(project, home=home, dry_run=True)
+            self.assertEqual(created_state, state_path.read_bytes())
+            self.assertTrue(tasks_path.exists())
+
+            remove(project, home=home)
+            disabled_state = state_path.read_bytes()
+            self.assertFalse(tasks_path.exists())
+            setup(project, home=home, dry_run=True)
+            self.assertEqual(disabled_state, state_path.read_bytes())
+            self.assertFalse(tasks_path.exists())
+
     def test_invalid_existing_json_is_not_overwritten(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

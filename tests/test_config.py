@@ -31,6 +31,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(DELEGATE_KINDS, ROLE_DELEGATE_KINDS)
         self.assertEqual(70, config["context_threshold_percent"])
         self.assertEqual("allow_delegated", config["dirty_worktree_policy"])
+        self.assertTrue(config["project_auto_setup"])
         default_warnings = "\n".join(warnings(config))
         self.assertIn("roles.explorer.effort: has no effect for the haiku model", default_warnings)
         self.assertIn("roles.tester.effort: has no effect for the haiku model", default_warnings)
@@ -139,6 +140,22 @@ class ConfigTests(unittest.TestCase):
         errors = "\n".join(validate(config))
         self.assertIn("mode: expected 'on' or 'off'", errors)
         self.assertIn("projects./tmp/project.mode: expected 'on' or 'off'", errors)
+
+    def test_project_auto_setup_is_optional_boolean_globally_and_per_project(self):
+        config = copy.deepcopy(default_config())
+        self.assertTrue(config["project_auto_setup"])
+        del config["project_auto_setup"]
+        self.assertEqual([], validate(config))
+
+        config["project_auto_setup"] = False
+        config["projects"] = {"/tmp/project": {"project_auto_setup": False}}
+        self.assertEqual([], validate(config))
+
+        config["project_auto_setup"] = "no"
+        config["projects"]["/tmp/project"]["project_auto_setup"] = 0
+        errors = "\n".join(validate(config))
+        self.assertIn("project_auto_setup: expected boolean", errors)
+        self.assertIn("projects./tmp/project.project_auto_setup: expected boolean", errors)
 
     def test_unknown_efforts_are_warnings_but_empty_efforts_are_errors(self):
         config = copy.deepcopy(default_config())

@@ -48,18 +48,19 @@ orchestrator context. The complete raw event log is in the run directory's
 shown, but Claude `tool_result` bodies and error text from `state.json` are not
 shown, even with `--all`.
 
-To start this watcher automatically when VS Code opens a repository folder,
-run the following once for each repository:
+Claude SessionStart automatically creates the folder-open watcher when
+`.vscode/tasks.json` is absent in the repository. Existing files are left alone.
+To install or update the task manually, run:
 
 ```sh
 cross-harness project setup --cwd /path/to/repository
 ```
 
-This adds the folder-open task to that repository's `.vscode/tasks.json`; it
-does not run merely because VS Code starts. VS Code must be configured to allow
-automatic tasks for the folder. Remove the repository-local task with
-`cross-harness project remove --cwd /path/to/repository`. Use `--dry-run` with
-either command to see the planned change without writing files.
+The task runs the next time VS Code opens that folder, and VS Code must allow
+automatic tasks for it. `cross-harness project remove --cwd /path/to/repository`
+removes the cross-harness task when possible and disables future automatic
+setup for the repository; `project setup` enables it again. Use `--dry-run`
+with either command to see the planned change without writing files.
 
 Run `cross-harness doctor` after either CLI upgrades, authentication changes,
 hook changes, or a reinstall. Run `cross-harness cleanup` when stale run

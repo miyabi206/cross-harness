@@ -85,23 +85,37 @@ def _state_path(runtime_root: Path) -> Path:
     return runtime_root / _STATE_FILE
 
 
-def _created_tasks(runtime_root: Path) -> set[str]:
+def _project_state(runtime_root: Path) -> tuple[set[str], set[str]]:
     path = _state_path(runtime_root)
     if not path.exists():
-        return set()
+        return set(), set()
     state = _read_json(path)
-    entries = state.get("created_tasks") if isinstance(state, dict) else None
-    if not isinstance(entries, list) or not all(isinstance(entry, str) for entry in entries):
+    created = state.get("created_tasks") if isinstance(state, dict) else None
+    disabled = state.get("auto_setup_disabled", []) if isinstance(state, dict) else None
+    if not isinstance(created, list) or not all(isinstance(entry, str) for entry in created):
         raise HarnessError(f"invalid project state in {path}")
-    return set(entries)
+    if not isinstance(disabled, list) or not all(isinstance(entry, str) for entry in disabled):
+        raise HarnessError(f"invalid project state in {path}")
+    return set(created), set(disabled)
 
 
-def _write_created_tasks(runtime_root: Path, entries: set[str]) -> None:
+def _write_project_state(runtime_root: Path, created: set[str], disabled: set[str]) -> None:
     path = _state_path(runtime_root)
-    if entries:
-        atomic_write(path, _json_text({"created_tasks": sorted(entries)}), 0o600)
+    if created or disabled:
+        atomic_write(
+            path,
+            _json_text({"created_tasks": sorted(created), "auto_setup_disabled": sorted(disabled)}),
+            0o600,
+        )
     else:
         path.unlink(missing_ok=True)
+
+
+def is_auto_setup_disabled(cwd: Path, runtime_root: Path) -> bool:
+    """Return whether a project was explicitly opted out with project remove."""
+    root = _project_directory(cwd)
+    _, disabled = _project_state(runtime_root)
+    return str(root) in disabled
 
 
 def _backup(path: Path, content: str, runtime_root: Path) -> Path:
@@ -131,6 +145,9 @@ def setup(cwd: Path, config_path: Path | None = None, home: Path | None = None, 
     runtime_root = Path(config["runtime_root"])
     path = _tasks_path(root)
     task = _task_template(paths.executable)
+    created, disabled = _project_state(runtime_root)
+    was_disabled = str(root) in disabled
+    disabled.discard(str(root))
 
     if path.exists():
         try:
@@ -140,22 +157,24 @@ def setup(cwd: Path, config_path: Path | None = None, home: Path | None = None, 
         document = _tasks_document(path, paths.executable, "setup")
         changed = _replace_task(document, task)
         if not changed:
+            if was_disabled and not dry_run:
+                _write_project_state(runtime_root, created, disabled)
             return []
         action = f"{'would update' if dry_run else 'updated'} {path}"
         if dry_run:
             return [action]
         _backup(path, original, runtime_root)
         atomic_write(path, _json_text(document), path.stat().st_mode & 0o777)
+        _write_project_state(runtime_root, created, disabled)
         return [action]
 
     document = {"version": "2.0.0", "tasks": [task]}
     action = f"{'would create' if dry_run else 'created'} {path}"
     if dry_run:
         return [action]
-    created = _created_tasks(runtime_root)
     created.add(str(path))
     atomic_write(path, _json_text(document), 0o644)
-    _write_created_tasks(runtime_root, created)
+    _write_project_state(runtime_root, created, disabled)
     return [action]
 
 
@@ -166,16 +185,22 @@ def remove(cwd: Path, config_path: Path | None = None, home: Path | None = None,
     config = load_config(config_path, paths.home)
     runtime_root = Path(config["runtime_root"])
     path = _tasks_path(root)
+    created, disabled = _project_state(runtime_root)
+    already_disabled = str(root) in disabled
+    disabled.add(str(root))
     if not path.exists():
+        if not dry_run and not already_disabled:
+            _write_project_state(runtime_root, created, disabled)
         return []
 
     document = _tasks_document(path, paths.executable, "remove")
     tasks = document.get("tasks", [])
     remaining = [item for item in tasks if not (isinstance(item, dict) and item.get("label") == TASK_LABEL)]
     if remaining == tasks:
+        if not dry_run and not already_disabled:
+            _write_project_state(runtime_root, created, disabled)
         return []
 
-    created = _created_tasks(runtime_root)
     created_here = str(path) in created
     delete_file = not remaining and created_here
     actions = [f"{'would remove' if dry_run else 'removed'} {path}"]
@@ -194,5 +219,5 @@ def remove(cwd: Path, config_path: Path | None = None, home: Path | None = None,
     else:
         document["tasks"] = remaining
         atomic_write(path, _json_text(document), path.stat().st_mode & 0o777)
-    _write_created_tasks(runtime_root, created)
+    _write_project_state(runtime_root, created, disabled)
     return actions

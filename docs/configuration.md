@@ -19,8 +19,9 @@ remain aligned.
   `danger-full-access`.
 
 `projects."/absolute/path"` may set only `checks`, `delegate_kinds`,
-`dirty_worktree_policy`, and `mode`. It cannot select a model, authentication
-method, or sandbox. The most specific matching project path wins.
+`dirty_worktree_policy`, `mode`, and `project_auto_setup`. It cannot select a
+model, authentication method, or sandbox. The most specific matching project
+path wins.
 
 ## Dirty worktrees
 
@@ -40,6 +41,12 @@ operational discipline.
 `mode` is `"on"` or `"off"` and defaults fail closed to `"on"`. It may be set
 globally or in a project override, where the project value takes precedence.
 `"off"` disables enforcement; set a project value to `"on"` to opt back in.
+
+`project_auto_setup` defaults to `true`. At Claude SessionStart, the hook adds
+the VS Code delegation task only when `.vscode/tasks.json` does not exist. Set
+it to `false` globally or in a project override to disable automatic setup;
+`cross-harness project remove --cwd /path/to/repository` also disables it for
+that repository until `cross-harness project setup` is run again.
 
 ## Roles
 
