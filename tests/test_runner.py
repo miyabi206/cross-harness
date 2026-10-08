@@ -1089,7 +1089,8 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual([file_name], result["changed_files"])
             self.assertEqual("adopted\n", (self.repo / file_name).read_text())
         finally:
-            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+            if worktree.exists():
+                subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
 
     def test_adopt_treats_colon_and_glob_paths_as_literal(self):
         file_names = (":weird.txt", "*.glob.txt")
@@ -1108,12 +1109,13 @@ class RunnerTests(unittest.TestCase):
             for file_name in file_names:
                 self.assertEqual("adopted\n", (self.repo / file_name).read_text())
         finally:
-            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+            if worktree.exists():
+                subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
 
     def test_adopt_accepts_a_retry_run_worktree_marker(self):
         config = self.root / "isolate-adopt.toml"
         default = (Path(__file__).resolve().parents[1] / "config/default.toml").read_text()
-        config.write_text(default.replace('dirty_worktree_policy = "allow_delegated"', 'dirty_worktree_policy = "isolate"', 1))
+        config.write_text(default.replace("auto_commit = true", "auto_commit = false", 1).replace('dirty_worktree_policy = "allow_delegated"', 'dirty_worktree_policy = "isolate"', 1))
         self.task.write_text("# Goal\nContinue.\n\n# Checks\n- fixture\n")
         verify_result = (Path("/usr/bin/true"), False)
 
@@ -1157,7 +1159,8 @@ class RunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(HarnessError, "outside run directory"):
                 adopt(run, home=self.home)
         finally:
-            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+            if worktree.exists():
+                subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
 
     def test_adopt_rejects_submodule_changes_with_a_clear_error(self):
         subrepo = self.root / "subrepo"
@@ -1185,7 +1188,8 @@ class RunnerTests(unittest.TestCase):
 
             self.assertEqual("before\n", (self.repo / "sub" / "sub.txt").read_text())
         finally:
-            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+            if worktree.exists():
+                subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
 
     def test_adopt_rejects_new_submodule_changes_before_writing_the_root(self):
         subrepo = self.root / "new-subrepo"
@@ -1210,7 +1214,8 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual("before\n", (self.repo / "README.md").read_text())
             self.assertFalse((self.repo / "sub").exists())
         finally:
-            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+            if worktree.exists():
+                subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
 
     def test_adopt_applies_tracked_and_untracked_changes_and_records_fingerprints(self):
         run, worktree = self._adopt_fixture()
@@ -1234,7 +1239,8 @@ class RunnerTests(unittest.TestCase):
                 records[str(self.repo.resolve())],
             )
         finally:
-            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+            if worktree.exists():
+                subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
 
     def test_adopt_uses_git_filter_comparison_for_a_clean_root_file(self):
         git(self.repo, "config", "filter.roundtrip.clean", "sed s/SMUDGE$//")
@@ -1255,7 +1261,8 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(["f.txt"], result["changed_files"])
             self.assertEqual("adopted\n", (self.repo / "f.txt").read_text())
         finally:
-            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+            if worktree.exists():
+                subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
 
     def test_adopt_ignores_umask_only_mode_difference(self):
         run, worktree = self._adopt_fixture("adopt-mode")
@@ -1268,7 +1275,8 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(["README.md"], result["changed_files"])
             self.assertEqual("adopted\n", (self.repo / "README.md").read_text())
         finally:
-            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+            if worktree.exists():
+                subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
 
     def test_adopt_handles_tracked_symlink_changes(self):
         (self.repo / "target.txt").write_text("target\n")
@@ -1285,7 +1293,8 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(["link"], result["changed_files"])
             self.assertEqual("README.md", os.readlink(self.repo / "link"))
         finally:
-            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+            if worktree.exists():
+                subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
 
     def test_adopt_rejects_a_run_without_a_finalized_summary(self):
         run, worktree = self._adopt_fixture("adopt-incomplete")
@@ -1295,7 +1304,8 @@ class RunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(HarnessError, "summary is not finalized"):
                 adopt(run, home=self.home)
         finally:
-            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+            if worktree.exists():
+                subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
 
     def test_adopt_rejects_a_live_run(self):
         run, worktree = self._adopt_fixture("adopt-running")
@@ -1305,7 +1315,8 @@ class RunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(HarnessError, "run is still in progress"):
                 adopt(run, home=self.home)
         finally:
-            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+            if worktree.exists():
+                subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
 
     def test_adopt_rejects_a_live_run_sharing_the_isolated_worktree(self):
         run, worktree = self._adopt_fixture("adopt-shared-live")
@@ -1321,7 +1332,8 @@ class RunnerTests(unittest.TestCase):
 
             self.assertFalse((self.repo / "new.txt").exists())
         finally:
-            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+            if worktree.exists():
+                subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
 
     def test_adopt_rejects_when_shared_worktree_runs_cannot_be_enumerated(self):
         run, worktree = self._adopt_fixture("adopt-shared-enumeration-error")
@@ -1332,7 +1344,8 @@ class RunnerTests(unittest.TestCase):
                         self.home / ".local/state/cross-harness", run, worktree
                     )
         finally:
-            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+            if worktree.exists():
+                subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
 
     def test_adopt_rejects_when_shared_worktree_marker_cannot_be_read(self):
         runtime_root = self.home / ".local/state/cross-harness"
@@ -1396,7 +1409,8 @@ class RunnerTests(unittest.TestCase):
             records = json.loads(records_path.read_text())
             self.assertEqual("parallel", records[str(self.repo.resolve())]["parallel.txt"])
         finally:
-            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+            if worktree.exists():
+                subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
 
     def test_adopt_reports_conflicts_without_changing_root_worktree(self):
         run, worktree = self._adopt_fixture("adopt-conflict")
@@ -1409,7 +1423,8 @@ class RunnerTests(unittest.TestCase):
 
             self.assertEqual("user\n", (self.repo / "README.md").read_text())
         finally:
-            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+            if worktree.exists():
+                subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
 
     def test_adopt_blocks_when_root_lock_is_owned(self):
         run, worktree = self._adopt_fixture("adopt-lock")
@@ -1424,7 +1439,8 @@ class RunnerTests(unittest.TestCase):
                 runner._release_root_lock(runtime_root, self.repo)
             self.assertFalse((self.repo / "new.txt").exists())
         finally:
-            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+            if worktree.exists():
+                subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
 
     def test_adopt_rolls_back_when_post_write_verification_reports_missing_paths(self):
         run, worktree = self._adopt_fixture("adopt-missing-path")
@@ -1441,7 +1457,8 @@ class RunnerTests(unittest.TestCase):
 
             self.assertFalse((self.repo / "new.txt").exists())
         finally:
-            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
+            if worktree.exists():
+                subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=self.repo, check=True)
 
     def test_last_declared_check_execution_controls_the_result(self):
         run = self.root / "last-check-execution-run"
@@ -2488,7 +2505,10 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
         invoke.side_effect = retry_in_same_worktree
         summary = retry(previous, self.task, config_path=config, home=self.home)
         retry_run = Path(summary["run_dir"])
-        self.assertEqual(str(worktree), (retry_run / "ISOLATED_WORKTREE").read_text().strip())
+        self.assertEqual("integrated", summary["integration"]["status"])
+        self.assertTrue((retry_run / "INTEGRATED").exists())
+        self.assertFalse(worktree.exists())
+        self.assertEqual("outside isolated worktree\n", (self.repo / "pre-existing.txt").read_text())
         self.assertEqual(2, invoke.call_count)
 
     @patch("cross_harness.runner.verify_codex_chatgpt")

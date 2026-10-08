@@ -295,18 +295,20 @@ def test_self_reversion_demotion_prevents_commit(execution, monkeypatch):
     assert git(execution["repo"], "rev-list", "--count", "HEAD") == "1"
 
 
-def test_isolated_run_keeps_existing_behavior(execution):
+def test_isolated_run_commits_and_integrates(execution):
     state = execution
     state["config"].write_text('dirty_worktree_policy = "isolate"\n')
     summary = delegate(state)
     run = Path(summary["run_dir"])
-    worktree = Path((run / "ISOLATED_WORKTREE").read_text().strip())
     assert summary["status"] == "success"
-    assert summary["commit"]["reason"] == "isolated worktree"
-    assert not (run / "WORK_BRANCH").exists()
-    assert git(state["repo"], "symbolic-ref", "--short", "HEAD") == "main"
+    assert summary["commit"]["status"] == "committed"
+    assert summary["integration"]["status"] == "integrated"
+    assert (run / "INTEGRATED").read_text().strip() == git(state["repo"], "rev-parse", "HEAD")
+    assert not (run / "ISOLATED_WORKTREE").exists()
+    assert not (run / "worktree").exists()
+    assert git(state["repo"], "symbolic-ref", "--short", "HEAD").startswith("cross-harness/")
     assert git(state["repo"], "status", "--porcelain") == ""
-    assert git(worktree, "status", "--porcelain") == "?? delegated.txt"
+    assert (state["repo"] / "delegated.txt").read_text() == "delegated\n"
 
 
 def test_read_only_role_has_no_commit_record_or_branch(execution, monkeypatch):
@@ -470,7 +472,7 @@ def test_branch_slug_is_bounded_ascii_with_run_name_fallback(execution, subject)
     state = execution
     state["task"].write_text(f"# Commit message\n{subject}\n# Checks\n- fixture\n")
     summary = delegate(state)
-    slug = summary["commit"]["branch"].split("/", 1)[1].split("-", 1)[1]
+    slug = summary["commit"]["branch"].split("/", 1)[1].split("-", 2)[2]
     assert len(slug) <= 40
     assert all(char in "abcdefghijklmnopqrstuvwxyz0123456789-" for char in slug)
     assert "--" not in slug

@@ -494,6 +494,17 @@ def render_summary(summary: dict, limit: int) -> str:
                     value = ", ".join(summary_item_text(item) for item in value) or "none"
                 commit_lines.append(f"commit_{key}: {summary_item_text(value)}")
         lines[4:4] = commit_lines
+    integration = summary.get("integration")
+    if isinstance(integration, dict):
+        lines.append(f"integration: {integration['status']}")
+        for key in ("sha", "unit_sha", "branch", "root", "conflicted_paths", "reason"):
+            if key in integration:
+                value = integration[key]
+                if isinstance(value, list):
+                    value = ", ".join(summary_item_text(item) for item in value) or "none"
+                lines.append(f"integration_{key}: {summary_item_text(value)}")
+    if "pending" in summary:
+        lines.append("pending: " + (", ".join(item["run_dir"] for item in summary["pending"]) or "none"))
     last_failed_command = summary.get("last_unrelated_failed_command")
     if isinstance(last_failed_command, dict):
         lines.append(

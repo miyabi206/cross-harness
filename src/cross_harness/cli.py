@@ -16,7 +16,7 @@ from .inventory import create_backup, inventory
 from .maintenance import cleanup
 from .paths import source_root, user_paths
 from .project import remove as remove_project, setup as setup_project
-from .runner import adopt, delegate, reply, retry, start_detached_delegate, wait_for_run
+from .runner import adopt, commit_run, delegate, discard, pending, reply, retry, start_detached_delegate, wait_for_run
 from .selfupdate import render as render_self_update, self_update
 from .taskfile import create_task_file
 from .trust import confirm_codex_hook
@@ -86,6 +86,18 @@ def parser() -> argparse.ArgumentParser:
     adopt_parser = commands.add_parser("adopt", help="apply an isolated worktree run to the root worktree")
     adopt_parser.add_argument("--run", required=True, type=Path)
     adopt_parser.add_argument("--config", type=Path)
+
+    discard_parser = commands.add_parser("discard", help="remove a finished isolated run's worktree")
+    discard_parser.add_argument("--run", required=True, type=Path)
+    discard_parser.add_argument("--config", type=Path)
+
+    commit_parser = commands.add_parser("commit", help="commit the recorded changes of a partial root run")
+    commit_parser.add_argument("--run", required=True, type=Path)
+    commit_parser.add_argument("--config", type=Path)
+
+    pending_parser = commands.add_parser("pending", help="list finished isolated runs awaiting resolution")
+    pending_parser.add_argument("--cwd", type=Path, default=Path.cwd())
+    pending_parser.add_argument("--config", type=Path)
 
     task_parser = commands.add_parser("task", help="create a credential-screened delegation task file")
     task_commands = task_parser.add_subparsers(dest="task_command", required=True)
@@ -237,6 +249,15 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "adopt":
             summary = adopt(args.run.resolve(), args.config, home)
             print(f"adopted {len(summary['changed_files'])} file(s) into {summary['root']}")
+        elif args.command == "discard":
+            result = discard(args.run.resolve(), args.config, home)
+            print(f"discarded worktree: {result['worktree']}")
+        elif args.command == "commit":
+            summary = commit_run(args.run.resolve(), args.config, home)
+            print(f"committed {summary['commit']['sha']}")
+        elif args.command == "pending":
+            for run in pending(args.cwd.resolve(), args.config, home):
+                print(f"{run['run_dir']}\t{run['status']}\t{run['worktree']}")
         elif args.command == "task":
             if args.task_command == "create":
                 path = create_task_file(
