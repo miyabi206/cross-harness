@@ -19,7 +19,8 @@ remain aligned.
   `danger-full-access`.
 
 `projects."/absolute/path"` may set only `checks`, `delegate_kinds`,
-`dirty_worktree_policy`, `mode`, and `project_auto_setup`. It cannot select a
+`dirty_worktree_policy`, `mode`, `project_auto_setup`, `auto_commit`, and
+`protected_branches`. It cannot select a
 model, authentication method, or sandbox. The most specific matching project
 path wins.
 
@@ -35,6 +36,25 @@ globally or in a project override. Do not edit the working tree while a
 delegated write run is executing: a concurrent user edit can be observed as
 that run's delta and recorded as delegated, so this policy depends on that
 operational discipline.
+
+## Automatic commits and work branches
+
+These settings are loaded and validated now; runtime handling will be added in
+a later unit. `auto_commit` is a boolean defaulting to `true`, configuring each
+successful write delegation to become one commit. `protected_branches` defaults
+to `["main", "master"]` and lists branches that never receive automatic commits.
+It accepts a unique array of non-empty strings, including an empty array.
+Both settings may be overridden per project; the closest matching project's
+value wins over the global value. If that project omits a setting, the global
+value applies.
+
+`work_branch_prefix` defaults to `"cross-harness/"` and names the branch created
+when a write delegation starts on a protected branch. It is global only and
+must be a non-empty string ending in `/`. Each slash-separated component must
+be non-empty, contain only ASCII letters, digits, `.`, `_`, or `-`, start with
+neither `.` nor `-`, end with neither `.` nor `.lock`, and contain no `..`.
+Older personal configurations inherit all three defaults without being rewritten;
+the inherited keys appear in the defaulted paths.
 
 ## Enforcement mode
 
@@ -59,7 +79,9 @@ budget or auto-escalate the model. Once the round count reaches this limit,
 only the limit check and still increments `discussion_rounds`. Older personal
 configurations inherit 3 through default merging without being rewritten.
 The top-level `max_parallel` is an enforced runtime limit across all delegated
-runs. Each non-orchestrator role's `max_parallel` is also enforced separately;
+runs and defaults to 4. Role limits default to 3 for explorer and implementer,
+2 for reviewer, and 1 for every other role. Global and role limits accept
+integers from 1 to 5. Each non-orchestrator role's `max_parallel` is also enforced separately;
 when either limit is full, the delegation is recorded as blocked immediately
 without waiting or queueing.
 Parallel capacity is counted from non-terminal runs whose supervisor is alive; an executor left alive after its supervisor exits does not consume capacity. PID identity is not verified, so a reused PID may be conservatively counted until the run is marked `ORPHANED` or exceeds `retention_days`.

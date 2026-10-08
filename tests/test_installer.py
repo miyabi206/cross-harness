@@ -196,7 +196,7 @@ class InstallerTests(unittest.TestCase):
             installed_skill = (home / ".claude/skills/cross-harness-orchestrator/SKILL.md").read_text()
             self.assertIn(str(home.resolve() / ".local/bin/cross-harness"), installed_skill)
             self.assertNotIn("{{CROSS_HARNESS_BIN}}", installed_skill)
-            self.assertIn("configured limit of 2", installed_skill)
+            self.assertIn("configured limit of 4", installed_skill)
             self.assertNotIn("{{MAX_PARALLEL}}", installed_skill)
             for installed in (home / ".claude").rglob("*"):
                 if installed.is_file():
@@ -577,7 +577,7 @@ class InstallerTests(unittest.TestCase):
             config.write_text(
                 contents
                 .replace("context_threshold_percent = 70", "context_threshold_percent = 63")
-                .replace("max_parallel = 2", "max_parallel = 5"),
+                .replace("max_parallel = 4", "max_parallel = 5"),
                 encoding="utf-8",
             )
             config.write_text(
@@ -926,8 +926,8 @@ class InstallerTests(unittest.TestCase):
             config.parent.mkdir(parents=True)
             contents = 'retention_days = 14\n[roles.tester]\ntimeout_seconds = 321\n'
             config.write_text(contents, encoding="utf-8")
-            # The partial config supplies two of 86 default leaf settings.
-            expected_defaulted_count = 84
+            # The partial config supplies two of 89 default leaf settings.
+            expected_defaulted_count = 87
             expected_default_action = "default: roles.tester.model"
 
             dry_run_actions = install(home, repo, dry_run=True)

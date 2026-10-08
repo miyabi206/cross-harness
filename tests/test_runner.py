@@ -2858,7 +2858,7 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
         config = self.root / "claude-retry.toml"
         default = (Path(__file__).resolve().parents[1] / "config/default.toml").read_text()
         config.write_text(default.replace(
-            '[roles.reviewer]\nharness = "claude"\nmodel = "opus"\neffort = "high"\nmax_parallel = 1\nretries = 0',
+            '[roles.reviewer]\nharness = "claude"\nmodel = "opus"\neffort = "high"\nmax_parallel = 2\nretries = 0',
             '[roles.reviewer]\nharness = "claude"\nmodel = "sonnet"\neffort = "high"\nmax_parallel = 1\nretries = 2',
             1,
         ))

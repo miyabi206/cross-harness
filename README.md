@@ -176,7 +176,8 @@ afterward:
 ```
 
 Project overrides accept only `checks`, `delegate_kinds`,
-`dirty_worktree_policy`, `mode`, and `project_auto_setup`; the most specific matching path wins,
+`dirty_worktree_policy`, `mode`, `project_auto_setup`, `auto_commit`, and
+`protected_branches`; the most specific matching path wins,
 `mode = "off"` excludes that repository from enforcement, and models,
 authentication, and sandbox settings cannot be overridden.
 
