@@ -145,6 +145,8 @@ it to another project by pointing these two delegation commands at it:
   --cwd /path/to/repository \
   --goal "Implement the requested change" \
   --done-when "The requested change is complete" \
+  --scope path/to/changed/file \
+  --commit-message "fix: implement the requested change" \
   --check "scripts/test.sh"
 ~/.local/bin/cross-harness delegate \
   --role implementer \
@@ -168,12 +170,39 @@ isolate it, add this project override to
 dirty_worktree_policy = "isolate"
 ```
 
-`isolate` runs the write role in a separate worktree; import its results
-afterward:
+With `auto_commit = true` (the default), a successful write run with a passing
+declared check becomes one unit commit. Before a root write run on a protected
+branch or detached HEAD, the wrapper creates a work branch under
+`work_branch_prefix` (default `cross-harness/`). It never pushes or merges into
+a protected branch; merging the work branch is left to the user.
+
+`isolate` runs the writer in a detached worktree containing tracked files only.
+Successful unit commits integrate automatically into the root work branch.
+The summary's `commit`, `integration`, and `pending` lines show the outcome:
+`integrated` means the commit reached the root, `conflict` means cherry-picking
+conflicted, `failed` records another integration error, and `pending` means
+integration is still outstanding. Integration refuses staged root changes,
+unfinished Git operations, and collisions with dirty or ignored root paths;
+unrelated unstaged changes are preserved. Concurrent units must touch disjoint
+paths, with shared files assigned to one unit or a later sequential unit.
+
+Resolve retained runs with these commands before the next wave or reporting:
 
 ```sh
 ~/.local/bin/cross-harness adopt --run <run_dir>
+~/.local/bin/cross-harness discard --run <run_dir>
+~/.local/bin/cross-harness commit --run <partial_root_run_dir>
+~/.local/bin/cross-harness pending --cwd /path/to/repository
 ```
+
+`adopt` retries a committed unit's integration after its cause is removed;
+`discard` removes an abandoned isolated worktree. After a conflict, delegate
+the unit sequentially citing its kept commit, then discard the conflicted run.
+`commit` commits a partial root run whose recorded changes were verified another
+way. Resolved worktrees receive `INTEGRATED`, `ADOPTED` (uncommitted file adoption),
+or `DISCARDED` markers. `pending` lists finished isolated runs whose worktrees
+remain; it must be empty before reporting. SessionStart reminds the orchestrator
+of these runs for the current repository.
 
 Project overrides accept only `checks`, `delegate_kinds`,
 `dirty_worktree_policy`, `mode`, `project_auto_setup`, `auto_commit`, and
@@ -227,9 +256,10 @@ because its session-start hook synchronizes
 `~/.claude/agents/cross-harness-*.md`. `orchestrator` is the session itself,
 so its `model` and `effort` settings currently have no effect.
 
-The implementer effort expanded into the orchestrator `SKILL.md` is fixed only
-when `install` runs. Changing the configuration without reinstalling leaves
-the previously installed value in place.
+The implementer effort, global parallel limit, and per-role parallel limits
+expanded into the orchestrator `SKILL.md` are fixed when `install` runs.
+Changing the configuration without reinstalling leaves the installed values
+in place; runtime limits use the current configuration.
 
 Check the configuration with:
 

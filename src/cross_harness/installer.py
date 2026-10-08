@@ -164,11 +164,13 @@ def _template(
     context_threshold_percent: int,
     max_parallel: int,
     implementer_effort: str,
+    role_parallel_limits: str,
 ) -> str:
     return (
         text.replace("{{CROSS_HARNESS_BIN}}", str(executable))
         .replace("{{CONTEXT_THRESHOLD_PERCENT}}", str(context_threshold_percent))
         .replace("{{MAX_PARALLEL}}", str(max_parallel))
+        .replace("{{ROLE_PARALLEL_LIMITS}}", role_parallel_limits)
         .replace("{{IMPLEMENTER_EFFORT}}", implementer_effort)
     )
 
@@ -179,6 +181,7 @@ def _materialize_templates(
     context_threshold_percent: int,
     max_parallel: int,
     implementer_effort: str,
+    role_parallel_limits: str,
 ) -> None:
     candidates = [path] if path.is_file() else [item for item in path.rglob("*") if item.is_file()]
     for candidate in candidates:
@@ -186,7 +189,7 @@ def _materialize_templates(
             text = candidate.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
-        rendered = _template(text, executable, context_threshold_percent, max_parallel, implementer_effort)
+        rendered = _template(text, executable, context_threshold_percent, max_parallel, implementer_effort, role_parallel_limits)
         if rendered != text:
             atomic_write(candidate, rendered, candidate.stat().st_mode & 0o777)
 
@@ -402,11 +405,13 @@ def _merge_markdown(
     context_threshold_percent: int,
     max_parallel: int,
     implementer_effort: str,
+    role_parallel_limits: str,
 ) -> None:
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
     content = "\n\n".join(
         _template(
-            source.read_text(encoding="utf-8"), executable, context_threshold_percent, max_parallel, implementer_effort
+            source.read_text(encoding="utf-8"), executable, context_threshold_percent, max_parallel, implementer_effort,
+            role_parallel_limits,
         ).rstrip()
         for source in sources
     )
@@ -818,6 +823,11 @@ def _install(
         _finish_record(config_record, paths.config)
         records.append(config_record)
 
+    role_parallel_limits = ", ".join(
+        f"{name}: {role['max_parallel']}"
+        for name, role in config["roles"].items()
+        if name != "orchestrator"
+    )
     shared = repo / "assets/shared/safety.md"
     if previous_manifest:
         for path in (paths.claude / "CLAUDE.md", paths.codex / "AGENTS.md"):
@@ -827,11 +837,13 @@ def _install(
         paths.claude / "CLAUDE.md", [repo / "assets/claude/CLAUDE.md", shared], paths,
         backup_root, records, paths.executable, config["context_threshold_percent"], config["max_parallel"],
         config["roles"]["implementer"]["effort"],
+        role_parallel_limits,
     )
     _merge_markdown(
         paths.codex / "AGENTS.md", [repo / "assets/codex/AGENTS.md", shared], paths,
         backup_root, records, paths.executable, config["context_threshold_percent"], config["max_parallel"],
         config["roles"]["implementer"]["effort"],
+        role_parallel_limits,
     )
 
     settings = paths.claude / "settings.json"
@@ -874,6 +886,7 @@ def _install(
             config["context_threshold_percent"],
             config["max_parallel"],
             config["roles"]["implementer"]["effort"],
+            role_parallel_limits,
         )
         _finish_record(record, destination)
         records.append(record)

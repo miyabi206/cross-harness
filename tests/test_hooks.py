@@ -179,6 +179,87 @@ class HookTests(unittest.TestCase):
         repo.mkdir(parents=True, exist_ok=True)
         subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
 
+    def _isolated_run(self, runtime, repo, name, status):
+        run_dir = runtime / "runs" / name
+        run_dir.mkdir(parents=True)
+        worktree = run_dir / "worktree"
+        subprocess.run(
+            ["git", "worktree", "add", "--detach", str(worktree)],
+            cwd=repo, check=True, capture_output=True,
+        )
+        (run_dir / "ISOLATED_WORKTREE").write_text(str(worktree), encoding="utf-8")
+        (run_dir / "summary.json").write_text(json.dumps({"status": status}), encoding="utf-8")
+        (run_dir / "summary.txt").write_text(f"status: {status}\n", encoding="utf-8")
+        return run_dir
+
+    def test_session_start_lists_only_finished_retained_runs_of_current_repository(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            home, repo, other, runtime = (root / name for name in ("home", "repo", "other", "runtime"))
+            self._session_config(home, runtime, project_auto_setup=False)
+            for repository in (repo, other):
+                self._init_repo(repository)
+                subprocess.run(
+                    ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                     "commit", "--allow-empty", "-m", "initial"],
+                    cwd=repository, check=True, capture_output=True,
+                )
+            statuses = ("success", "failed", "blocked", "partial", "discussion")
+            retained = [self._isolated_run(runtime, repo, status, status) for status in statuses]
+            running = self._isolated_run(runtime, repo, "running", "running")
+            foreign = self._isolated_run(runtime, other, "foreign", "partial")
+            removed = self._isolated_run(runtime, repo, "removed", "partial")
+            subprocess.run(
+                ["git", "worktree", "remove", str(removed / "worktree")],
+                cwd=repo, check=True, capture_output=True,
+            )
+            # An unreadable prior summary must not hide other pending units.
+            damaged = self._isolated_run(runtime, repo, "damaged", "partial")
+            (damaged / "summary.json").write_text("invalid JSON", encoding="utf-8")
+            nested = repo / "src"
+            nested.mkdir()
+            code, output = self._start_session(home, nested)
+
+            self.assertEqual(0, code)
+            block = output.split("<cross-harness-session>", 1)[1].split("</cross-harness-session>", 1)[0]
+            for run_dir, status in zip(retained, statuses):
+                self.assertIn(f"Pending isolated run: {run_dir} (status: {status})", block)
+            self.assertEqual(len(statuses), block.count("Pending isolated run:"))
+            for run_dir in (running, foreign, removed, damaged):
+                self.assertNotIn(str(run_dir), block)
+            self.assertIn(f"{home}/.local/bin/cross-harness adopt --run <run_dir>", block)
+            self.assertIn(f"{home}/.local/bin/cross-harness discard --run <run_dir>", block)
+
+    def test_session_start_pending_reminder_is_silent_without_runs_or_git_repository(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home, repo, outside = (root / name for name in ("home", "repo", "outside"))
+            self._session_config(home, root / "runtime", project_auto_setup=False)
+            self._init_repo(repo)
+            outside.mkdir()
+            for cwd in (repo, outside):
+                with self.subTest(cwd=cwd):
+                    code, output = self._start_session(home, cwd)
+                    self.assertEqual(0, code)
+                    self.assertNotIn("Pending isolated run:", output)
+                    self.assertNotIn("adopt --run", output)
+                    self.assertNotIn("discard --run", output)
+
+    def test_session_start_pending_collection_failures_are_silent_and_fail_open(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home, repo = root / "home", root / "repo"
+            self._session_config(home, root / "runtime", project_auto_setup=False)
+            self._init_repo(repo)
+            for error in (OSError("unreadable runs"), RuntimeError("bad pending data")):
+                with self.subTest(error=error), patch("cross_harness.hooks.pending", side_effect=error) as collect:
+                    code, output = self._start_session(home, repo)
+                    self.assertEqual(0, code)
+                    collect.assert_called_once_with(repo, home=home.resolve())
+                    self.assertNotIn(str(error), output)
+                    self.assertNotIn("Pending isolated run:", output)
+                    self.assertNotIn("adopt --run", output)
+
     def test_session_start_installs_task_and_excludes_it_from_git_status(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

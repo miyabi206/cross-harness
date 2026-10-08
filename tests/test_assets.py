@@ -102,9 +102,31 @@ class AssetTests(unittest.TestCase):
 
     def test_orchestrator_uses_template_for_every_wrapper_action(self):
         skill = (source_root() / "assets/claude/skills/cross-harness-orchestrator/SKILL.md").read_text()
-        for action in ("task create", "delegate", "retry", "reply"):
+        for action in ("task create", "delegate", "retry", "reply", "wait", "adopt", "discard", "commit", "pending"):
             self.assertIn(f"{{{{CROSS_HARNESS_BIN}}}} {action}", skill)
-        self.assertIsNone(re.search(r"`cross-harness (?:task|delegate|retry|reply)", skill))
+        self.assertIsNone(re.search(r"`cross-harness (?:task|delegate|retry|reply|wait|adopt|discard|commit|pending)", skill))
+
+    def test_orchestrator_unit_workflow_and_resolution_contract(self):
+        skill = (source_root() / "assets/claude/skills/cross-harness-orchestrator/SKILL.md").read_text()
+        normalized = " ".join(skill.split())
+        for phrase in (
+            "each become one commit", "list exact paths in Scope",
+            "must touch disjoint paths", "dependent units run in order",
+            "{{MAX_PARALLEL}}", "{{ROLE_PARALLEL_LIMITS}}",
+            "explorer runs before planning", "failure that survived a retry",
+            "reviewer runs per unit commit", "never while a writer is running",
+            "tracked files only", "name the setup command",
+            "--commit-message", "git show --stat <sha>", "git show <sha>",
+            "Integration conflict", "kept unit commit sha",
+            "Integration failed or pending", "verified another way",
+            "Abandoned isolated run", "pending line must show `none`",
+            "sha and subject", "merging that branch is the only step left",
+            "commit it yourself as one commit", "never leave it uncommitted",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, normalized)
+        self.assertNotIn("sequentially by default", skill)
+        self.assertNotIn("git diff --stat", skill)
 
     def test_all_executor_assets_include_discussion_policy_and_contract(self):
         root = source_root() / "assets"

@@ -11,8 +11,41 @@
 3. Let Claude create the bounded task file and call only `cross-harness
    delegate`. Inspect `summary.txt`; open raw logs only around an unresolved
    failure.
+   Resolve any finished isolated runs listed at SessionStart before reporting;
+   the reminder is silent when none remain and collection failures do not block
+   the session.
 4. At each phase boundary, migrate to a new session when context use reaches
    the configured threshold (70 percent by default).
+
+## Unit commits and parallel waves
+
+Split a change into independently verifiable single-commit units with exact
+Scope paths and an executable check. Delegate independent units in parallel
+waves with disjoint paths; dependent units run in order. Assign shared files
+(lockfiles, registries, schemas, generated files and configuration) to one unit
+or a later sequential unit. Respect both global and per-role parallel limits.
+Pass a one-line `--commit-message` in the repository's commit style on every
+write task. A write run without a passing declared check is partial and is not
+committed.
+
+The first writer uses the root worktree; concurrent writers use isolated
+worktrees containing tracked files only. Under `stop`, writers run sequentially;
+under `isolate`, every writer is isolated. Name dependency installation or other
+untracked setup in the task if a check needs it, or run the unit sequentially.
+With automatic commits enabled, the wrapper first moves a root writer off a
+protected branch or detached HEAD to a work branch under `work_branch_prefix`,
+then commits each successful write run as one unit. Successful isolated commits
+are cherry-picked onto the root work branch under its lock.
+
+Inspect unit commits with `git show --stat <sha>` and `git show <sha>` because
+the worktree is clean after committing. Resolve every unit before another wave,
+reviewer, tester, or report; tester checks the root and must never run alongside
+a writer. Report the work branch, each unit commit sha and subject, verification,
+and unresolved items. Merging the work branch is the user's remaining step.
+The wrapper never pushes or merges into a protected branch. Do not commit,
+merge, rebase, push, delete branches or run worktree commands by hand for
+delegated work. A direct edit is also one unit: after mandatory review and tester
+verification, the orchestrator commits it on the work branch itself.
 
 ## Watching a delegated run
 
@@ -130,7 +163,8 @@ Stop delegation immediately for any of the following:
 - user or project Codex config selects a non-OpenAI provider or custom base URL;
 - a rate or usage limit is reported;
 - a delegated run attempts to start Claude or another Codex executor;
-- a write task finds a dirty worktree under the default `stop` policy;
+- a write task finds unrecorded dirty changes under `allow_delegated`, or any
+  dirty changes under `stop`;
 - two identical failures have already triggered the single escalation run;
 - a high-risk task lacks explicit human confirmation.
 
@@ -184,9 +218,47 @@ write delegation and has not changed since. Otherwise, the wrapper stops the
 write role so the worktree can be reviewed before continuing.
 
 With `dirty_worktree_policy="isolate"`, the wrapper creates a detached Git
-worktree below the run directory and records it in `ISOLATED_WORKTREE`. Review
-and transfer its commit or patch explicitly. Cleanup does not remove a retained
-isolated worktree before the run's seven-day retention window.
+worktree below the run directory and records it in `ISOLATED_WORKTREE`.
+Successful unit commits integrate automatically. Cleanup does not remove a
+retained isolated worktree before the run's seven-day retention window.
+
+The summary's `commit` line describes the unit commit, `integration` describes
+its root integration, and `pending` lists finished isolated runs with remaining
+worktrees. Integration statuses mean:
+
+- `integrated`: unit commits reached the root work branch; successful cleanup
+  removes the worktree and writes `INTEGRATED`.
+- `conflict`: cherry-picking conflicted; the wrapper rolls back and keeps the
+  isolated unit. Delegate that unit again sequentially, citing its kept commit
+  sha so the executor can read it, then discard the conflicted run.
+- `failed`: another integration error; remove the stated cause and use `adopt`.
+- `pending`: integration is outstanding, for example after a root lock timeout
+  or an uncommitted unit; resolve the cause and use `adopt` or retry as appropriate.
+
+Integration refuses any staged root changes or unfinished Git operation. Dirty
+and ignored paths must not collide with any unit path, including parent/child
+paths; unrelated unstaged changes are preserved. This collision rule is why
+parallel units must have disjoint paths. Conflicts and failures retain the
+isolated worktree; successful integration can also leave a cleanup warning
+and a pending worktree that still needs resolving.
+
+```sh
+~/.local/bin/cross-harness adopt --run <run_dir>
+~/.local/bin/cross-harness discard --run <run_dir>
+~/.local/bin/cross-harness commit --run <partial_root_run_dir>
+~/.local/bin/cross-harness pending --cwd /path/to/repository
+```
+
+`adopt` retries committed integration under the root lock; it refuses a live
+run or a discussion awaiting a reply. For an uncommitted isolated result, it
+requires matching root and isolated HEADs and checks for file conflicts before
+copying changes, then writes `ADOPTED`. `discard` removes an abandoned isolated
+worktree and writes `DISCARDED`. Resolution also updates runs sharing the
+worktree through a retry chain. `commit` commits a finalized partial root write
+run with a skipped or failed commit after verification another way; it checks
+recorded file fingerprints and refuses changed evidence. Otherwise retry the
+unit. The last summary must say `pending: none`, or `pending` must return no
+entries, before reporting.
 
 With `dirty_worktree_policy="allow"`, write delegations and retries run in the
 current worktree even when it contains uncommitted changes. The wrapper still

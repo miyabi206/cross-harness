@@ -18,6 +18,7 @@ from .paths import user_paths
 from .project import is_auto_setup_disabled, setup as setup_project
 from .installer import synchronize_claude_agent_roles, synchronize_codex_agent_roles
 from .selfupdate import self_update
+from .runner import pending
 from .taskfile import contains_secret
 
 
@@ -534,6 +535,20 @@ def claude_session_start(home: Path | None = None) -> int:
         cleanup(home=paths.home)
     except Exception as exc:  # hooks must not hide the session for maintenance failure
         warnings.append(f"runtime cleanup warning: {exc}")
+    try:
+        unresolved = pending(Path((data or {}).get("cwd", os.getcwd())), home=paths.home)
+        if unresolved:
+            reminders = [
+                f"Pending isolated run: {run['run_dir']} (status: {run['status']})"
+                for run in unresolved
+            ]
+            reminders.append(
+                f"Resolve with `{paths.executable} adopt --run <run_dir>` or "
+                f"`{paths.executable} discard --run <run_dir>` before reporting."
+            )
+            warnings.extend(reminders)
+    except Exception:  # pending-run collection must be silent and fail open
+        pass
     state_file = paths.home / ".local/state/cross-harness/session/latest.json"
     if state_file.exists():
         try:

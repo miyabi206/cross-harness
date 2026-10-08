@@ -198,10 +198,16 @@ class InstallerTests(unittest.TestCase):
             self.assertNotIn("{{CROSS_HARNESS_BIN}}", installed_skill)
             self.assertIn("configured limit of 4", installed_skill)
             self.assertNotIn("{{MAX_PARALLEL}}", installed_skill)
+            self.assertIn(
+                "per-role limits: explorer: 3, implementer: 3, implementer_complex: 1, "
+                "tester: 1, reviewer: 2, debugger: 1, security_reviewer: 1",
+                installed_skill,
+            )
             for installed in (home / ".claude").rglob("*"):
                 if installed.is_file():
                     self.assertNotIn("{{CONTEXT_THRESHOLD_PERCENT}}", installed.read_text(encoding="utf-8"))
                     self.assertNotIn("{{MAX_PARALLEL}}", installed.read_text(encoding="utf-8"))
+                    self.assertNotIn("{{ROLE_PARALLEL_LIMITS}}", installed.read_text(encoding="utf-8"))
             explorer = (home / ".claude/agents/cross-harness-explorer.md").read_text()
             reviewer = (home / ".claude/agents/cross-harness-reviewer.md").read_text()
             self.assertIn("model: haiku", explorer)
@@ -577,7 +583,8 @@ class InstallerTests(unittest.TestCase):
             config.write_text(
                 contents
                 .replace("context_threshold_percent = 70", "context_threshold_percent = 63")
-                .replace("max_parallel = 4", "max_parallel = 5"),
+                .replace("max_parallel = 4", "max_parallel = 5")
+                .replace("max_parallel = 3", "max_parallel = 2"),
                 encoding="utf-8",
             )
             config.write_text(
@@ -593,7 +600,10 @@ class InstallerTests(unittest.TestCase):
                 repo / "assets/claude/skills/cross-harness-orchestrator/SKILL.md",
                 repo / "assets/claude/agents/explorer.md",
             ):
-                source.write_text(source.read_text(encoding="utf-8") + "\nThreshold: {{CONTEXT_THRESHOLD_PERCENT}}\n", encoding="utf-8")
+                source.write_text(
+                    source.read_text(encoding="utf-8") + "\nThreshold: {{CONTEXT_THRESHOLD_PERCENT}}\n"
+                    + "Role limits: {{ROLE_PARALLEL_LIMITS}}\n", encoding="utf-8"
+                )
             codex_agents = repo / "assets/codex/AGENTS.md"
             codex_agents.write_text(codex_agents.read_text(encoding="utf-8") + "\nParallel limit: {{MAX_PARALLEL}}\n", encoding="utf-8")
             skill = repo / "assets/claude/skills/cross-harness-orchestrator/SKILL.md"
@@ -610,6 +620,13 @@ class InstallerTests(unittest.TestCase):
                 content = installed.read_text(encoding="utf-8")
                 self.assertIn("Threshold: 63", content)
                 self.assertNotIn("{{CONTEXT_THRESHOLD_PERCENT}}", content)
+                self.assertIn(
+                    "Role limits: explorer: 2, implementer: 2, implementer_complex: 1, "
+                    "tester: 1, reviewer: 2, debugger: 1, security_reviewer: 1",
+                    content,
+                )
+                self.assertNotIn("{{ROLE_PARALLEL_LIMITS}}", content)
+                self.assertNotIn("orchestrator:", content)
             codex_content = (home / ".codex/AGENTS.md").read_text(encoding="utf-8")
             self.assertIn("Parallel limit: 5", codex_content)
             self.assertNotIn("{{MAX_PARALLEL}}", codex_content)
