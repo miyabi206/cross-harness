@@ -178,6 +178,8 @@ a protected branch; merging the work branch is left to the user.
 
 `isolate` runs the writer in a detached worktree containing tracked files only.
 Successful unit commits integrate automatically into the root work branch.
+The root is the launching worktree, including a linked worktree; other worktrees
+are left untouched.
 The summary's `commit`, `integration`, and `pending` lines show the outcome:
 `integrated` means the commit reached the root, `conflict` means cherry-picking
 conflicted, `failed` records another integration error, and `pending` means
@@ -191,15 +193,17 @@ Resolve retained runs with these commands before the next wave or reporting:
 ```sh
 ~/.local/bin/cross-harness adopt --run <run_dir>
 ~/.local/bin/cross-harness discard --run <run_dir>
-~/.local/bin/cross-harness commit --run <partial_root_run_dir>
+~/.local/bin/cross-harness commit --run <partial_run_dir>
 ~/.local/bin/cross-harness pending --cwd /path/to/repository
 ```
 
-`adopt` retries a committed unit's integration after its cause is removed;
-`discard` removes an abandoned isolated worktree. After a conflict, delegate
-the unit sequentially citing its kept commit, then discard the conflicted run.
-`commit` commits a partial root run whose recorded changes were verified another
-way. Resolved worktrees receive `INTEGRATED`, `ADOPTED` (uncommitted file adoption),
+For a committed unit whose integration failed, conflicted or is pending, remove
+the cause and use `adopt`. For a partial unit verified another way, root or
+isolated, use `commit`; an isolated unit is committed and integrated. For a
+failed isolated unit, retry or discard. `discard` removes an abandoned isolated
+worktree. Adopting or discarding an already integrated unit only completes
+cleanup and preserves the integrated result. Resolved worktrees receive
+`INTEGRATED`, `ADOPTED` (uncommitted file adoption),
 or `DISCARDED` markers. `pending` lists finished isolated runs whose worktrees
 remain; it must be empty before reporting. SessionStart reminds the orchestrator
 of these runs for the current repository.

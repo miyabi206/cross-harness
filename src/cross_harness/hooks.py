@@ -543,8 +543,10 @@ def claude_session_start(home: Path | None = None) -> int:
                 for run in unresolved
             ]
             reminders.append(
-                f"Resolve with `{paths.executable} adopt --run <run_dir>` or "
-                f"`{paths.executable} discard --run <run_dir>` before reporting."
+                f"Resolve with `{paths.executable} adopt --run <run_dir>` after removing "
+                "the cause of a committed unit's failed, conflicted or pending integration. "
+                f"For a partial unit verified another way, root or isolated, use `{paths.executable} commit --run <run_dir>`. "
+                f"For a failed isolated unit, retry or `{paths.executable} discard --run <run_dir>` before reporting."
             )
             warnings.extend(reminders)
     except Exception:  # pending-run collection must be silent and fail open

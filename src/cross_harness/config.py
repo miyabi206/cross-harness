@@ -166,8 +166,8 @@ def validate(config: dict) -> list[str]:
         errors.append("auto_commit: expected boolean")
     if "work_branch_prefix" in config and not _work_branch_prefix(config["work_branch_prefix"]):
         errors.append("work_branch_prefix: expected non-empty slash-terminated prefix with safe branch components")
-    if "protected_branches" in config and not _string_list(config["protected_branches"], allow_empty=True):
-        errors.append("protected_branches: expected unique string array")
+    if "protected_branches" in config and not _literal_branches(config["protected_branches"]):
+        errors.append("protected_branches: expected unique string array; entries are literal short branch names")
     if not _string_list(config.get("delegate_kinds")):
         errors.append("delegate_kinds: expected a unique string array")
     elif unknown_kinds := set(config["delegate_kinds"]) - DELEGATE_KINDS:
@@ -250,8 +250,8 @@ def validate(config: dict) -> list[str]:
                 errors.append(f"{location}.project_auto_setup: expected boolean")
             if "auto_commit" in project and not isinstance(project["auto_commit"], bool):
                 errors.append(f"{location}.auto_commit: expected boolean")
-            if "protected_branches" in project and not _string_list(project["protected_branches"], allow_empty=True):
-                errors.append(f"{location}.protected_branches: expected unique string array")
+            if "protected_branches" in project and not _literal_branches(project["protected_branches"]):
+                errors.append(f"{location}.protected_branches: expected unique string array; entries are literal short branch names")
     return errors
 
 
@@ -275,6 +275,14 @@ def warnings(config: dict) -> list[str]:
                 f"roles.{name}.effort: {effort!r} is not a known {harness} effort value; passing through unchanged"
             )
     return messages
+
+
+def _literal_branches(value: object) -> bool:
+    return _string_list(value, allow_empty=True) and all(
+        not name.startswith("refs/")
+        and not any(char in "*?[]" or char.isspace() for char in name)
+        for name in value
+    )
 
 
 def _string_list(value: object, allow_empty: bool = False) -> bool:

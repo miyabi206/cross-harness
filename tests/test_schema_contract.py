@@ -80,7 +80,8 @@ class SchemaContractTests(unittest.TestCase):
     def test_commit_setting_schema_validation_matches_runtime(self):
         cases = {
             "auto_commit": (True, False, 1, "true", [], None),
-            "protected_branches": ([], ["main"], ["main", "master"], ["main", "main"], [""], [1], {}, "main", None),
+            "protected_branches": ([], ["main"], ["main", "master"], ["release/next"], ["main", "main"], [""], [1], {}, "main", None,
+                                   ["release/*"], ["main?"], ["[main]"], ["main]"], ["main branch"], ["main\t"], ["refs/heads/main"]),
             "work_branch_prefix": (
                 "cross-harness/", "a/", "_work/", "Team/branch-1.2_/", "a-/", "a.locked/",
                 "", "branch", "/", "/branch/", "branch//", "branch//nested/",

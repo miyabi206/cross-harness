@@ -117,6 +117,9 @@ writers block, so run sequentially. If a unit's check needs untracked setup such
 as installed dependencies, name the setup command in its task or run the unit
 sequentially. Successful isolated unit commits integrate automatically; resolve
 retained worktrees as described below.
+Nobody edits the root worktree while a writer is running, including direct
+edits: everything changed during a root run is attributed to that unit.
+The root is the launching worktree, including when it is a linked worktree.
 It prints the run directory first and then waits for the detached supervisor.
 If the foreground call is interrupted or times out, do not delegate again. Re-attach
 to that printed run with:
@@ -134,13 +137,13 @@ Before the next wave, tester or reviewer, and before reporting, resolve every un
 
 - Committed root unit or integrated isolated unit: done; resolve any cleanup
   warning that leaves a worktree pending too.
-- Integration conflict: delegate that unit again sequentially, citing the kept
-  unit commit sha so the executor can read it, then discard the conflicted run
-  with `{{CROSS_HARNESS_BIN}} discard --run <run_dir>`.
-- Integration failed or pending: remove the stated cause, then use
+- Committed unit whose integration failed, conflicted or is pending: remove
+  the stated cause, then use
   `{{CROSS_HARNESS_BIN}} adopt --run <run_dir>`.
-- Partial run whose root changes were verified another way: use
+- Partial unit verified another way, root or isolated: use
   `{{CROSS_HARNESS_BIN}} commit --run <run_dir>`; otherwise retry.
+- Failed isolated unit: retry or use
+  `{{CROSS_HARNESS_BIN}} discard --run <run_dir>`.
 - Abandoned isolated run: use `{{CROSS_HARNESS_BIN}} discard --run <run_dir>`.
 
 The last summary's pending line must show `none`, or confirm no entries with

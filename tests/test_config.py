@@ -214,7 +214,9 @@ class ConfigTests(unittest.TestCase):
     def test_invalid_commit_settings_raise_path_specific_load_errors(self):
         values = {
             "auto_commit": ("1", '"true"', "[]"),
-            "protected_branches": ('"main"', '["main", "main"]', '[""]', '[1]', '{}'),
+            "protected_branches": ('"main"', '["main", "main"]', '[""]', '[1]', '{}') + tuple(
+                json.dumps([name]) for name in ("release/*", "main?", "[main]", "main]", "main branch", "main\t", "refs/heads/main")
+            ),
             "work_branch_prefix": tuple(json.dumps(value) for value in (
                 "", "branch", "/", "/branch/", "branch//", "branch//nested/",
                 ".branch/", "-branch/", "branch/.nested/", "branch/-nested/",
@@ -235,6 +237,8 @@ class ConfigTests(unittest.TestCase):
                             with self.assertRaises(ConfigError) as raised:
                                 load_config(path, Path(folder))
                             self.assertIn(f"{expected_path}: expected", str(raised.exception))
+                            if key == "protected_branches":
+                                self.assertIn("entries are literal short branch names", str(raised.exception))
 
     def test_safe_work_branch_prefixes_and_empty_protected_branches_are_valid(self):
         for prefix in ("a/", "_work/", "cross-harness/", "Team/branch-1.2_/", "a-/", "a.locked/"):

@@ -91,7 +91,7 @@ def parser() -> argparse.ArgumentParser:
     discard_parser.add_argument("--run", required=True, type=Path)
     discard_parser.add_argument("--config", type=Path)
 
-    commit_parser = commands.add_parser("commit", help="commit the recorded changes of a partial root run")
+    commit_parser = commands.add_parser("commit", help="commit the recorded changes of a partial root or isolated run")
     commit_parser.add_argument("--run", required=True, type=Path)
     commit_parser.add_argument("--config", type=Path)
 
@@ -251,7 +251,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"adopted {len(summary['changed_files'])} file(s) into {summary['root']}")
         elif args.command == "discard":
             result = discard(args.run.resolve(), args.config, home)
-            print(f"discarded worktree: {result['worktree']}")
+            if result.get("integration", {}).get("status") == "integrated":
+                print(f"completed integrated worktree cleanup for {result['root']}")
+            else:
+                print(f"discarded worktree: {result['worktree']}")
         elif args.command == "commit":
             summary = commit_run(args.run.resolve(), args.config, home)
             print(f"committed {summary['commit']['sha']}")

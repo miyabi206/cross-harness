@@ -505,6 +505,8 @@ def render_summary(summary: dict, limit: int) -> str:
                 lines.append(f"integration_{key}: {summary_item_text(value)}")
     if "pending" in summary:
         lines.append("pending: " + (", ".join(item["run_dir"] for item in summary["pending"]) or "none"))
+    for error in summary.get("cleanup_errors", []):
+        lines.append(f"cleanup_error: {summary_item_text(error)}")
     last_failed_command = summary.get("last_unrelated_failed_command")
     if isinstance(last_failed_command, dict):
         lines.append(

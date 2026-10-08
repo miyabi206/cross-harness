@@ -229,6 +229,10 @@ class HookTests(unittest.TestCase):
                 self.assertNotIn(str(run_dir), block)
             self.assertIn(f"{home}/.local/bin/cross-harness adopt --run <run_dir>", block)
             self.assertIn(f"{home}/.local/bin/cross-harness discard --run <run_dir>", block)
+            self.assertIn(f"{home}/.local/bin/cross-harness commit --run <run_dir>", block)
+            self.assertIn("failed, conflicted or pending integration", block)
+            self.assertIn("partial unit verified another way, root or isolated", block)
+            self.assertIn("failed isolated unit, retry or", block)
 
     def test_session_start_pending_reminder_is_silent_without_runs_or_git_repository(self):
         with tempfile.TemporaryDirectory() as folder:

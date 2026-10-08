@@ -219,8 +219,9 @@ write role so the worktree can be reviewed before continuing.
 
 With `dirty_worktree_policy="isolate"`, the wrapper creates a detached Git
 worktree below the run directory and records it in `ISOLATED_WORKTREE`.
-Successful unit commits integrate automatically. Cleanup does not remove a
-retained isolated worktree before the run's seven-day retention window.
+Successful unit commits integrate automatically into the launching worktree,
+which is the root even when it is a linked worktree. Other worktrees are left
+untouched. Cleanup does not remove a retained isolated worktree before the run's seven-day retention window.
 
 The summary's `commit` line describes the unit commit, `integration` describes
 its root integration, and `pending` lists finished isolated runs with remaining
@@ -229,8 +230,7 @@ worktrees. Integration statuses mean:
 - `integrated`: unit commits reached the root work branch; successful cleanup
   removes the worktree and writes `INTEGRATED`.
 - `conflict`: cherry-picking conflicted; the wrapper rolls back and keeps the
-  isolated unit. Delegate that unit again sequentially, citing its kept commit
-  sha so the executor can read it, then discard the conflicted run.
+  isolated unit. Remove the cause and use `adopt`.
 - `failed`: another integration error; remove the stated cause and use `adopt`.
 - `pending`: integration is outstanding, for example after a root lock timeout
   or an uncommitted unit; resolve the cause and use `adopt` or retry as appropriate.
@@ -245,7 +245,7 @@ and a pending worktree that still needs resolving.
 ```sh
 ~/.local/bin/cross-harness adopt --run <run_dir>
 ~/.local/bin/cross-harness discard --run <run_dir>
-~/.local/bin/cross-harness commit --run <partial_root_run_dir>
+~/.local/bin/cross-harness commit --run <partial_run_dir>
 ~/.local/bin/cross-harness pending --cwd /path/to/repository
 ```
 
@@ -254,11 +254,14 @@ run or a discussion awaiting a reply. For an uncommitted isolated result, it
 requires matching root and isolated HEADs and checks for file conflicts before
 copying changes, then writes `ADOPTED`. `discard` removes an abandoned isolated
 worktree and writes `DISCARDED`. Resolution also updates runs sharing the
-worktree through a retry chain. `commit` commits a finalized partial root write
-run with a skipped or failed commit after verification another way; it checks
-recorded file fingerprints and refuses changed evidence. Otherwise retry the
-unit. The last summary must say `pending: none`, or `pending` must return no
-entries, before reporting.
+worktree through a retry chain. A committed unit whose integration failed,
+conflicted or is pending is resolved by removing the cause and adopting it.
+For a partial unit verified another way, root or isolated, use `commit`; it
+checks recorded file fingerprints, commits the unit, and integrates it if
+isolated. A failed isolated unit is resolved by retry or discard. Adopting or
+discarding an already integrated unit only completes cleanup and retains the
+integrated record. The last summary must say `pending: none`, or `pending` must
+return no entries, before reporting.
 
 With `dirty_worktree_policy="allow"`, write delegations and retries run in the
 current worktree even when it contains uncommitted changes. The wrapper still

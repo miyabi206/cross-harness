@@ -43,12 +43,17 @@ operational discipline.
 with a passing declared check becomes one unit commit. Write tasks supply a
 one-line `--commit-message` in the repository's commit style; missing passing
 check evidence makes the run partial and skips the commit. Runs with no changes
-skip committing too. With `allow`, pre-existing dirty paths are excluded from
-the commit, and unrelated staged changes are preserved. Setting `auto_commit`
+skip committing too. Fresh runs exclude all pre-existing dirty paths from
+the commit, even if the executor modifies them. Retry, reply and escalation
+may commit baseline paths changed by earlier runs of the same chain only.
+Unrelated staged changes are preserved. Setting `auto_commit`
 to `false` disables automatic branch creation, commits, and isolated integration;
 isolated results remain pending for explicit resolution. `protected_branches` defaults
 to `["main", "master"]` and lists branches that never receive automatic commits.
-It accepts a unique array of non-empty strings, including an empty array.
+It accepts a unique array of literal short branch names, including an empty
+array. Entries cannot contain `*`, `?`, square brackets, whitespace, or start
+with `refs/`. Setting the key replaces the default list: repeat `main` and
+`master` when adding other protected branches.
 Both settings may be overridden per project; the closest matching project's
 value wins over the global value. If that project omits a setting, the global
 value applies.
@@ -68,8 +73,10 @@ tracked files only, except under `stop`, which blocks them; `isolate` isolates
 every writer. Plan single-commit units with exact, disjoint paths and executable
 checks, assigning shared files to one unit or a later sequential unit. Name any
 untracked setup command in the task or run that unit sequentially.
-Successful isolated unit commits are cherry-picked automatically under the root
-lock. Integration refuses staged root changes, unfinished Git operations, and
+The root is the launching worktree, including a linked worktree; project
+settings resolve against its path. Successful isolated unit commits are
+cherry-picked automatically under that worktree's root lock. Integration refuses
+staged root changes, unfinished Git operations, and
 unit-path collisions with dirty or ignored root paths (including parent/child
 paths), while preserving unrelated unstaged changes.
 
@@ -79,9 +86,11 @@ retain the isolated worktree for resolution. `INTEGRATED` marks automatic or
 explicit committed integration, `ADOPTED` marks file-by-file adoption of
 uncommitted changes, and `DISCARDED` marks an abandoned isolated worktree.
 Use `cross-harness adopt --run <run_dir>` after removing an integration failure's
-cause, `cross-harness discard --run <run_dir>` for abandoned work, and
-`cross-harness commit --run <run_dir>` for a partial root run verified another
-way. `cross-harness pending --cwd <repo>` lists finished isolated runs whose
+cause (including conflicts), `cross-harness discard --run <run_dir>` for
+abandoned work, and `cross-harness commit --run <run_dir>` for a partial root
+or isolated run verified another way. Failed isolated units require retry or
+discard. Already integrated runs use adopt or discard only to finish cleanup.
+`cross-harness pending --cwd <repo>` lists finished isolated runs whose
 worktrees still exist; resolve them before the next wave, tester, reviewer, or
 report. SessionStart lists these runs for the current repository and stays
 silent about them if there are none or collection fails.

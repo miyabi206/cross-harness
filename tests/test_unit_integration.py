@@ -32,9 +32,12 @@ def worktree(summary):
 
 
 def snapshot(repo):
+    index = Path(git(repo, "rev-parse", "--git-path", "index"))
+    if not index.is_absolute():
+        index = repo / index
     return (
         git(repo, "rev-parse", "HEAD"), runner._current_branch(repo),
-        (repo / ".git/index").read_bytes(),
+        index.read_bytes(),
         {str(path.relative_to(repo)): runner._adopt_snapshot(path)
          for path in repo.rglob("*") if ".git" not in path.relative_to(repo).parts and not path.is_dir()},
     )
@@ -192,13 +195,24 @@ def test_integration_refuses_file_directory_prefix_collisions(isolated, root_dir
     assert not (Path(summary["run_dir"]) / "WORK_BRANCH").exists()
 
 
-def test_integration_refuses_unfinished_git_operation_without_mutation(isolated):
+def test_integration_refuses_unfinished_git_operation_without_mutation(isolated, monkeypatch):
     repo = isolated["repo"]
     marker = repo / ".git/CHERRY_PICK_HEAD"
-    marker.write_text(git(repo, "rev-parse", "HEAD") + "\n")
     before = snapshot(repo)
+
+    original = runner._git
+
+    def root_operation_after_unit_commit(cwd, args, timeout=30):
+        result = original(cwd, args, timeout)
+        if "commit" in args and result.returncode == 0:
+            marker.write_text(before[0] + "\n")
+        return result
+
+    monkeypatch.setattr(runner, "_git", root_operation_after_unit_commit)
     summary = delegate(isolated)
     assert summary["status"] == "partial"
+    assert summary["commit"]["status"] == "committed"
+    assert summary["integration"]["status"] == "failed"
     assert "unfinished Git operation" in summary["error"]
     assert snapshot(repo) == before
     assert marker.read_text().strip() == before[0]
@@ -226,6 +240,8 @@ def test_collision_check_includes_paths_reverted_by_a_later_unit_commit(isolated
 
 @pytest.mark.parametrize("cancelled_staging", [False, True])
 def test_empty_isolated_unit_still_removes_its_worktree(isolated, cancelled_staging):
+    before = snapshot(isolated["repo"])
+    branches = git(isolated["repo"], "branch", "--list")
     def change(cwd, run):
         if cancelled_staging:
             (cwd / "README.md").write_text("staged\n")
@@ -239,6 +255,8 @@ def test_empty_isolated_unit_still_removes_its_worktree(isolated, cancelled_stag
     assert summary["integration"]["status"] == "integrated"
     assert not (Path(summary["run_dir"]) / "worktree").exists()
     assert git(isolated["repo"], "rev-list", "--count", "HEAD") == "1"
+    assert snapshot(isolated["repo"]) == before
+    assert git(isolated["repo"], "branch", "--list") == branches
 
 
 def test_integration_waits_for_root_lock_only_after_unit_commit(isolated):
@@ -335,8 +353,9 @@ def test_failed_cherry_pick_restores_root(isolated, monkeypatch, failure, dirty)
     assert summary["integration"]["status"] == "failed"
     assert snapshot(isolated["repo"]) == before
     assert git(isolated["repo"], "branch", "--list") == branches_before
-    assert ["reset", "--keep" if dirty else "--hard", before[0]] in commands
-    assert commands.index(["cherry-pick", "--abort"]) < commands.index(["reset", "--keep" if dirty else "--hard", before[0]])
+    assert ["reset", "--keep", before[0]] in commands
+    assert commands.index(["cherry-pick", "--abort"]) < commands.index(["reset", "--keep", before[0]])
+    assert not any("--hard" in args for args in commands)
     assert any(args[:2] == ["branch", "--delete"] for args in commands)
     assert not any(args[:2] == ["branch", "-D"] for args in commands)
     assert worktree(summary).exists()
@@ -836,3 +855,353 @@ def test_work_branch_collision_uses_numeric_suffix(execution, monkeypatch):
     git(execution["repo"], "branch", "cross-harness/20261009-123456-implement-the-change")
     summary = delegate(execution)
     assert summary["commit"]["branch"] == "cross-harness/20261009-123456-implement-the-change-1"
+
+
+@pytest.fixture
+def linked(execution):
+    primary = execution["repo"]
+    launch = primary.parent / "linked"
+    git(primary, "worktree", "add", "-b", "launch", str(launch))
+    (primary / "user.txt").write_text("staged in primary\n")
+    git(primary, "add", "user.txt")
+    (primary / "user.txt").write_bytes(b"primary unstaged\x00\n")
+    (primary / "mine.txt").write_bytes(b"primary untracked\xff\n")
+    execution["primary"] = primary
+    execution["primary_snapshot"] = snapshot(primary)
+    execution["repo"] = launch
+    execution["config"].write_text(
+        'auto_commit = false\nprotected_branches = []\n'
+        f'[projects.{json.dumps(str(launch.resolve()))}]\n'
+        'auto_commit = true\nprotected_branches = ["launch"]\n'
+    )
+    return execution
+
+
+def test_linked_root_writer_uses_launch_branch_settings_and_lock(linked):
+    primary_lock = runner._try_lock(runner._root_lock_path(runtime(linked), linked["primary"]))
+
+    def change(cwd, run):
+        assert cwd == linked["repo"].resolve()
+        assert runner._root_lock_path(runtime(linked), cwd) in runner._HELD_ROOT_LOCKS
+        (cwd / "delegated.txt").write_text("linked unit\n")
+
+    linked["change"] = change
+    try:
+        summary = delegate(linked)
+    finally:
+        runner._release_lock(primary_lock)
+    assert summary["status"] == "success"
+    assert summary["commit"]["sha"] == git(linked["repo"], "rev-parse", "HEAD")
+    assert summary["commit"]["branch"].startswith("cross-harness/")
+    assert git(linked["repo"], "rev-list", "--count", "launch") == "1"
+    assert snapshot(linked["primary"]) == linked["primary_snapshot"]
+    run = Path(summary["run_dir"])
+    assert (run / "ROOT_WORKTREE").read_text().strip() == str(linked["repo"].resolve())
+
+
+@pytest.mark.parametrize("resume", ["retry", "reply"])
+def test_linked_isolated_integration_and_resume_stay_in_launch_worktree(linked, resume):
+    with linked["config"].open("a") as config:
+        config.write('dirty_worktree_policy = "isolate"\n')
+    linked["status"] = "discussion" if resume == "reply" else "failed"
+    first = delegate(linked)
+    previous = Path(first["run_dir"])
+    assert runner.pending(linked["primary"], linked["config"], linked["home"]) == []
+    assert len(runner.pending(linked["repo"], linked["config"], linked["home"])) == 1
+    linked["status"] = "success"
+    second = getattr(runner, resume)(previous, linked["task"], linked["config"], linked["home"])
+    assert second["status"] == "success"
+    assert second["integration"]["root"] == str(linked["repo"].resolve())
+    assert snapshot(linked["primary"]) == linked["primary_snapshot"]
+
+    def root_change(cwd, run):
+        assert cwd == linked["repo"].resolve()
+        assert runner._root_lock_path(runtime(linked), cwd) in runner._HELD_ROOT_LOCKS
+        (cwd / "next.txt").write_text("next\n")
+
+    linked["change"] = root_change
+    third = getattr(runner, resume)(previous, linked["task"], linked["config"], linked["home"])
+    assert third["status"] == "success"
+    assert third["cwd"] == str(linked["repo"].resolve())
+    assert snapshot(linked["primary"]) == linked["primary_snapshot"]
+    assert not runner._HELD_ROOT_LOCKS
+
+
+@pytest.mark.parametrize("action", ["committed adopt", "uncommitted adopt", "discard", "commit"])
+def test_linked_resolution_and_pending_use_recorded_root(linked, action):
+    if action == "uncommitted adopt":
+        linked["config"].write_text(linked["config"].read_text().replace('auto_commit = true', 'auto_commit = false'))
+    with linked["config"].open("a") as config:
+        config.write('dirty_worktree_policy = "isolate"\n')
+    if action == "committed adopt":
+        (linked["repo"] / "delegated.txt").write_text("collision\n")
+    elif action in {"discard", "commit"}:
+        linked["status"] = "failed" if action == "discard" else "partial"
+    summary = delegate(linked)
+    run = Path(summary["run_dir"])
+    unit = worktree(summary)
+    assert runner.pending(linked["primary"], linked["config"], linked["home"]) == []
+    assert [item["run_dir"] for item in runner.pending(linked["repo"], linked["config"], linked["home"])] == [str(run)]
+    assert [item["run_dir"] for item in runner.pending(unit, linked["config"], linked["home"])] == [str(run)]
+    primary_lock = runner._try_lock(runner._root_lock_path(runtime(linked), linked["primary"]))
+    try:
+        if action == "committed adopt":
+            (linked["repo"] / "delegated.txt").unlink()
+            launch_lock = runner._try_lock(runner._root_lock_path(runtime(linked), linked["repo"]))
+            try:
+                with pytest.raises(HarnessError, match="another write delegation"):
+                    runner.adopt(run, linked["config"], linked["home"])
+            finally:
+                runner._release_lock(launch_lock)
+        command = runner.discard if action == "discard" else runner.commit_run if action == "commit" else runner.adopt
+        command(run, linked["config"], linked["home"])
+    finally:
+        runner._release_lock(primary_lock)
+    assert not unit.exists()
+    assert snapshot(linked["primary"]) == linked["primary_snapshot"]
+    assert json.loads((run / "state.json").read_text())["cwd"] == str(linked["repo"].resolve())
+    assert runner.pending(linked["repo"], linked["config"], linked["home"]) == []
+
+
+def test_resolution_never_prunes_unrelated_worktree_metadata(isolated, monkeypatch):
+    missing = isolated["repo"].parent / "missing"
+    git(isolated["repo"], "worktree", "add", "--detach", str(missing))
+    import shutil
+    shutil.rmtree(missing)
+    original = runner._git
+    commands = []
+
+    def tracked(cwd, args, timeout=30):
+        commands.append(args)
+        return original(cwd, args, timeout)
+
+    monkeypatch.setattr(runner, "_git", tracked)
+    summary = delegate(isolated)
+    assert summary["integration"]["status"] == "integrated"
+    assert str(missing) in git(isolated["repo"], "worktree", "list", "--porcelain")
+    for action in ("adopt", "discard"):
+        isolated["status"] = "partial" if action == "adopt" else "failed"
+        pending_summary = delegate(isolated)
+        getattr(runner, action)(Path(pending_summary["run_dir"]), isolated["config"], isolated["home"])
+    runner.pending(isolated["repo"], isolated["config"], isolated["home"])
+    assert not any(args[:2] == ["worktree", "prune"] for args in commands)
+    assert str(missing) in git(isolated["repo"], "worktree", "list", "--porcelain")
+
+
+@pytest.mark.parametrize("failure", ["delegated cleanup", "pending collection", "rendering"])
+def test_root_commit_finalizes_despite_later_errors(execution, monkeypatch, failure):
+    def fail(*args, **kwargs):
+        raise RuntimeError(failure)
+
+    target = {"delegated cleanup": "_forget_committed_paths", "pending collection": "_run_pending",
+              "rendering": "render_summary"}[failure]
+    monkeypatch.setattr(runner, target, fail)
+    summary = delegate(execution)
+    run = Path(summary["run_dir"])
+    assert summary["commit"]["status"] == "committed"
+    assert summary["commit"]["sha"] == git(execution["repo"], "rev-parse", "HEAD")
+    assert summary["status"] == "partial"
+    assert failure in " ".join(summary["cleanup_errors"])
+    assert json.loads((run / "summary.json").read_text())["commit"] == summary["commit"]
+    assert json.loads((run / "state.json").read_text())["status"] == "partial"
+    assert (run / "summary.txt").is_file()
+
+
+def test_baseline_failure_after_branch_creation_is_finalized(execution, monkeypatch):
+    monkeypatch.setattr(runner, "_write_baseline", lambda *args: (_ for _ in ()).throw(OSError("baseline failed")))
+    with pytest.raises(OSError, match="baseline failed"):
+        delegate(execution)
+    assert runner._current_branch(execution["repo"]).startswith("cross-harness/")
+    run = next((runtime(execution) / "runs").iterdir())
+    summary = json.loads((run / "summary.json").read_text())
+    state = json.loads((run / "state.json").read_text())
+    assert summary["status"] == state["status"] == "blocked"
+    assert state["blocked_category"] == "work_branch"
+    assert execution["calls"] == []
+    assert not runner._HELD_ROOT_LOCKS
+
+
+def test_failed_keep_reset_reports_rollback_failure_and_keeps_unit(isolated, monkeypatch):
+    original = runner._git
+    commands = []
+
+    def fail(cwd, args, timeout=30):
+        commands.append(args)
+        if args[0] == "cherry-pick" or args[:2] == ["reset", "--keep"]:
+            return subprocess.CompletedProcess(args, 1, "", "rollback refused")
+        return original(cwd, args, timeout)
+
+    monkeypatch.setattr(runner, "_git", fail)
+    summary = delegate(isolated)
+    assert summary["status"] == "partial"
+    assert "integration rollback failed" in summary["integration"]["reason"]
+    assert worktree(summary).exists()
+    assert not any("--hard" in args for args in commands)
+
+
+@pytest.mark.parametrize("touch_leftover", [False, True])
+def test_fresh_run_excludes_other_unit_leftovers_and_retry_carries_own_paths(execution, touch_leftover):
+    execution["status"] = "partial"
+    earlier = delegate(execution)
+    execution["status"] = "success"
+
+    def change(cwd, run):
+        if touch_leftover:
+            (cwd / "delegated.txt").write_text("changed leftover\n")
+        (cwd / "own.txt").write_text("own unit\n")
+
+    execution["change"] = change
+    fresh = delegate(execution)
+    assert fresh["commit"]["paths"] == ["own.txt"]
+    assert fresh["commit"]["excluded_paths"] == ["delegated.txt"]
+    assert git(execution["repo"], "ls-tree", "--name-only", "HEAD", "delegated.txt") == ""
+    assert (execution["repo"] / "delegated.txt").read_text() == ("changed leftover\n" if touch_leftover else "delegated\n")
+    run = Path(fresh["run_dir"])
+    assert json.loads((run / "chain-paths.json").read_text()) == ["own.txt"]
+    # The earlier chain can commit its path only while its recorded fingerprint is intact.
+    if not touch_leftover:
+        execution["change"] = lambda cwd, run: (cwd / "retry.txt").write_text("retry\n")
+        retried = runner.retry(Path(earlier["run_dir"]), execution["task"], execution["config"], execution["home"])
+        assert retried["commit"]["paths"] == ["delegated.txt", "retry.txt"]
+
+
+@pytest.mark.parametrize("operation", ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "BISECT_START"])
+@pytest.mark.parametrize("action", ["delegate", "isolated delegate", "commit", "isolated commit"])
+def test_unfinished_operations_refuse_before_branch_or_commit(execution, operation, action):
+    isolated = action.startswith("isolated")
+    if isolated:
+        execution["config"].write_text('auto_commit = true\ndirty_worktree_policy = "isolate"\n')
+    run = None
+    if "commit" in action:
+        execution["status"] = "partial"
+        run = Path(delegate(execution)["run_dir"])
+        git(execution["repo"], "symbolic-ref", "HEAD", "refs/heads/main")
+    location = Path(git(execution["repo"], "rev-parse", "--git-path", operation))
+    if not location.is_absolute():
+        location = execution["repo"] / location
+    if operation.startswith("rebase-"):
+        location.mkdir()
+    else:
+        location.write_text(git(execution["repo"], "rev-parse", "HEAD") + "\n")
+    before = snapshot(execution["repo"])
+    branches = git(execution["repo"], "branch", "--list")
+    calls = len(execution["calls"])
+    with pytest.raises(HarnessError, match="unfinished Git operation"):
+        if "commit" in action:
+            runner.commit_run(run, execution["config"], execution["home"])
+        else:
+            delegate(execution)
+    assert snapshot(execution["repo"]) == before
+    assert git(execution["repo"], "branch", "--list") == branches
+    assert len(execution["calls"]) == calls
+    if "delegate" in action:
+        run = next((runtime(execution) / "runs").iterdir())
+        assert json.loads((run / "state.json").read_text())["blocked_category"] == "work_branch"
+        assert json.loads((run / "summary.json").read_text())["status"] == "blocked"
+
+
+@pytest.mark.parametrize("fingerprint_changed", [False, True])
+def test_commit_partial_isolated_unit_verifies_and_integrates(isolated, fingerprint_changed):
+    isolated["status"] = "partial"
+    summary = delegate(isolated)
+    run = Path(summary["run_dir"])
+    unit = worktree(summary)
+    before = snapshot(isolated["repo"])
+    if fingerprint_changed:
+        (unit / "delegated.txt").write_text("edited afterwards\n")
+        with pytest.raises(HarnessError, match="fingerprint changed"):
+            runner.commit_run(run, isolated["config"], isolated["home"])
+        assert snapshot(isolated["repo"]) == before
+        assert unit.exists()
+        assert git(unit, "rev-list", "--count", "HEAD") == "1"
+    else:
+        result = runner.commit_run(run, isolated["config"], isolated["home"])
+        assert result["commit"]["status"] == "committed"
+        assert result["integration"]["status"] == "integrated"
+        assert not unit.exists()
+        assert result["cwd"] == str(isolated["repo"].resolve())
+        assert json.loads((run / "state.json").read_text())["cwd"] == result["cwd"]
+        assert (isolated["repo"] / "delegated.txt").read_text() == "delegated\n"
+
+
+@pytest.mark.parametrize("action", ["adopt", "discard"])
+@pytest.mark.parametrize("status", ["partial", "discussion"])
+def test_already_integrated_resolution_only_finishes_cleanup(isolated, monkeypatch, action, status):
+    real_remove = runner._remove_isolated_worktree
+    monkeypatch.setattr(runner, "_remove_isolated_worktree", lambda *args: (_ for _ in ()).throw(OSError("remove failed")))
+    summary = delegate(isolated)
+    run = Path(summary["run_dir"])
+    unit = worktree(summary)
+    assert summary["integration"]["status"] == "integrated"
+    if status == "discussion":
+        for name in ("state.json", "summary.json"):
+            path = run / name
+            record = json.loads(path.read_text())
+            record["status"] = "discussion"
+            path.write_text(json.dumps(record))
+    before = snapshot(isolated["repo"])
+    monkeypatch.setattr(runner, "_remove_isolated_worktree", real_remove)
+    if action == "discard":
+        assert main(["--home", str(isolated["home"]), "discard", "--run", str(run),
+                     "--config", str(isolated["config"])]) == 0
+    result = getattr(runner, action)(run, isolated["config"], isolated["home"])
+    assert result["integration"]["status"] == "integrated"
+    assert snapshot(isolated["repo"]) == before
+    assert not unit.exists()
+    assert not (run / "DISCARDED").exists()
+    assert (run / "INTEGRATED").exists()
+    assert json.loads((run / "summary.json").read_text())["integration"]["status"] == "integrated"
+    assert getattr(runner, action)(run, isolated["config"], isolated["home"])["integration"]["status"] == "integrated"
+
+
+def test_failed_isolated_unit_cannot_be_committed(isolated):
+    isolated["status"] = "failed"
+    summary = delegate(isolated)
+    unit = worktree(summary)
+    before = snapshot(isolated["repo"])
+    with pytest.raises(HarnessError, match="finalized partial write run"):
+        runner.commit_run(Path(summary["run_dir"]), isolated["config"], isolated["home"])
+    assert unit.exists()
+    assert git(unit, "rev-list", "--count", "HEAD") == "1"
+    assert snapshot(isolated["repo"]) == before
+
+
+def test_failed_uncommitted_isolated_unit_requires_retry_or_discard(isolated):
+    isolated["status"] = "failed"
+    summary = delegate(isolated)
+    before = snapshot(isolated["repo"])
+    with pytest.raises(HarnessError, match="requires retry or discard"):
+        runner.adopt(Path(summary["run_dir"]), isolated["config"], isolated["home"])
+    assert snapshot(isolated["repo"]) == before
+    assert worktree(summary).exists()
+
+
+@pytest.mark.parametrize("resume", ["retry", "reply"])
+def test_allow_resume_excludes_user_edits_to_earlier_chain_paths(execution, resume):
+    execution["config"].write_text('auto_commit = true\ndirty_worktree_policy = "allow"\n')
+    execution["status"] = "discussion" if resume == "reply" else "partial"
+    earlier = delegate(execution)
+    (execution["repo"] / "delegated.txt").write_bytes(b"user edit\x00\n")
+    execution["status"] = "success"
+    execution["change"] = lambda cwd, run: (cwd / "own.txt").write_text("new unit\n")
+    result = getattr(runner, resume)(Path(earlier["run_dir"]), execution["task"], execution["config"], execution["home"])
+    assert result["commit"]["paths"] == ["own.txt"]
+    assert result["commit"]["excluded_paths"] == ["delegated.txt"]
+    assert git(execution["repo"], "ls-tree", "--name-only", "HEAD", "delegated.txt") == ""
+    assert (execution["repo"] / "delegated.txt").read_bytes() == b"user edit\x00\n"
+
+
+@pytest.mark.parametrize("failure", ["pending", "summary rewriting"])
+def test_explicit_isolated_commit_finalizes_after_cleanup_errors(isolated, monkeypatch, failure):
+    isolated["status"] = "partial"
+    summary = delegate(isolated)
+    run = Path(summary["run_dir"])
+    target = "_pending_isolated_runs" if failure == "pending" else "_save_summary"
+    monkeypatch.setattr(runner, target, lambda *args: (_ for _ in ()).throw(RuntimeError(failure)))
+    result = runner.commit_run(run, isolated["config"], isolated["home"])
+    assert result["commit"]["status"] == "committed"
+    assert result["integration"]["status"] == "integrated"
+    assert failure in result["integration"]["reason"]
+    assert json.loads((run / "summary.json").read_text())["integration"] == result["integration"]
+    assert json.loads((run / "state.json").read_text())["cwd"] == str(isolated["repo"].resolve())
+    assert (run / "summary.txt").is_file()
