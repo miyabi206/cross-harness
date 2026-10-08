@@ -9,6 +9,20 @@ from cross_harness.maintenance import cleanup
 
 
 class MaintenanceTests(unittest.TestCase):
+    def test_discussion_run_is_complete_and_not_marked_orphaned(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            run = home / ".local/state/cross-harness/runs/discussion"
+            run.mkdir(parents=True)
+            (run / "summary.json").write_text('{"status":"discussion"}')
+            (run / "state.json").write_text('{"status":"discussion","discussion_rounds":0}')
+            now = datetime.now(timezone.utc)
+            modified = (now - timedelta(hours=2)).timestamp()
+            os.utime(run, (modified, modified))
+            result = cleanup(home=home, now=now)
+            self.assertEqual([], result["orphaned"])
+            self.assertFalse((run / "ORPHANED").exists())
+
     def test_old_runs_removed_and_recent_incomplete_run_marked_orphan(self):
         with tempfile.TemporaryDirectory() as folder:
             home = Path(folder)

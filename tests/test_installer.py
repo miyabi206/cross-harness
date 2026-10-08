@@ -44,11 +44,13 @@ class InstallerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "managed"
             path.symlink_to("target")
-            with patch("cross_harness.installer.os.readlink", side_effect=PermissionError("denied")):
+            paths = user_paths(Path(folder))
+            with patch("cross_harness.installer.os.readlink", side_effect=PermissionError("denied")) as readlink:
                 drift = _installed_drift(
                     [{"path": str(path), "installed_symlink": "target"}],
-                    user_paths(Path(folder)),
+                    paths,
                 )
+            readlink.assert_called_once_with(path)
             self.assertEqual([str(path)], drift)
 
     def test_unreadable_codex_config_hash_is_reported_as_drift(self):
@@ -70,12 +72,19 @@ class InstallerTests(unittest.TestCase):
             root = Path(folder)
             home = root / "home"
             home.mkdir()
-            repo = home / ".local/share/cross-harness/current/bad\x1b[31mrepo"
-            repo.mkdir(parents=True)
-            with self.assertRaises(HarnessError) as raised:
-                _reject_install_root_repo(repo, user_paths(home))
-            self.assertNotIn("\x1b", str(raised.exception))
-            self.assertNotIn("\x07", str(raised.exception))
+            home_alias = root / "home-link"
+            home_alias.symlink_to(home, target_is_directory=True)
+            relative_root = Path(".local/share/cross-harness/current")
+            relative_repo = relative_root / "bad\x1b[31mrepo\x07"
+            (home / relative_repo).mkdir(parents=True)
+            for home_path in (home, home_alias):
+                for relative in (relative_root, relative_repo):
+                    with self.subTest(home=home_path, repo=relative):
+                        with self.assertRaises(HarnessError) as raised:
+                            _reject_install_root_repo(home_path / relative, user_paths(home_path))
+                        self.assertIn("installation destination", str(raised.exception))
+                        self.assertNotIn("\x1b", str(raised.exception))
+                        self.assertNotIn("\x07", str(raised.exception))
 
     def test_global_core_hooks_path_is_ignored(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -148,7 +157,7 @@ class InstallerTests(unittest.TestCase):
             installed = hooks / "post-commit"
             self.assertNotIn("exit 7", installed.read_text(encoding="utf-8"))
             manifest = json.loads((home / ".local/state/cross-harness/install-manifest.json").read_text())
-            self.assertTrue(any(record["path"] == str(installed) for record in manifest["records"]))
+            self.assertTrue(any(record["path"] == str(installed.resolve()) for record in manifest["records"]))
 
             uninstall(home)
             self.assertEqual("#!/bin/sh\nexit 7\n", existing.read_text(encoding="utf-8"))
@@ -917,8 +926,8 @@ class InstallerTests(unittest.TestCase):
             config.parent.mkdir(parents=True)
             contents = 'retention_days = 14\n[roles.tester]\ntimeout_seconds = 321\n'
             config.write_text(contents, encoding="utf-8")
-            # The partial config supplies two of 85 default leaf settings.
-            expected_defaulted_count = 83
+            # The partial config supplies two of 86 default leaf settings.
+            expected_defaulted_count = 84
             expected_default_action = "default: roles.tester.model"
 
             dry_run_actions = install(home, repo, dry_run=True)

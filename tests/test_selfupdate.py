@@ -189,7 +189,7 @@ class SelfUpdateTests(unittest.TestCase):
             existing.chmod(0o755)
             install(home, repo)
             manifest = json.loads((home / ".local/state/cross-harness/install-manifest.json").read_text())
-            record = next(item for item in manifest["records"] if item["path"] == str(existing))
+            record = next(item for item in manifest["records"] if item["path"] == str(existing.resolve()))
             self.assertEqual("git_hook", record["management"])
             self.assertTrue(Path(record["backup"]).is_file())
             self.assertNotIn("exit 7", existing.read_text())

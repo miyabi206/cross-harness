@@ -26,6 +26,7 @@ TOP_KEYS = {
     "auth_cache_hours",
     "context_threshold_percent",
     "max_parallel",
+    "max_discussion_rounds",
     "dirty_worktree_policy",
     "delegate_kinds",
     "fallback",
@@ -145,6 +146,7 @@ def validate(config: dict) -> list[str]:
     _integer(config, "auth_cache_hours", 1, 24, errors)
     _integer(config, "context_threshold_percent", 40, 85, errors)
     _integer(config, "max_parallel", 1, 5, errors)
+    _integer(config, "max_discussion_rounds", 0, 10, errors)
     if config.get("dirty_worktree_policy") not in {"stop", "isolate", "allow", "allow_delegated"}:
         errors.append("dirty_worktree_policy: expected 'stop', 'isolate', 'allow', or 'allow_delegated'")
     if "mode" in config and config["mode"] not in {"on", "off"}:

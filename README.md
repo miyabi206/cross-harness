@@ -94,6 +94,14 @@ The wrapper returns only a bounded summary and artifact paths. Raw JSONL,
 stderr, the structured final response, diff statistics, and retry state stay in
 `~/.local/state/cross-harness/runs/<run-id>/`. A correction uses a delta-only
 task file with `~/.local/bin/cross-harness retry --run-dir ... --task-file ...`.
+Executor results contain seven fields: `status`, `work_completed`,
+`changed_files`, `tests`, `error`, `next_decision`, and `discussion_points`
+(an array of strings). A `discussion` result finalizes the turn; the orchestrator
+answers its points with `~/.local/bin/cross-harness reply --run-dir ... --task-file ...`.
+`retry` refuses discussion runs. Replies resume the same thread, keep attempts
+unchanged, and increment `discussion_rounds` without automatic model escalation.
+Summaries and state retain the points and round count. At the configured round
+limit, send the user's decision with `reply --user-decided`.
 
 ## Watch delegated runs
 
@@ -208,6 +216,11 @@ Claude session starts.
 `max_parallel` is enforced at runtime: a delegation that would exceed the
 global limit, or its non-orchestrator role's own limit, is immediately recorded
 as blocked rather than queued.
+`max_discussion_rounds` defaults to 3 and accepts integers from 0 to 10. It
+limits replies before a user decision is required; 0 requires `--user-decided`
+for every reply. The flag skips only this limit and still increments the count;
+`command.json` and `summary.json` record it. Older configurations inherit the
+default automatically.
 Claude role changes require a new Claude session,
 because its session-start hook synchronizes
 `~/.claude/agents/cross-harness-*.md`. `orchestrator` is the session itself,

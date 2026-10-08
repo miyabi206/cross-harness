@@ -17,6 +17,37 @@ from cross_harness.project import remove as remove_project, setup as setup_proje
 
 @patch.dict("os.environ", {}, clear=True)
 class HookTests(unittest.TestCase):
+    def test_both_executor_hooks_deny_reply_like_retry(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runtime = Path(folder) / "runtime"
+            for write in (False, True):
+                environment = self._execution_environment(runtime, write=write)
+                with patch.dict("os.environ", environment, clear=True), patch(
+                    "cross_harness.hooks.load_config", return_value={"runtime_root": str(runtime)}
+                ):
+                    for action in ("retry", "reply"):
+                        for command in (
+                            f"cross-harness {action} --run-dir /tmp/run",
+                            f"/opt/bin/cross-harness {action} --run-dir /tmp/run",
+                            f"bash -lc 'cross-harness {action} --run-dir /tmp/run'",
+                            f"cross-harness re\\{action[2:]} --run-dir /tmp/run",
+                        ):
+                            with self.subTest(write=write, command=command):
+                                payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+                                for hook in (claude_pre_tool_use, codex_pre_tool_use):
+                                    code, message = self._run(hook, payload)
+                                    self.assertEqual(2, code)
+                                    self.assertIn("nested executor", message)
+
+    @patch("cross_harness.hooks.shutil.which", return_value="/tmp/shadowed-wrapper")
+    def test_shadowed_bare_reply_is_blocked(self, which):
+        code, message = self._run(
+            claude_pre_tool_use,
+            '{"tool_name":"Bash","tool_input":{"command":"cross-harness reply --run-dir /tmp/run"}}',
+        )
+        self.assertEqual(2, code)
+        self.assertIn("does not resolve", message)
+
     def _run(self, function, payload, *, record=False):
         recorder = nullcontext() if record else patch("cross_harness.hooks._record_orchestrator_action")
         with recorder, patch("sys.stdin", StringIO(payload)), patch("sys.stderr", new_callable=StringIO) as stderr:
@@ -165,13 +196,13 @@ class HookTests(unittest.TestCase):
             tasks = repo / ".vscode/tasks.json"
             exclude = repo / ".git/info/exclude"
             self.assertEqual(0, code)
-            tracked_check.assert_called_once_with(repo)
+            tracked_check.assert_called_once_with(repo.resolve())
             self.assertTrue(tasks.is_file())
             self.assertEqual(1, exclude.read_text(encoding="utf-8").splitlines().count("/.vscode/tasks.json"))
             self.assertEqual("", subprocess.run(
                 ["git", "status", "--short"], cwd=repo, check=True, capture_output=True, text=True
             ).stdout)
-            self.assertIn(str(tasks), output)
+            self.assertIn(str(tasks.resolve()), output)
             self.assertIn("allow automatic tasks", output)
             self.assertIn("next opens", output)
 
@@ -632,6 +663,16 @@ class HookTests(unittest.TestCase):
                 command = f"{wrapper} task create --description 'ask Codex to run codex exec later'"
                 payload = '{"tool_name":"Bash","tool_input":{"command":' + json.dumps(command) + '}}'
                 self.assertEqual(0, self._run(claude_pre_tool_use, payload)[0])
+
+    def test_claude_orchestrator_allows_reply_through_installed_absolute_wrapper(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with self._wrapper_environment(Path(folder) / "home"):
+                wrapper = str(user_paths().executable)
+                command = f"{wrapper} reply --run-dir /tmp/run --task-file /tmp/reply.md"
+                payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+                code, message = self._run(claude_pre_tool_use, payload)
+                self.assertEqual(0, code)
+                self.assertEqual("", message)
 
     def test_claude_installed_non_task_wrapper_arguments_are_scanned(self):
         with tempfile.TemporaryDirectory() as folder:

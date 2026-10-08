@@ -67,24 +67,43 @@ CLAUDE_EXECUTOR_CHARTER = """# Cross-harness executor
 You are the bounded execution worker for a task file supplied by Claude.
 Do not follow the orchestrator charter from CLAUDE.md: this is an execution-role
 charter. Make the smallest change that satisfies its completion conditions.
-Do not ask the user questions, broaden scope, delegate to another agent, or launch Codex.
-If a blocking unknown prevents safe work, return `blocked` with the single decision needed.
+Do not ask the user questions, broaden scope on your own, delegate to another agent, or launch Codex.
+Never launch the wrapper or either harness.
+Run each declared check exactly as written as its own command with nothing piped
+or appended, because the wrapper reads that command's exit status.
+When you disagree with the task direction, see a materially better approach, or
+need an answer to proceed safely, return `discussion` with `discussion_points`.
+Each point gives the concern, evidence with file and line when one exists, and
+your proposal. Raise these points before changing files whenever possible.
+After a reply, proceed on the decision or counter only with new evidence; never
+repeat an answered point. Use `blocked` only for obstacles a reply cannot resolve,
+with the single decision needed. With any other status, `discussion_points` may
+carry non-blocking concerns about the direction and is otherwise empty.
 
-Your final response must contain exactly these six fields through the supplied
-JSON schema: status, work_completed, changed_files, tests, error, and
-next_decision. On failure, include exit code, cause, file, line, expected value,
+Your final response must contain exactly these seven fields through the supplied
+JSON schema: status, work_completed, changed_files, tests, error, next_decision,
+and discussion_points. On failure, include exit code, cause, file, line, expected value,
 and actual value whenever those facts exist. Do not narrate intermediate work."""
 CODEX_EXECUTOR_CHARTER = """# Cross-harness executor
 
 You are the bounded execution worker for a task file supplied by Claude. Make
 the smallest change that satisfies its completion conditions. Do not ask the
-user questions, broaden scope, delegate to another agent, or launch Claude.
-If a blocking unknown prevents safe work, return `blocked` with the single
-decision needed.
+user questions, broaden scope on your own, delegate to another agent, or launch Claude.
+Never launch the wrapper or either harness.
+Run each declared check exactly as written as its own command with nothing piped
+or appended, because the wrapper reads that command's exit status.
+When you disagree with the task direction, see a materially better approach, or
+need an answer to proceed safely, return `discussion` with `discussion_points`.
+Each point gives the concern, evidence with file and line when one exists, and
+your proposal. Raise these points before changing files whenever possible.
+After a reply, proceed on the decision or counter only with new evidence; never
+repeat an answered point. Use `blocked` only for obstacles a reply cannot resolve,
+with the single decision needed. With any other status, `discussion_points` may
+carry non-blocking concerns about the direction and is otherwise empty.
 
-Your final response must contain exactly these six fields through the supplied
-JSON schema: status, work_completed, changed_files, tests, error, and
-next_decision. On failure, include exit code, cause, file, line, expected value,
+Your final response must contain exactly these seven fields through the supplied
+JSON schema: status, work_completed, changed_files, tests, error, next_decision,
+and discussion_points. On failure, include exit code, cause, file, line, expected value,
 and actual value whenever those facts exist. Do not narrate intermediate work."""
 _DETACHED_SUPERVISORS: dict[int, subprocess.Popen] = {}
 _HELD_ROOT_LOCKS: dict[Path, int] = {}
@@ -434,6 +453,7 @@ def _prepare_write_execution(
                 thread_id=thread_id,
                 signatures=signatures,
                 defaulted_settings=defaulted_settings,
+                max_discussion_rounds=config["max_discussion_rounds"],
             )
             raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
         return _create_isolated_worktree(root, run_dir)
@@ -452,6 +472,7 @@ def _prepare_write_execution(
             thread_id=thread_id,
             signatures=signatures,
             defaulted_settings=defaulted_settings,
+            max_discussion_rounds=config["max_discussion_rounds"],
         )
         raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
     return root
@@ -531,8 +552,16 @@ def _prepare_retry_execution(
     signatures: list[str] | None,
     defaulted_settings: list[str] | None = None,
     root_lock_held: bool = False,
+    discussion_rounds: int = 0,
+    max_discussion_rounds: int = 3,
+    user_decided: bool = False,
 ) -> Path:
     """Prepare a retry from its predecessor's recorded worktree state."""
+    discussion = {
+        "discussion_rounds": discussion_rounds,
+        "max_discussion_rounds": max_discussion_rounds,
+        "user_decided": user_decided,
+    }
     if not role["write"]:
         return root
 
@@ -546,6 +575,7 @@ def _prepare_retry_execution(
                 thread_id=thread_id,
                 signatures=signatures,
                 defaulted_settings=defaulted_settings,
+                **discussion,
             )
             raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
         atomic_write(run_dir / "ISOLATED_WORKTREE", str(execution_root) + "\n")
@@ -563,6 +593,7 @@ def _prepare_retry_execution(
                 thread_id=thread_id,
                 signatures=signatures,
                 defaulted_settings=defaulted_settings,
+                **discussion,
             )
             raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
 
@@ -579,6 +610,7 @@ def _prepare_retry_execution(
             thread_id=thread_id,
             signatures=signatures,
             defaulted_settings=defaulted_settings,
+            **discussion,
         )
         raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
     try:
@@ -592,6 +624,7 @@ def _prepare_retry_execution(
             thread_id=thread_id,
             signatures=signatures,
             defaulted_settings=defaulted_settings,
+            **discussion,
         )
         raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
     current_changes: set[tuple[str, str | None]] = set()
@@ -611,6 +644,7 @@ def _prepare_retry_execution(
             thread_id=thread_id,
             signatures=signatures,
             defaulted_settings=defaulted_settings,
+            **discussion,
         )
         raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
     return execution_root
@@ -868,7 +902,7 @@ def adopt(
     except (OSError, UnicodeError, json.JSONDecodeError):
         state = None
     completed_summary = _completed_summary(run_dir)
-    completed_statuses = {"success", "failed", "blocked", "partial"}
+    completed_statuses = {"success", "failed", "blocked", "partial", "discussion"}
     if (
         not isinstance(state, dict)
         or state.get("status") not in completed_statuses
@@ -876,6 +910,8 @@ def adopt(
         or completed_summary.get("status") not in completed_statuses
     ):
         raise HarnessError("cannot adopt: run summary is not finalized")
+    if state["status"] == "discussion" or completed_summary["status"] == "discussion":
+        raise HarnessError("cannot adopt: discussion run awaits a reply")
     marker = run_dir / "ISOLATED_WORKTREE"
     if not marker.is_file():
         raise HarnessError(
@@ -1117,9 +1153,14 @@ def _declared_checks(run_dir: Path) -> list[str]:
     path = run_dir / "task.md"
     if not path.exists():
         return []
+    return _task_checks(path.read_text(encoding="utf-8", errors="replace"))
+
+
+def _task_checks(task: str) -> list[str]:
+    """Read the bullet commands from task text's Checks section."""
     checks: list[str] = []
     in_checks = False
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in task.splitlines():
         if _CHECKS_HEADING.match(line):
             in_checks = True
             continue
@@ -1390,8 +1431,9 @@ def _claude_command(
         + (agent_instruction + "\n\n" if agent_instruction else "")
         + "When the task is complete, respond with only a JSON object conforming to "
         f"{schema}. It must contain exactly: status (one of success, failed, blocked, "
-        "partial), work_completed (string), changed_files (array of strings), tests "
-        "(array of strings), error (string or null), and next_decision (string or null). "
+        "partial, discussion), work_completed (string), changed_files (array of strings), tests "
+        "(array of strings), error (string or null), next_decision (string or null), "
+        "and discussion_points (array of strings). "
         "Your entire final message must be that JSON object: do not include "
         "explanatory prose or Markdown code fences before or after it. Do not write the "
         "result to a file. "
@@ -1663,6 +1705,7 @@ def delegate(
                 str(exc),
                 "authentication",
                 defaulted_settings=defaulted_settings,
+                max_discussion_rounds=config["max_discussion_rounds"],
             )
         environment = sanitized_environment(paths.home, {
             "CROSS_HARNESS_ACTIVE": "1",
@@ -1691,6 +1734,7 @@ def delegate(
             return _run_delegate_executor(
                 command, task, environment, execution_root, run_dir, role_name, role, kind,
                 runtime_root, effective_policy, defaulted_settings,
+                config["max_discussion_rounds"],
             )
         parallel_error = _reserve_parallel_capacity(
             config, runtime_root, run_dir, role_name,
@@ -1700,11 +1744,13 @@ def delegate(
             return finalize_blocked_run(
                 run_dir, role_name, role, kind, execution_root, parallel_error, "parallel_limit",
                 defaulted_settings=defaulted_settings,
+                max_discussion_rounds=config["max_discussion_rounds"],
             )
         try:
             return _run_delegate_executor(
                 command, task, environment, execution_root, run_dir, role_name, role, kind,
                 runtime_root, effective_policy, defaulted_settings,
+                config["max_discussion_rounds"],
             )
         finally:
             _release_parallel_reservation(run_dir)
@@ -1717,6 +1763,7 @@ def _run_delegate_executor(
     command: list[str], task: str, environment: dict[str, str], execution_root: Path, run_dir: Path,
     role_name: str, role: dict, kind: str, runtime_root: Path, effective_policy: str,
     defaulted_settings: list[str],
+    max_discussion_rounds: int = 3,
 ) -> dict:
     exit_code = _invoke_safe(
         command, _executor_task(task, role["harness"]), environment, execution_root, run_dir,
@@ -1728,6 +1775,7 @@ def _run_delegate_executor(
         run_dir, role_name, role, kind, execution_root, exit_code, attempt=1,
         runtime_root=runtime_root, dirty_worktree_policy=effective_policy,
         defaulted_settings=defaulted_settings,
+        max_discussion_rounds=max_discussion_rounds,
     )
 
 
@@ -1830,6 +1878,7 @@ def start_detached_delegate(
         finalize_blocked_run(
             run_dir, role_name, role, kind, cwd, parallel_error, "parallel_limit",
             defaulted_settings=defaulted_config_paths(config_path, paths.home),
+            max_discussion_rounds=config["max_discussion_rounds"],
         )
         return run_dir
     assert process is not None
@@ -1950,6 +1999,9 @@ def finalize_blocked_run(
     thread_id: str | None = None,
     signatures: list[str] | None = None,
     defaulted_settings: list[str] | None = None,
+    discussion_rounds: int = 0,
+    max_discussion_rounds: int = 3,
+    user_decided: bool = False,
 ) -> dict:
     final = {
         "status": "blocked",
@@ -1958,6 +2010,7 @@ def finalize_blocked_run(
         "tests": [],
         "error": reason,
         "next_decision": "Resolve the blocking condition and start a new delegation.",
+        "discussion_points": [],
     }
     atomic_write(run_dir / "events.jsonl", "")
     atomic_write(run_dir / "stderr.log", reason + "\n")
@@ -1972,6 +2025,10 @@ def finalize_blocked_run(
         "model": role["model"],
         "effort": role["effort"],
         "attempt": attempts,
+        "discussion_points": [],
+        "discussion_rounds": discussion_rounds,
+        "max_discussion_rounds": max_discussion_rounds,
+        "user_decided": user_decided,
         "thread_id": thread_id,
         "changed_files": [],
         "tests": [],
@@ -1989,10 +2046,13 @@ def finalize_blocked_run(
     }
     state = {
         "role": role_name,
+        "harness": role.get("harness"),
         "kind": kind,
         "cwd": str(cwd),
         "thread_id": thread_id,
         "attempts": attempts,
+        "discussion_points": [],
+        "discussion_rounds": discussion_rounds,
         "signatures": signatures or [],
         "escalated": False,
         "status": "blocked",
@@ -2020,6 +2080,10 @@ def finalize_run(
     runtime_root: Path | None = None,
     dirty_worktree_policy: str | None = None,
     defaulted_settings: list[str] | None = None,
+    discussion_rounds: int = 0,
+    max_discussion_rounds: int = 3,
+    user_decided: bool = False,
+    thread_id: str | None = None,
 ) -> dict:
     parsed = parse_events(run_dir / "events.jsonl")
     declared_checks = _declared_checks(run_dir)
@@ -2047,10 +2111,14 @@ def finalize_run(
         except (subprocess.TimeoutExpired, OSError):
             self_reversion_check_unavailable = True
     final = load_final(run_dir / "final.json") or {}
+    discussion_points = final.get("discussion_points", [])
+    if not isinstance(discussion_points, list):
+        discussion_points = []
+    discussion_points = [point for point in discussion_points if isinstance(point, str)]
     stderr = (run_dir / "stderr.log").read_text(encoding="utf-8", errors="replace") if (run_dir / "stderr.log").exists() else ""
     filtered_stderr = _filtered_executor_stderr(stderr)
     event_failed = bool(parsed.get("errors"))
-    allowed_statuses = {"success", "failed", "blocked", "partial"}
+    allowed_statuses = {"success", "failed", "blocked", "partial", "discussion"}
     reported_status = final.get("status")
     invalid_reported_status = "status" in final and reported_status not in allowed_statuses
     if invalid_reported_status:
@@ -2062,6 +2130,9 @@ def finalize_run(
     else:
         status = "success" if exit_code == 0 and not event_failed else "failed"
         status_error = ""
+    if status == "discussion" and not any(point.strip() for point in discussion_points):
+        status = "failed"
+        status_error = "a discussion needs at least one point"
     if exit_code != 0 and status == "success":
         status = "failed"
     if event_failed and status == "success":
@@ -2192,6 +2263,7 @@ def finalize_run(
         reported_tests = []
     else:
         reported_tests = [summary_item_text(test) for test in reported_tests]
+    thread_id = parsed.get("thread_id") or thread_id
     summary = {
         "status": status,
         "run_dir": str(run_dir),
@@ -2201,7 +2273,11 @@ def finalize_run(
         "model": role["model"],
         "effort": role["effort"],
         "attempt": attempt,
-        "thread_id": parsed.get("thread_id"),
+        "discussion_points": discussion_points,
+        "discussion_rounds": discussion_rounds,
+        "max_discussion_rounds": max_discussion_rounds,
+        "user_decided": user_decided,
+        "thread_id": thread_id,
         "changed_files": detected_changed,
         "reported_changed_files": reported_changed_files,
         "unverified_changed_files": unverified_changed_files,
@@ -2234,10 +2310,13 @@ def finalize_run(
         summary["rate_limit_notice"] = rate_limit_notice
     state = {
         "role": role_name,
+        "harness": role.get("harness"),
         "kind": kind,
         "cwd": str(cwd),
-        "thread_id": parsed.get("thread_id"),
+        "thread_id": thread_id,
         "attempts": attempt,
+        "discussion_points": discussion_points,
+        "discussion_rounds": discussion_rounds,
         "signatures": [signature] if signature else [],
         "escalated": False,
         "status": status,
@@ -2290,8 +2369,26 @@ def _escalated_role(role: dict, config: dict) -> dict:
 
 def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home: Path | None = None) -> dict:
     """Retry while releasing any root lock acquired by the retry path."""
+    return _resume_run(run_dir, task_file, config_path, home)
+
+
+def reply(
+    run_dir: Path, task_file: Path, config_path: Path | None = None, home: Path | None = None,
+    *, user_decided: bool = False,
+) -> dict:
+    """Answer a discussion without spending a retry or escalating the model."""
+    return _resume_run(
+        run_dir, task_file, config_path, home, discussion_reply=True, user_decided=user_decided,
+    )
+
+
+def _resume_run(
+    run_dir: Path, task_file: Path, config_path: Path | None = None, home: Path | None = None,
+    *, discussion_reply: bool = False, user_decided: bool = False,
+) -> dict:
+    action = "reply" if discussion_reply else "retry"
     if os.environ.get("CROSS_HARNESS_ACTIVE") == "1":
-        raise HarnessError("nested cross-harness retry from an active executor is blocked")
+        raise HarnessError(f"nested cross-harness {action} from an active executor is blocked")
     paths = user_paths(home)
     config = load_config(config_path, paths.home)
     root: Path | None = None
@@ -2314,16 +2411,23 @@ def retry(run_dir: Path, task_file: Path, config_path: Path | None = None, home:
             lock_path = _root_lock_path(runtime_root, root)
             held_before = lock_path in _HELD_ROOT_LOCKS
     try:
-        return _retry_impl(run_dir, task_file, config_path=config_path, home=home)
+        return _retry_impl(
+            run_dir, task_file, config_path=config_path, home=home,
+            discussion_reply=discussion_reply, user_decided=user_decided,
+        )
     finally:
         if root is not None and runtime_root is not None and lock_path is not None:
             if not held_before and lock_path in _HELD_ROOT_LOCKS:
                 _release_root_lock(runtime_root, root)
 
 
-def _retry_impl(run_dir: Path, task_file: Path, config_path: Path | None = None, home: Path | None = None) -> dict:
+def _retry_impl(
+    run_dir: Path, task_file: Path, config_path: Path | None = None, home: Path | None = None,
+    *, discussion_reply: bool = False, user_decided: bool = False,
+) -> dict:
+    action = "reply" if discussion_reply else "retry"
     if os.environ.get("CROSS_HARNESS_ACTIVE") == "1":
-        raise HarnessError("nested cross-harness retry from an active executor is blocked")
+        raise HarnessError(f"nested cross-harness {action} from an active executor is blocked")
     paths = user_paths(home)
     config = load_config(config_path, paths.home)
     defaulted_settings = defaulted_config_paths(config_path, paths.home)
@@ -2333,6 +2437,25 @@ def _retry_impl(run_dir: Path, task_file: Path, config_path: Path | None = None,
     state = json.loads(state_path.read_text(encoding="utf-8"))
     role_name = state["role"]
     role = dict(config["roles"][role_name])
+    discussion_rounds = state.get("discussion_rounds", 0)
+    if discussion_reply:
+        if state["status"] != "discussion":
+            raise HarnessError("reply refused: run status must be discussion")
+        if not state.get("thread_id"):
+            raise HarnessError(
+                "reply refused: discussion run has no recorded thread; start a new delegation"
+            )
+        if discussion_rounds >= config["max_discussion_rounds"] and not user_decided:
+            raise HarnessError(
+                "reply refused: max_discussion_rounds reached; present both positions to the user "
+                "and send the decision with reply --user-decided"
+            )
+        discussion_rounds += 1
+        role["harness"] = state.get("harness") or role["harness"]
+        role["model"] = state["model"]
+        role["effort"] = state["effort"]
+    elif state["status"] == "discussion":
+        raise HarnessError("retry refused: discussion run requires reply")
     if state["status"] == "blocked":
         blocked_category = state.get("blocked_category")
         if blocked_category == "executor_reported":
@@ -2351,7 +2474,7 @@ def _retry_impl(run_dir: Path, task_file: Path, config_path: Path | None = None,
             raise HarnessError(
                 f"retry refused: blocked run category {blocked_category!r} is not eligible for retry"
             )
-    if state["attempts"] > role["retries"]:
+    if not discussion_reply and state["attempts"] > role["retries"]:
         raise HarnessError("normal retry budget exhausted")
     if not task_file.is_file():
         raise HarnessError(f"task file not found: {task_file}")
@@ -2360,13 +2483,37 @@ def _retry_impl(run_dir: Path, task_file: Path, config_path: Path | None = None,
     task = task_file.read_text(encoding="utf-8")
     if not task.strip():
         raise HarnessError("task file is empty")
+    if discussion_reply:
+        inherited_checks = _declared_checks(run_dir) if not _task_checks(task) else []
+        if inherited_checks:
+            checks_text = "\n".join(f"- {check}" for check in inherited_checks)
+            lines = task.splitlines(keepends=True)
+            for index, line in enumerate(lines):
+                if _CHECKS_HEADING.match(line.rstrip("\r\n")):
+                    lines[index] = line.rstrip("\r\n") + "\n" + checks_text + "\n"
+                    task = "".join(lines)
+                    break
+            else:
+                task = f"{task}\n\n# Checks\n{checks_text}\n"
+        header = f"Discussion round {discussion_rounds} of {config['max_discussion_rounds']}."
+        if user_decided:
+            header += " This decision comes from the user and is final."
+        task = f"{header}\n\n{task}"
     if contains_secret(task):
         raise HarnessError("task file appears to contain credential material; refusing delegation")
+    discussion = {
+        "discussion_rounds": discussion_rounds,
+        "max_discussion_rounds": config["max_discussion_rounds"],
+        "user_decided": user_decided,
+    }
     runtime_root = Path(config["runtime_root"])
     source_root = _git_root(Path(state["cwd"]))
     effective_policy = _effective_dirty_worktree_policy(config, source_root)
     retry_root = _new_run_dir(runtime_root)
-    shutil.copy2(task_file, retry_root / "task.md")
+    if discussion_reply:
+        atomic_write(retry_root / "task.md", task)
+    else:
+        shutil.copy2(task_file, retry_root / "task.md")
     execution_root = _prepare_retry_execution(
         config, role_name, role, state["kind"], source_root, retry_root, run_dir,
         runtime_root=runtime_root,
@@ -2374,6 +2521,7 @@ def _retry_impl(run_dir: Path, task_file: Path, config_path: Path | None = None,
         thread_id=state["thread_id"],
         signatures=state.get("signatures", []),
         defaulted_settings=defaulted_settings,
+        **discussion,
     )
     root_lock_held = (
         role["write"]
@@ -2403,6 +2551,7 @@ def _retry_impl(run_dir: Path, task_file: Path, config_path: Path | None = None,
             thread_id=state["thread_id"],
             signatures=state.get("signatures", []),
             defaulted_settings=defaulted_settings,
+            **discussion,
         )
     environment = sanitized_environment(paths.home, {
         "CROSS_HARNESS_ACTIVE": "1",
@@ -2433,6 +2582,7 @@ def _retry_impl(run_dir: Path, task_file: Path, config_path: Path | None = None,
         "auth_cached": cached,
         "resume": state["thread_id"],
         "sandbox_exec": sandbox_exec,
+        "user_decided": user_decided,
     }))
     parallel_error = _reserve_parallel_capacity(
         config, runtime_root, retry_root, role_name,
@@ -2443,6 +2593,7 @@ def _retry_impl(run_dir: Path, task_file: Path, config_path: Path | None = None,
             retry_root, state["role"], role, state["kind"], execution_root, parallel_error,
             "parallel_limit", attempts=state["attempts"], thread_id=state["thread_id"],
             signatures=state.get("signatures", []), defaulted_settings=defaulted_settings,
+            **discussion,
         )
     try:
         exit_code = _invoke_safe(
@@ -2452,16 +2603,21 @@ def _retry_impl(run_dir: Path, task_file: Path, config_path: Path | None = None,
         if role["harness"] == "claude":
             _write_claude_final_from_events(retry_root)
         summary = finalize_run(
-            retry_root, state["role"], role, state["kind"], execution_root, exit_code, state["attempts"] + 1,
+            retry_root, state["role"], role, state["kind"], execution_root, exit_code,
+            state["attempts"] if discussion_reply else state["attempts"] + 1,
             runtime_root=runtime_root, dirty_worktree_policy=effective_policy,
             defaulted_settings=defaulted_settings,
+            thread_id=state["thread_id"] if discussion_reply else None,
+            **discussion,
         )
     finally:
         _release_parallel_reservation(retry_root)
     new_state = json.loads((retry_root / "state.json").read_text(encoding="utf-8"))
     new_state["signatures"] = [*state.get("signatures", []), *new_state.get("signatures", [])]
+    if discussion_reply:
+        new_state["escalated"] = state.get("escalated", False)
     identical = summary.get("failure_signature") and new_state["signatures"].count(summary["failure_signature"]) >= 2
-    if summary["status"] == "failed" and identical and not state.get("escalated"):
+    if not discussion_reply and summary["status"] == "failed" and identical and not state.get("escalated"):
         new_state["escalated"] = True
         atomic_write(retry_root / "state.json", dump_json(new_state))
         escalation = _escalated_role(role, config)
@@ -2474,6 +2630,7 @@ def _retry_impl(run_dir: Path, task_file: Path, config_path: Path | None = None,
             signatures=new_state.get("signatures", []),
             defaulted_settings=defaulted_settings,
             root_lock_held=root_lock_held,
+            **discussion,
         )
         _write_baseline(escalation_root, escalation_execution_root)
         command = _command(
@@ -2512,6 +2669,7 @@ def _retry_impl(run_dir: Path, task_file: Path, config_path: Path | None = None,
                 parallel_error, "parallel_limit", attempts=new_state["attempts"],
                 thread_id=summary.get("thread_id"), signatures=new_state.get("signatures", []),
                 defaulted_settings=defaulted_settings,
+                **discussion,
             )
         try:
             code = _invoke_safe(
@@ -2526,6 +2684,7 @@ def _retry_impl(run_dir: Path, task_file: Path, config_path: Path | None = None,
                 code, new_state["attempts"] + 1, runtime_root=runtime_root,
                 dirty_worktree_policy=_effective_dirty_worktree_policy(config, source_root),
                 defaulted_settings=defaulted_settings,
+                **discussion,
             )
         finally:
             _release_parallel_reservation(escalation_root)

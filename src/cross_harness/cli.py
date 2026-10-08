@@ -16,7 +16,7 @@ from .inventory import create_backup, inventory
 from .maintenance import cleanup
 from .paths import source_root, user_paths
 from .project import remove as remove_project, setup as setup_project
-from .runner import adopt, delegate, retry, start_detached_delegate, wait_for_run
+from .runner import adopt, delegate, reply, retry, start_detached_delegate, wait_for_run
 from .selfupdate import render as render_self_update, self_update
 from .taskfile import create_task_file
 from .trust import confirm_codex_hook
@@ -76,6 +76,12 @@ def parser() -> argparse.ArgumentParser:
     retry_parser.add_argument("--run-dir", required=True, type=Path)
     retry_parser.add_argument("--task-file", required=True, type=Path)
     retry_parser.add_argument("--config", type=Path)
+
+    reply_parser = commands.add_parser("reply", help="answer executor discussion and resume its thread")
+    reply_parser.add_argument("--run-dir", required=True, type=Path)
+    reply_parser.add_argument("--task-file", required=True, type=Path)
+    reply_parser.add_argument("--user-decided", action="store_true")
+    reply_parser.add_argument("--config", type=Path)
 
     adopt_parser = commands.add_parser("adopt", help="apply an isolated worktree run to the root worktree")
     adopt_parser.add_argument("--run", required=True, type=Path)
@@ -218,6 +224,13 @@ def main(argv: list[str] | None = None) -> int:
             return watch(args.config, home, show_all=args.all, color=args.color)
         elif args.command == "retry":
             summary = retry(args.run_dir.resolve(), args.task_file.resolve(), args.config, home)
+            print((Path(summary["run_dir"]) / "summary.txt").read_text(encoding="utf-8"), end="")
+            return 0 if summary["status"] == "success" else 1
+        elif args.command == "reply":
+            summary = reply(
+                args.run_dir.resolve(), args.task_file.resolve(), args.config, home,
+                user_decided=args.user_decided,
+            )
             print((Path(summary["run_dir"]) / "summary.txt").read_text(encoding="utf-8"), end="")
             return 0 if summary["status"] == "success" else 1
         elif args.command == "adopt":

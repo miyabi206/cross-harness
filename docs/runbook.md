@@ -161,6 +161,23 @@ rate-limit blocks remain safety-policy stops and cannot be resumed. A
 dirty-worktree or missing-isolated-worktree block has no reusable result, so
 create a new delegation instead.
 
+Executor results have exactly seven fields: `status`, `work_completed`,
+`changed_files`, `tests`, `error`, `next_decision`, and `discussion_points`
+(an array of strings). A `discussion` turn is finalized and has no block category.
+Answer every point in a delta task file and use
+`~/.local/bin/cross-harness reply --run-dir <run_dir> --task-file <reply_file>`;
+`retry` refuses these runs. The reply resumes the recorded thread, preserves
+attempts, increments `discussion_rounds`, and never auto-escalates the model.
+Checks declared in the original task carry over when the reply declares none.
+`adopt` refuses discussion runs because they await a reply.
+The points and round count are retained in summary and state artifacts, and
+printed before summary content that may be truncated. Non-blocking points on
+finished runs should be weighed and unresolved points named in the report.
+At `max_discussion_rounds` (default 3, range 0 to 10), present both positions to
+the user and send the decision with `reply --user-decided`. That flag skips only
+the round-limit check, still increments the count, and is recorded in
+`command.json` and `summary.json`. A limit of 0 requires it for every reply.
+
 By default, `dirty_worktree_policy="allow_delegated"` lets a write role
 continue in a dirty worktree only when every dirty file was recorded by a prior
 write delegation and has not changed since. Otherwise, the wrapper stops the

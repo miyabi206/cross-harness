@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 
 
 FAILURE_WORDS = re.compile(r"\b(error|failed|failure|exception|panic|traceback)\b", re.IGNORECASE)
@@ -30,40 +31,79 @@ _READ_COMMANDS = frozenset({
     "cat", "less", "more", "head", "tail", "bat", "echo", "printf", "grep", "rg", "ag", "sed",
     "awk", "wc", "file", "stat", "ls", "find",
 })
-_SHELL_WRAPPER = re.compile(r"^/bin/(?:zsh|bash|sh)\s+-lc\s+(['\"])(.*)\1$", re.DOTALL)
+_SHELL_WRAPPER = re.compile(r"^(?:[^\s'\"]*/)?(?:zsh|bash|sh)\s+-l?c\s+(['\"])(.*)\1$", re.DOTALL)
+
+
+def _unquoted_command_text(command: str) -> str:
+    """Mask quoted arguments and substitutions while preserving offsets."""
+    visible = list(command)
+    contexts: list[str] = []
+    escaped = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        context = contexts[-1] if contexts else None
+        if contexts or escaped:
+            visible[index] = " "
+        if escaped:
+            escaped = False
+        elif context == "'":
+            if char == "'":
+                contexts.pop()
+        elif char == "\\":
+            visible[index] = " "
+            escaped = True
+        elif context in {'"', "`"} and char == context:
+            contexts.pop()
+        elif command.startswith("$(", index) and context != "`":
+            visible[index:index + 2] = [" ", " "]
+            contexts.append(")")
+            index += 1
+        elif context == ")" and char == "(":
+            contexts.append(")")
+        elif context == ")" and char == ")":
+            contexts.pop()
+        elif char == "`" or (char in "'\"" and context not in {'"', "`"}):
+            visible[index] = " "
+            contexts.append(char)
+        index += 1
+    return "".join(visible)
+
+
 def _command_segments_with_operators(command: str) -> list[tuple[str, str | None]]:
     """Split shell command lines, preserving unquoted terminating operators."""
     match = _SHELL_WRAPPER.match(command.strip())
-    inner = match.group(2) if match else command
+    inner = command
+    if match:
+        try:
+            arguments = shlex.split(command)
+        except ValueError:
+            arguments = []
+        if len(arguments) == 3:
+            inner = arguments[2]
+    visible = _unquoted_command_text(inner)
     segments: list[tuple[str, str | None]] = []
     start = 0
-    quote: str | None = None
-    escaped = False
     index = 0
     while index < len(inner):
-        char = inner[index]
-        if escaped:
-            escaped = False
-        elif char == "\\" and quote != "'":
-            escaped = True
-        elif quote:
-            if char == quote:
-                quote = None
-        elif char in "'\"":
-            quote = char
-        elif char == "\n" or char == ";" or char == "|":
+        char = visible[index]
+        if char == "\n" or char == ";" or char == "|":
             operator = char
-            if char == "|" and index + 1 < len(inner) and inner[index + 1] in "|&":
-                operator += inner[index + 1]
-            elif char != "|" and index + 1 < len(inner) and inner[index + 1] == "&":
+            if char == "|" and index + 1 < len(inner) and visible[index + 1] in "|&":
+                operator += visible[index + 1]
+            elif char != "|" and index + 1 < len(inner) and visible[index + 1] == "&":
                 operator += "&"
             segments.append((inner[start:index], operator))
             index += len(operator)
             start = index
             continue
-        elif char == "&" and index + 1 < len(inner) and inner[index + 1] == "&":
-            segments.append((inner[start:index], "&&"))
-            index += 2
+        elif char == "&" and not (
+            (index > 0 and visible[index - 1] in "<>")
+            or (index + 1 < len(inner) and visible[index + 1] == ">")
+        ):
+            operator = "&&" if visible[index:index + 2] == "&&" else "&"
+            segments.append((inner[start:index], operator))
+            index += len(operator)
             start = index
             continue
         index += 1
@@ -78,10 +118,14 @@ def _command_segments(command: str) -> list[str]:
 
 def _pipefail_enabled_before(segments: list[tuple[str, str | None]], index: int) -> bool:
     """Return whether this shell command enabled pipefail before a pipeline."""
-    prefix = "".join(
-        segment + (operator or "") for segment, operator in segments[:index + 1]
-    )
-    return bool(re.search(r"(?:^|[;\n]|&&)\s*set\s+-o\s+pipefail\b", prefix))
+    enabled = False
+    for position, (segment, operator) in enumerate(segments[:index + 1]):
+        if position and segments[position - 1][1] not in {";", "\n", "&&"}:
+            continue
+        match = re.fullmatch(r"\s*set\s+([-+])o\s+pipefail\s*", segment)
+        if match and operator in {";", "\n", "&&"}:
+            enabled = match.group(1) == "-"
+    return enabled
 
 
 def _starts_with_read_command(command: str) -> bool:
@@ -89,9 +133,25 @@ def _starts_with_read_command(command: str) -> bool:
     return bool(token) and token[0] in _READ_COMMANDS
 
 
+def _check_status_preserved(segments: list[tuple[str, str | None]], index: int) -> bool:
+    """Reject later commands that can hide a check's failure exit status."""
+    has_following_command = False
+    for position in range(len(segments) - 1, index - 1, -1):
+        segment, operator = segments[position]
+        if operator == "&":
+            return False
+        if has_following_command and operator != "&&":
+            if operator not in {"|", "|&"} or not _pipefail_enabled_before(segments, position):
+                return False
+        has_following_command = has_following_command or bool(segment.strip())
+    return True
+
+
 def command_matches_check(command: str, check: str) -> bool:
     normalized_command = " ".join(command.split())
     normalized_check = " ".join(check.split())
+    if not normalized_check:
+        return False
     tail = normalized_check.split("&&", 1)[-1].strip()
     matches = normalized_check in normalized_command or (len(tail) >= 12 and tail in normalized_command)
     if not matches:
@@ -102,12 +162,32 @@ def command_matches_check(command: str, check: str) -> bool:
         normalized_segment = " ".join(segment.split())
         if normalized_check not in normalized_segment and (len(tail) < 12 or tail not in normalized_segment):
             continue
+        executable_segment = re.sub(
+            r"^(?:\s*[A-Za-z_][A-Za-z_0-9]*=(?:[^\s'\"\\]|\\.|'[^']*'|\"(?:\\.|[^\"\\])*\")*)+\s+",
+            "", segment,
+        ).lstrip()
+        check_at_head = " ".join(executable_segment.split()).startswith(normalized_check)
+        if not check_at_head:
+            visible_segment = _unquoted_command_text(normalized_segment)
+            candidates = [normalized_check] + ([tail] if len(tail) >= 12 else [])
+            if not any(
+                visible_segment[match.start()] != " "
+                for candidate in candidates
+                for match in re.finditer(re.escape(candidate), normalized_segment)
+            ):
+                continue
+            if re.match(r"^(?:[!:#]|(?:true|false|eval|nohup)(?:\s|$))", executable_segment):
+                continue
+        if index and segments[index - 1][1] in {"||", "|", "|&"}:
+            continue
         if (_starts_with_read_command(segment) and not check_starts_with_read):
             continue
         # The shell reports the final command in a pipeline.  A check whose
         # output is piped elsewhere is therefore not evidence of a successful
         # check unless pipefail was explicitly enabled for this command.
         if operator in {"|", "|&"} and not _pipefail_enabled_before(segments, index):
+            continue
+        if not _check_status_preserved(segments, index):
             continue
         if not _starts_with_read_command(segment) or check_starts_with_read:
             return True
@@ -370,6 +450,20 @@ def _bounded_command_text(command: object, limit: int = 500) -> str:
 
 
 def render_summary(summary: dict, limit: int) -> str:
+    discussion_lines = []
+    if summary.get("discussion_points") or summary.get("discussion_rounds", 0):
+        discussion_lines.extend([
+            f"discussion_rounds: {summary.get('discussion_rounds', 0)}/{summary.get('max_discussion_rounds', 3)}",
+            "discussion_points:",
+        ])
+        discussion_lines.extend(
+            f"- {summary_item_text(point)}" for point in summary.get("discussion_points", [])
+        )
+        if not summary.get("discussion_points"):
+            discussion_lines.append("- none")
+    prefix = "\n".join([
+        f"status: {summary['status']}", f"run_dir: {summary['run_dir']}", *discussion_lines,
+    ]) + "\n"
     checks = summary.get("checks", [])
     if not checks:
         checks_text = "none declared"
@@ -380,8 +474,6 @@ def render_summary(summary: dict, limit: int) -> str:
             for item in checks
         )
     lines = [
-        f"status: {summary['status']}",
-        f"run_dir: {summary['run_dir']}",
         f"exit_code: {summary['exit_code']}",
         f"role: {summary['role']}",
         f"model: {summary['model']}",
@@ -450,7 +542,10 @@ def render_summary(summary: dict, limit: int) -> str:
             f"({summary.get('summary_bytes', 0)}/{summary['raw_artifact_bytes']} bytes)"
         )
     text = "\n".join(lines) + "\n"
-    if len(text) <= limit:
-        return text
+    if not discussion_lines:
+        text = prefix + text
+        prefix = ""
+    if len(prefix) + len(text) <= limit:
+        return prefix + text
     suffix = "\n[summary truncated; full artifacts remain at run_dir]\n"
-    return text[: max(0, limit - len(suffix))] + suffix
+    return prefix + text[: max(0, limit - len(prefix) - len(suffix))] + suffix

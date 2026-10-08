@@ -52,6 +52,12 @@ that repository until `cross-harness project setup` is run again.
 
 Every role has `harness`, `model`, `effort`, `max_parallel`, `retries`,
 `timeout_seconds`, `write`, `output_limit_chars`, and `delegate_kinds`.
+The top-level `max_discussion_rounds` defaults to 3 and accepts integers from 0
+to 10. Discussion replies preserve attempts and do not consume the normal retry
+budget or auto-escalate the model. Once the round count reaches this limit,
+`reply` requires `--user-decided`; 0 requires it for every reply. The flag skips
+only the limit check and still increments `discussion_rounds`. Older personal
+configurations inherit 3 through default merging without being rewritten.
 The top-level `max_parallel` is an enforced runtime limit across all delegated
 runs. Each non-orchestrator role's `max_parallel` is also enforced separately;
 when either limit is full, the delegation is recorded as blocked immediately

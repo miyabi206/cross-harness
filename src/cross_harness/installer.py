@@ -59,6 +59,7 @@ def _manifest_path(paths: UserPaths) -> Path:
 
 
 def _is_install_root_repo(repo: Path, paths: UserPaths) -> bool:
+    repo = repo.resolve()
     install_root = paths.install_root.resolve()
     return repo == install_root or install_root in repo.parents
 

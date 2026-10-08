@@ -1,8 +1,10 @@
 from pathlib import Path
+import shlex
 import tempfile
 import unittest
 
 from cross_harness.files import MARKER_END, MARKER_START, append_marker, atomic_write, dump_json, extract_marker, load_json, remove_marker
+from cross_harness.runner import _check_results
 from cross_harness.summarize import command_matches_check, failure_signature, normalize_comparison_path, parse_events, render_summary
 
 
@@ -75,7 +77,177 @@ class FileTests(unittest.TestCase):
         self.assertTrue(command_matches_check(
             "set -o pipefail; ./scripts/test.sh 2>&1 | tail -100", check,
         ))
-        self.assertTrue(command_matches_check("tail -100 | ./scripts/test.sh", check))
+        self.assertFalse(command_matches_check("tail -100 | ./scripts/test.sh", check))
+
+    def test_command_match_rejects_empty_checks_without_raising(self):
+        for check in ("", " ", "\t\n "):
+            for command in ("", " ", "uv run pytest -q", "cd /tmp && scripts/test.sh"):
+                with self.subTest(command=command, check=check):
+                    self.assertFalse(command_matches_check(command, check))
+
+    def test_command_match_accepts_declared_special_prefix_only_at_segment_head(self):
+        checks = (
+            "! grep -rn TODO src",
+            '"/tmp/path with spaces/test.sh"',
+            "'./scripts/test.sh'",
+            "$(command -v python3) --version",
+            "`command -v python3` --version",
+            r"\./scripts/test.sh",
+            ": scripts/test.sh",
+            "true scripts/test.sh",
+            "false scripts/test.sh",
+            "eval scripts/test.sh",
+            "nohup scripts/test.sh",
+        )
+        for check in checks:
+            accepted = (
+                check,
+                f"cd /tmp && {check}",
+                f"MODE=test {check}",
+                f'MODE="test mode" COUNT=2 {check}',
+                f"MODE='test mode' COUNT=2 {check}",
+                f"MODE=two\\ words {check}",
+                f"cd /tmp && MODE=test {check}",
+                f"{check} --extra",
+                f"{check} && echo done",
+                f"set -o pipefail; {check} | tail -100",
+                f"set -o pipefail; {check} 2>&1 | tail -100",
+            )
+            rejected = (
+                f"! {check}",
+                f": {check}",
+                f"# {check}",
+                f"true {check}",
+                f"false {check}",
+                f"eval {check}",
+                f"nohup {check}",
+                f'MODE="test mode" eval {check}',
+                f"result=$({check})",
+                f"result=`{check}`",
+                f"custom-program {shlex.quote(check)}",
+                f"{check}; echo done",
+                f"{check}\necho done",
+                f"{check} || true",
+                f"{check} &",
+                f"{check} & echo done",
+                f"true || {check}",
+                f"true | {check}",
+                f"true |& {check}",
+                f"{check} | tail -100",
+                f"set -o pipefail; set +o pipefail; {check} | tail -100",
+                f'custom-program "set -o pipefail"; {check} | tail -100',
+            )
+            for expected, commands in ((True, accepted), (False, rejected)):
+                for command in commands:
+                    for invocation in (command, f"bash -lc {shlex.quote(command)}"):
+                        with self.subTest(check=check, command=invocation):
+                            self.assertEqual(expected, command_matches_check(invocation, check))
+                            self.assertEqual(
+                                [{"check": check, "status": "passed" if expected else "not_run",
+                                  "exit_code": 0 if expected else None}],
+                                _check_results([check], [{"command": invocation, "exit_code": 0}]),
+                            )
+
+    def test_command_match_rejects_unexecuted_or_status_masked_checks(self):
+        check = "uv run pytest -q"
+        commands = (
+            f'env bash -lc "{check}"',
+            f'env sh -c "{check}"',
+            f'eval "{check}"',
+            f'python -c "{check}"',
+            f'custom-program "{check}"',
+            f"true || {check}",
+            f"echo ready || {check}",
+            f"true | {check}",
+            f"true |& {check}",
+            f"set -o pipefail; true | {check}",
+            f"{check} &",
+            f"{check} & echo done",
+            f"{check} &\necho done",
+            f"set -o pipefail; {check} | tail -100 &",
+            f"! {check}",
+            f": {check}",
+            f"# {check}",
+            f"true {check}",
+            f"false {check}",
+            f"eval {check}",
+            f"nohup {check}",
+            f"MODE=test ! {check}",
+            f"result=$({check})",
+            f"result=$(echo ready; {check})",
+            f"result=$(echo ready\n{check})",
+            f"result=$(echo $({check}))",
+            f"result=`{check}`",
+            f"result=`echo ready; {check}`",
+            f"set -o pipefail; set +o pipefail; {check} | tail -100",
+            f"set -o pipefail && set +o pipefail && {check} | tail -100",
+            f'custom-program "set -o pipefail;"; {check} | tail -100',
+            f'custom-program "set -o pipefail"; {check} | tail -100',
+        )
+        for command in commands:
+            for shell in (None, "zsh", "bash", "sh", "/bin/zsh", "/bin/bash", "/bin/sh"):
+                for option in ("-c", "-lc") if shell else (None,):
+                    invocation = f"{shell} {option} {shlex.quote(command)}" if shell else command
+                    with self.subTest(command=invocation):
+                        self.assertFalse(command_matches_check(invocation, check))
+                        self.assertEqual(
+                            [{"check": check, "status": "not_run", "exit_code": None}],
+                            _check_results([check], [{"command": invocation, "exit_code": 0}]),
+                        )
+
+    def test_command_match_rejects_later_commands_that_can_hide_check_failure(self):
+        check = "uv run pytest -q"
+        commands = (
+            f"{check}; echo $?",
+            f"{check}\necho $?",
+            f"{check} || true",
+            f"{check} && echo done; echo $?",
+            f"{check} && echo done\necho $?",
+            f"{check} && echo done || true",
+            f"{check};\n echo $?",
+            f"set -o pipefail; {check} | tail -100; echo $?",
+            f"set -o pipefail; {check} | tail -100 || true",
+            f"{check} && echo done | tail -100",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertFalse(command_matches_check(command, check))
+                for shell in ("zsh", "bash", "sh"):
+                    self.assertFalse(command_matches_check(f'/bin/{shell} -lc "{command}"', check))
+
+    def test_command_match_keeps_commands_that_preserve_check_failure(self):
+        check = "uv run pytest -q"
+        commands = (
+            check,
+            f"{check};",
+            f"{check};\n ",
+            f"cd /tmp && {check}",
+            f"{check} && echo done",
+            f"echo ready; {check}",
+            f"echo ready\n{check}",
+            f"MODE=test {check}",
+            f"{check} --verbose",
+            f"{check} -k 'some test'",
+            f"{check} 2>&1",
+            f"{check} > results.txt",
+            f"{check} &> results.txt",
+            f"{check} &>> results.txt",
+            f"{check} 2>&1 && echo done",
+            f"{check} && echo 'done; ready | ok'",
+            f"set -o pipefail; {check} | tail -100",
+            f"set -o pipefail; {check} 2>&1 | tail -100",
+            f"set -o pipefail; {check} |& tail -100",
+            f"set -o pipefail; {check} | tail -100 && echo done",
+            f"set +o pipefail; set -o pipefail; {check} | tail -100",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertTrue(command_matches_check(command, check))
+                for shell in ("zsh", "bash", "sh", "/bin/zsh", "/bin/bash", "/bin/sh", "/usr/local/bin/bash"):
+                    for option in ("-c", "-lc"):
+                        invocation = f"{shell} {option} {shlex.quote(command)}"
+                        with self.subTest(invocation=invocation):
+                            self.assertTrue(command_matches_check(invocation, check))
 
     def test_parse_events_reads_claude_stream_result(self):
         with tempfile.TemporaryDirectory() as folder:

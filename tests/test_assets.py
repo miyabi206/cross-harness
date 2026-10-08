@@ -40,7 +40,12 @@ class AssetTests(unittest.TestCase):
             self.assertIn("Cross-harness executor", content)
             self.assertIn("Do not ask the user questions", content)
             self.assertIn("Do not follow the orchestrator charter", content)
-            self.assertIn("exactly these six fields", content)
+            self.assertIn(
+                "Run each declared check exactly as written as its own command with nothing piped "
+                "or appended, because the wrapper reads that command's exit status.",
+                " ".join(content.split()),
+            )
+            self.assertIn("exactly these seven fields", content)
             self.assertNotIn("gpt-", content)
             installed_name = f"cross-harness-{Path(name).stem}"
             self.assertIn(f"name: {installed_name}", content)
@@ -90,16 +95,65 @@ class AssetTests(unittest.TestCase):
         content = (source_root() / "assets/codex/AGENTS.md").read_text()
         self.assertIn("Cross-harness integration", content)
         self.assertIn("no interactive response\nformat requirements", content)
-        self.assertNotIn("exactly these six fields", content)
+        self.assertNotIn("exactly these seven fields", content)
         self.assertNotIn("Do not ask the user questions", content)
         self.assertNotIn("Do not narrate intermediate work", content)
         self.assertNotIn("smallest change", content)
 
     def test_orchestrator_uses_template_for_every_wrapper_action(self):
         skill = (source_root() / "assets/claude/skills/cross-harness-orchestrator/SKILL.md").read_text()
-        for action in ("task create", "delegate", "retry"):
+        for action in ("task create", "delegate", "retry", "reply"):
             self.assertIn(f"{{{{CROSS_HARNESS_BIN}}}} {action}", skill)
-        self.assertIsNone(re.search(r"`cross-harness (?:task|delegate|retry)", skill))
+        self.assertIsNone(re.search(r"`cross-harness (?:task|delegate|retry|reply)", skill))
+
+    def test_all_executor_assets_include_discussion_policy_and_contract(self):
+        root = source_root() / "assets"
+        definitions = [
+            (root / "claude/agents" / name).read_text()
+            for name in (
+                "debugger.md", "implementer.md", "implementer_complex.md",
+                "security_reviewer.md", "tester.md",
+            )
+        ]
+        for content in definitions:
+            normalized = " ".join(content.split())
+            self.assertEqual(1, normalized.count("broaden scope on your own"))
+            for phrase in (
+                "Do not ask the user questions", "broaden scope on your own",
+                "Never launch the wrapper or either harness", "materially better approach",
+                "return `discussion` with `discussion_points`", "evidence with file and line",
+                "before changing files whenever possible", "counter only with new evidence",
+                "never repeat an answered point", "obstacles a reply cannot resolve",
+                "non-blocking concerns", "exactly these seven fields",
+            ):
+                self.assertIn(phrase, normalized)
+
+    def test_native_agent_assets_have_no_result_contract(self):
+        root = source_root() / "assets"
+        paths = list((root / "codex/agents").glob("*.toml"))
+        paths.extend(root / "claude/agents" / name for name in ("explorer.md", "reviewer.md"))
+        for path in paths:
+            with self.subTest(path=path.name):
+                content = path.read_text()
+                self.assertNotIn("seven fields", content)
+                self.assertNotIn("discussion_points", content)
+
+    def test_orchestrator_discussion_and_shared_launch_policy(self):
+        root = source_root() / "assets"
+        skill = (root / "claude/skills/cross-harness-orchestrator/SKILL.md").read_text()
+        normalized = " ".join(skill.split())
+        self.assertLess(skill.index("## Verify"), skill.index("## Discuss"))
+        self.assertLess(skill.index("## Discuss"), skill.index("## Report"))
+        for phrase in (
+            "answer every point yourself", "reject it with the reason and evidence",
+            "Do not ask the user", "settle scope changes", "present both positions to the user",
+            "--user-decided", "do not count against the two normal retries",
+            "name any left unresolved", "explicit human confirmation and a security review",
+        ):
+            self.assertIn(phrase, normalized)
+        safety = " ".join((root / "shared/safety.md").read_text().split())
+        self.assertIn("Never launch Claude from a delegated Codex run or Codex from another Codex run.", safety)
+        self.assertIn("Launching has exactly one direction and one level. Discussion flows both ways through discussion results and the reply command.", safety)
 
     def test_orchestrator_routes_complex_changes_and_templates_effort(self):
         skill = (source_root() / "assets/claude/skills/cross-harness-orchestrator/SKILL.md").read_text()

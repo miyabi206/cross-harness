@@ -1,5 +1,6 @@
 from pathlib import Path
 from unittest.mock import patch
+import errno
 import json
 import os
 import subprocess
@@ -41,6 +42,14 @@ class RunnerTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def _write_invalid_utf8_fixture(self, path):
+        try:
+            path.write_bytes(b"before\n")
+        except OSError as exc:
+            if exc.errno == errno.EILSEQ:
+                self.skipTest("filesystem does not support non-UTF8 filenames")
+            raise
 
     def test_tee_writes_and_flushes_small_block_before_pipe_closes(self):
         reader_fd, writer_fd = os.pipe()
@@ -97,11 +106,36 @@ class RunnerTests(unittest.TestCase):
 
         self.assertTrue(codex_task.startswith(CODEX_EXECUTOR_CHARTER + "\n\n# Delegated task\n\n"))
         self.assertTrue(codex_task.endswith(task))
-        self.assertIn("exactly these six fields", codex_task)
+        self.assertIn("exactly these seven fields", codex_task)
         self.assertIn("delegate to another agent", codex_task)
         self.assertIn("launch Claude", codex_task)
         self.assertEqual(task, _executor_task(task, "claude"))
         self.assertNotIn(CODEX_EXECUTOR_CHARTER, CLAUDE_EXECUTOR_CHARTER)
+
+    def test_executor_charters_require_checks_as_separate_commands(self):
+        sentence = (
+            "Run each declared check exactly as written as its own command with nothing piped "
+            "or appended, because the wrapper reads that command's exit status."
+        )
+        for charter in (CODEX_EXECUTOR_CHARTER, CLAUDE_EXECUTOR_CHARTER):
+            with self.subTest(charter=charter.splitlines()[2]):
+                self.assertIn(sentence, " ".join(charter.split()))
+
+    def test_declared_check_with_later_unconditional_command_is_not_run(self):
+        check = "uv run pytest -q"
+        commands = (
+            f"{check}; echo $?",
+            f"{check}\necho $?",
+            f"{check} || true",
+            f"{check} && echo done; echo $?",
+        )
+        for command in commands:
+            for exit_code in (0, 1):
+                with self.subTest(command=command, exit_code=exit_code):
+                    self.assertEqual(
+                        [{"check": check, "status": "not_run", "exit_code": None}],
+                        runner._check_results([check], [{"command": command, "exit_code": exit_code}]),
+                    )
 
     def _failed_write_run(self, name: str, changed_file: str, contents: str, attempt: int = 1) -> Path:
         """Create a real failed write-run artifact for retry guard tests."""
@@ -174,7 +208,7 @@ class RunnerTests(unittest.TestCase):
     def test_delegate_writes_json_artifacts_for_invalid_utf8_changes(self, invoke, ownership, verify):
         file_name = os.fsdecode(b"bad-\xff-delegate.txt")
         path = self.repo / file_name
-        path.write_bytes(b"before\n")
+        self._write_invalid_utf8_fixture(path)
         git(self.repo, "add", file_name)
         git(self.repo, "commit", "-m", "invalid utf8 delegate path")
 
@@ -771,7 +805,7 @@ class RunnerTests(unittest.TestCase):
         raw_name = b"bad-\xff-name.txt"
         file_name = os.fsdecode(raw_name)
         path = self.repo / file_name
-        path.write_bytes(b"before\n")
+        self._write_invalid_utf8_fixture(path)
         git(self.repo, "add", file_name)
         git(self.repo, "commit", "-m", "invalid utf8 path")
         path.write_bytes(b"after\n")
@@ -1812,13 +1846,14 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
         instruction = command[command.index("--append-system-prompt") + 1]
         self.assertIn("Cross-harness executor", instruction)
         self.assertIn("Do not follow the orchestrator charter", instruction)
-        self.assertIn("exactly these six fields", instruction)
-        self.assertIn("status (one of success, failed, blocked, partial)", instruction)
+        self.assertIn("exactly these seven fields", instruction)
+        self.assertIn("status (one of success, failed, blocked, partial, discussion)", instruction)
         self.assertIn("work_completed (string)", instruction)
         self.assertIn("changed_files (array of strings)", instruction)
         self.assertIn("tests (array of strings)", instruction)
         self.assertIn("error (string or null)", instruction)
         self.assertIn("next_decision (string or null)", instruction)
+        self.assertIn("discussion_points (array of strings)", instruction)
         self.assertIn("only a JSON object", instruction)
         self.assertIn("Do not write the result to a file", instruction)
         self.assertNotIn(str(run / "final.json"), instruction)
@@ -1863,7 +1898,7 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
         instruction = command[command.index("--append-system-prompt") + 1]
         self.assertIn("Cross-harness executor", instruction)
         self.assertIn("Do not ask the user questions", instruction)
-        self.assertIn("exactly these six fields", instruction)
+        self.assertIn("exactly these seven fields", instruction)
 
     def test_codex_resume_reapplies_sandbox_through_config_override(self):
         run = self.root / "codex-resume"
@@ -2731,7 +2766,7 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
     def test_finalize_records_invalid_utf8_path_and_writes_readable_json(self):
         file_name = os.fsdecode(b"bad-\xff-delegated.txt")
         path = self.repo / file_name
-        path.write_bytes(b"before\n")
+        self._write_invalid_utf8_fixture(path)
         git(self.repo, "add", file_name)
         git(self.repo, "commit", "-m", "invalid utf8 delegated path")
 

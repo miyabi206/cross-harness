@@ -131,6 +131,34 @@ explicit escalation; authentication or rate-limit failures stop immediately.
 Runtime cleanup marks incomplete runs as ORPHANED only when their
 `supervisor.pid` is not alive.
 
+## Discuss
+
+When a run returns `discussion`, answer every point yourself: accept it with a
+changed instruction or reject it with the reason and evidence. Send all answers
+in a task file with:
+
+```text
+{{CROSS_HARNESS_BIN}} reply --run-dir <run_dir> --task-file <reply_file>
+```
+
+Create the reply file with `{{CROSS_HARNESS_BIN}} task create` like any task
+file. Checks declared in the original task carry over when the reply declares
+none.
+
+Do not ask the user; you may settle scope changes with the executor. Discussion
+replies do not count against the two normal retries. When `reply` refuses at
+`max_discussion_rounds`, present both positions to the user and send the decision
+with:
+
+```text
+{{CROSS_HARNESS_BIN}} reply --run-dir <run_dir> --task-file <decision_file> --user-decided
+```
+
+Weigh non-blocking `discussion_points` on a finished run before reporting, and
+name any left unresolved in the report. The explicit human confirmation and
+security review rule for security, auth, database, public API, or infrastructure
+changes still applies.
+
 ## Report
 
 Report only changes, verification, and unresolved items. Do not repeat the raw

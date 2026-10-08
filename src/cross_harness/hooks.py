@@ -24,12 +24,12 @@ from .taskfile import contains_secret
 SHELL_BOUNDARY = r"[;&|()\s'\"`]"
 CODEX_EXEC = re.compile(rf"(?:^|{SHELL_BOUNDARY})(?:[^\s;&|()'\"`]*/)?codex\s+(?:e|exec)(?=$|{SHELL_BOUNDARY})")
 CLAUDE_EXEC = re.compile(rf"(?:^|{SHELL_BOUNDARY})(?:[^\s;&|()'\"`]*/)?claude(?=$|{SHELL_BOUNDARY})")
-BARE_WRAPPER = re.compile(rf"(?:^|{SHELL_BOUNDARY})cross-harness\s+(?:task|delegate|retry)(?=$|{SHELL_BOUNDARY})")
+BARE_WRAPPER = re.compile(rf"(?:^|{SHELL_BOUNDARY})cross-harness\s+(?:task|delegate|retry|reply)(?=$|{SHELL_BOUNDARY})")
 HARNESS_DELEGATION = re.compile(
-    rf"(?:^|{SHELL_BOUNDARY})(?:[^\s;&|()'\"`]*/)?cross-harness\s+(?:delegate|retry)(?=$|{SHELL_BOUNDARY})"
+    rf"(?:^|{SHELL_BOUNDARY})(?:[^\s;&|()'\"`]*/)?cross-harness\s+(?:delegate|retry|reply)(?=$|{SHELL_BOUNDARY})"
 )
 HARNESS_REDELEGATION = re.compile(
-    rf"(?:^|{SHELL_BOUNDARY})(?:[^\s;&|()'\"`]*/)?cross-harness\s+(?:delegate|retry|task\s+create)(?=$|{SHELL_BOUNDARY})"
+    rf"(?:^|{SHELL_BOUNDARY})(?:[^\s;&|()'\"`]*/)?cross-harness\s+(?:delegate|retry|reply|task\s+create)(?=$|{SHELL_BOUNDARY})"
 )
 SIMPLE_WRAPPER_UNSAFE_SYNTAX = re.compile(r"[;&|()\n\r`<>{}]")
 ORCHESTRATOR_ACTIONS_MAX_BYTES = 5 * 1024 * 1024

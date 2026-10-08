@@ -270,6 +270,15 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(["  ◐ partial"], watcher.poll())
         self.assertEqual([], watcher.poll())
 
+    def test_discussion_is_finalized_and_rendered_once(self):
+        watcher = RunWatcher(self.runs)
+        self.assertEqual([], watcher.poll())
+        run = self.runs / "discussion"
+        run.mkdir()
+        (run / "state.json").write_text('{"status":"discussion","discussion_rounds":1}')
+        self.assertEqual(["  ? discussion"], watcher.poll())
+        self.assertEqual([], watcher.poll())
+
     def test_missing_or_empty_runs_root_waits_quietly(self):
         missing = RunWatcher(self.runs.parent / "missing")
         self.assertEqual([], missing.poll())

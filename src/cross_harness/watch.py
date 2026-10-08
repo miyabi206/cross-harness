@@ -15,7 +15,7 @@ from .config import load_config
 from .paths import user_paths
 
 
-_VERDICTS = {"success", "failed", "blocked", "partial"}
+_VERDICTS = {"success", "failed", "blocked", "partial", "discussion"}
 _DETAIL_LIMIT = 120
 _EXECUTION_METADATA_LIMIT = 64 * 1024
 _DEFAULT_WIDTH = 100
@@ -512,6 +512,7 @@ class RunWatcher:
             "failed": ("✖", "red"),
             "blocked": ("⚠", "yellow"),
             "partial": ("◐", "yellow"),
+            "discussion": ("?", "yellow"),
         }[status]
         return self._emit((EventLine(marker, detail=status, tone=tone),))
 

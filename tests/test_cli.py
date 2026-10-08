@@ -13,6 +13,35 @@ from cross_harness.errors import SupervisorDiedError
 
 
 class CliWaitTests(unittest.TestCase):
+    def test_reply_passes_run_task_config_and_user_decision_and_prints_summary(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            (root / "summary.txt").write_text("discussion summary\n")
+            for user_decided in (False, True):
+                with self.subTest(user_decided=user_decided), redirect_stdout(StringIO()) as output, patch(
+                    "cross_harness.cli.reply", return_value={"status": "discussion", "run_dir": str(root)}
+                ) as reply:
+                    args = [
+                        "--home", str(root), "reply", "--run-dir", str(root),
+                        "--task-file", str(root / "reply.md"), "--config", str(root / "config.toml"),
+                    ]
+                    if user_decided:
+                        args.append("--user-decided")
+                    self.assertEqual(1, main(args))
+                    reply.assert_called_once_with(
+                        root, root / "reply.md", root / "config.toml", root, user_decided=user_decided,
+                    )
+                    self.assertEqual("discussion summary\n", output.getvalue())
+
+    def test_wait_accepts_finalized_discussion(self):
+        with tempfile.TemporaryDirectory() as folder:
+            run = Path(folder)
+            (run / "summary.json").write_text('{"status":"discussion"}')
+            (run / "summary.txt").write_text("discussion summary\n")
+            with redirect_stdout(StringIO()) as output:
+                self.assertEqual(3, main(["wait", "--run", str(run), "--timeout-seconds", "0"]))
+            self.assertEqual("discussion summary\n", output.getvalue())
+
     def test_validate_reports_defaulted_settings_for_partial_personal_config(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

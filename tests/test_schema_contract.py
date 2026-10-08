@@ -42,6 +42,30 @@ class SchemaContractTests(unittest.TestCase):
         self.assertEqual(config_module.ROLE_KEYS, set(self.schema["$defs"]["role"]["properties"]))
         self.assertEqual(config_module.PROJECT_KEYS, set(self.schema["$defs"]["project"]["properties"]))
 
+    def test_result_schema_requires_seven_fields_and_string_discussion_points(self):
+        schema = json.loads((source_root() / "schemas/delegation-result.schema.json").read_text())
+        result = {
+            "status": "discussion", "work_completed": "", "changed_files": [],
+            "tests": [], "error": None, "next_decision": None,
+            "discussion_points": ["Concern; runner.py:1 evidence; proposal."],
+        }
+        self.assertEqual(set(result), set(schema["required"]))
+        self.assertEqual([], self._validate(result, schema))
+        for points in (None, "concern", [1]):
+            with self.subTest(points=points):
+                self.assertTrue(self._validate({**result, "discussion_points": points}, schema))
+        del result["discussion_points"]
+        self.assertIn("$: missing 'discussion_points'", self._validate(result, schema))
+
+    def test_discussion_limit_schema_range_matches_runtime(self):
+        for value in (0, 10, -1, 11, True, "3"):
+            with self.subTest(value=value):
+                config = copy.deepcopy(self.default_config)
+                config["max_discussion_rounds"] = value
+                self.assertEqual(
+                    bool(config_module.validate(config)), bool(self._validate(config, self.schema)),
+                )
+
     def test_schema_enums_match_config_validation(self):
         definitions = self.schema["$defs"]
         self.assertEqual(

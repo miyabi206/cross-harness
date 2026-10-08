@@ -20,6 +20,27 @@ from cross_harness.errors import ConfigError
 
 
 class ConfigTests(unittest.TestCase):
+    def test_discussion_limit_range_and_legacy_default(self):
+        self.assertEqual(3, default_config()["max_discussion_rounds"])
+        for value in (0, 3, 10, -1, 11, True, 1.5, "3"):
+            with self.subTest(value=value):
+                config = default_config()
+                config["max_discussion_rounds"] = value
+                errors = validate(config)
+                if type(value) is int and 0 <= value <= 10:
+                    self.assertEqual([], errors)
+                else:
+                    self.assertIn("max_discussion_rounds: expected integer in range 0..10", errors)
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            path = home / "legacy.toml"
+            contents = (Path(__file__).resolve().parents[1] / "config/default.toml").read_text()
+            contents = contents.replace("max_discussion_rounds = 3\n", "")
+            path.write_text(contents)
+            self.assertEqual(3, load_config(path, home)["max_discussion_rounds"])
+            self.assertIn("max_discussion_rounds", defaulted_config_paths(path, home))
+            self.assertEqual(contents, path.read_text())
+
     def test_defaults_match_required_roles_and_validate(self):
         config = default_config()
         self.assertEqual([], validate(config))
