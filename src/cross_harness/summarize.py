@@ -484,6 +484,16 @@ def render_summary(summary: dict, limit: int) -> str:
         f"checks: {checks_text}",
         f"unrelated_failed_commands: {summary.get('unrelated_failed_command_count', 0)}",
     ]
+    commit = summary.get("commit")
+    if isinstance(commit, dict):
+        commit_lines = [f"commit: {commit['status']}"]
+        for key in ("sha", "branch", "subject", "paths", "excluded_paths", "reason"):
+            if key in commit:
+                value = commit[key]
+                if isinstance(value, list):
+                    value = ", ".join(summary_item_text(item) for item in value) or "none"
+                commit_lines.append(f"commit_{key}: {summary_item_text(value)}")
+        lines[4:4] = commit_lines
     last_failed_command = summary.get("last_unrelated_failed_command")
     if isinstance(last_failed_command, dict):
         lines.append(

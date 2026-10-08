@@ -94,6 +94,7 @@ def parser() -> argparse.ArgumentParser:
     task_create.add_argument("--kind", required=True)
     task_create.add_argument("--cwd", required=True, type=Path)
     task_create.add_argument("--goal", required=True)
+    task_create.add_argument("--commit-message")
     task_create.add_argument("--done-when", required=True, action="append")
     task_create.add_argument("--scope", action="append", default=[])
     task_create.add_argument("--constraint", action="append", default=[])
@@ -251,6 +252,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.assumption,
                     args.config,
                     home,
+                    commit_message=args.commit_message,
                 )
                 print(path)
         elif args.command == "hook":

@@ -121,6 +121,14 @@ class RunnerTests(unittest.TestCase):
             with self.subTest(charter=charter.splitlines()[2]):
                 self.assertIn(sentence, " ".join(charter.split()))
 
+    def test_executor_charters_reserve_git_commits_for_wrapper(self):
+        sentence = (
+            "Do not create commits, switch branches or rewrite Git history, "
+            "because the wrapper commits a successful run."
+        )
+        for charter in (CODEX_EXECUTOR_CHARTER, CLAUDE_EXECUTOR_CHARTER):
+            self.assertIn(sentence, " ".join(charter.split()))
+
     def test_declared_check_with_later_unconditional_command_is_not_run(self):
         check = "uv run pytest -q"
         commands = (
@@ -2513,6 +2521,9 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
     @patch("cross_harness.runner.verify_codex_config_ownership")
     @patch("cross_harness.runner._invoke_safe")
     def test_default_allow_delegated_accepts_recorded_changes_and_rejects_other_changes(self, invoke, ownership, verify):
+        config = self.home / ".config/cross-harness/config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text("auto_commit = false\n")
         self.task.write_text("# Goal\nMake a delegated change.\n\n# Checks\n- fixture\n")
         verify.return_value = (Path("/usr/bin/true"), False)
 

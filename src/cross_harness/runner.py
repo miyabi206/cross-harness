@@ -29,6 +29,8 @@ from .config import (
     CODEX_EFFORTS,
     defaulted_config_paths,
     delegation_kind_error,
+    effective_auto_commit,
+    effective_protected_branches,
     load_config,
     project_config,
 )
@@ -69,6 +71,7 @@ Do not follow the orchestrator charter from CLAUDE.md: this is an execution-role
 charter. Make the smallest change that satisfies its completion conditions.
 Do not ask the user questions, broaden scope on your own, delegate to another agent, or launch Codex.
 Never launch the wrapper or either harness.
+Do not create commits, switch branches or rewrite Git history, because the wrapper commits a successful run.
 Run each declared check exactly as written as its own command with nothing piped
 or appended, because the wrapper reads that command's exit status.
 When you disagree with the task direction, see a materially better approach, or
@@ -90,6 +93,7 @@ You are the bounded execution worker for a task file supplied by Claude. Make
 the smallest change that satisfies its completion conditions. Do not ask the
 user questions, broaden scope on your own, delegate to another agent, or launch Claude.
 Never launch the wrapper or either harness.
+Do not create commits, switch branches or rewrite Git history, because the wrapper commits a successful run.
 Run each declared check exactly as written as its own command with nothing piped
 or appended, because the wrapper reads that command's exit status.
 When you disagree with the task direction, see a materially better approach, or
@@ -420,6 +424,193 @@ def _record_delegated_changes(
     descriptor = _acquire_delegated_changes_lock(runtime_root)
     try:
         _record_delegated_changes_locked(runtime_root, run_dir, cwd, current, execution_delta)
+    finally:
+        _release_lock(descriptor)
+
+
+def _task_subject(task: str, section: str) -> str | None:
+    """Read the first non-empty line of a task section as a subject."""
+    in_section = False
+    for line in task.splitlines():
+        if _HEADING.match(line):
+            in_section = bool(re.fullmatch(rf"#{{1,6}}\s+{section}\s*", line, re.IGNORECASE))
+        elif in_section and line.strip():
+            item = _CHECK_ITEM.match(line)
+            return (item.group(1) if item else line).strip()
+    return None
+
+
+def _prepare_commit_settings(
+    config: dict, role_name: str, root: Path, run_dir: Path, previous_run: Path | None = None,
+) -> None:
+    """Persist the resolved subject and root-specific policy before execution."""
+    task = (run_dir / "task.md").read_text(encoding="utf-8")
+    subject = _task_subject(task, "Commit message")
+    if not subject and previous_run is not None:
+        previous_subject = previous_run / "commit-subject.txt"
+        if previous_subject.exists():
+            subject = previous_subject.read_text(encoding="utf-8").strip() or None
+    subject = subject or (_task_subject(task, "Goal") or "")[:72]
+    subject = subject or f"cross-harness: {role_name} {run_dir.name}"
+    atomic_write(run_dir / "commit-subject.txt", subject + "\n")
+    atomic_write(run_dir / "auto-commit.json", dump_json({
+        "enabled": effective_auto_commit(config, root),
+        "write": config["roles"][role_name]["write"],
+        "protected_branches": effective_protected_branches(config, root),
+        "dirty_worktree_policy": _effective_dirty_worktree_policy(config, root),
+        "subject": subject,
+    }))
+
+
+def _current_branch(root: Path) -> str | None:
+    result = _git(root, ["symbolic-ref", "--quiet", "--short", "HEAD"])
+    if result.returncode == 1:
+        return None
+    if result.returncode:
+        raise HarnessError(result.stderr.strip() or "could not inspect Git branch")
+    return result.stdout.strip()
+
+
+def _prepare_work_branch(
+    config: dict, role_name: str, role: dict, kind: str, root: Path, runtime_root: Path,
+    run_dir: Path, *, attempts: int = 0, thread_id: str | None = None,
+    signatures: list[str] | None = None, defaulted_settings: list[str] | None = None,
+    discussion_rounds: int = 0, max_discussion_rounds: int = 3, user_decided: bool = False,
+) -> None:
+    """Move a root writer off a protected or detached HEAD without a checkout."""
+    if not role["write"] or (run_dir / "ISOLATED_WORKTREE").exists() or not effective_auto_commit(config, root):
+        return
+    digest = hashlib.sha256(str(root.resolve()).encode("utf-8")).hexdigest()
+    lock_path = runtime_root / "locks" / f"work-branch-{digest}.lock"
+    descriptor = None
+    try:
+        deadline = time.monotonic() + _DELEGATED_CHANGES_LOCK_TIMEOUT_SECONDS
+        while descriptor is None:
+            descriptor = _try_lock(lock_path)
+            if descriptor is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise HarnessError(f"timed out waiting for lock: {lock_path}")
+                time.sleep(min(_LOCK_POLL_INTERVAL_SECONDS, remaining))
+        branch = _current_branch(root)
+        if branch is None or branch in effective_protected_branches(config, root):
+            subject = (run_dir / "commit-subject.txt").read_text(encoding="utf-8").strip()
+            slug = re.sub(r"[^a-z0-9]+", "-", subject.lower()).strip("-")[:40].rstrip("-")
+            slug = slug or re.sub(r"[^a-z0-9]+", "-", run_dir.name.lower()).strip("-")[:40].rstrip("-")
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+            branch = f"{config['work_branch_prefix']}{stamp}-{slug}"
+            # Both refs point at the same tree. Updating only HEAD avoids any
+            # change to the user's working files or index, even when dirty.
+            for args in (["branch", branch], ["symbolic-ref", "HEAD", f"refs/heads/{branch}"]):
+                result = _git(root, args)
+                if result.returncode:
+                    raise HarnessError(result.stderr.strip() or result.stdout.strip() or "could not create work branch")
+        atomic_write(run_dir / "WORK_BRANCH", branch + "\n")
+    except (HarnessError, OSError, subprocess.TimeoutExpired) as exc:
+        reason = f"work branch preparation failed: {exc}"
+        finalize_blocked_run(
+            run_dir, role_name, role, kind, root, reason, "work_branch",
+            attempts=attempts, thread_id=thread_id, signatures=signatures,
+            defaulted_settings=defaulted_settings, discussion_rounds=discussion_rounds,
+            max_discussion_rounds=max_discussion_rounds, user_decided=user_decided,
+        )
+        raise HarnessError(f"{reason}\nrun state: {run_dir}") from exc
+    finally:
+        if descriptor is not None:
+            _release_lock(descriptor)
+
+
+def _auto_commit_run(
+    run_dir: Path, role: dict, cwd: Path, status: str, current: list[dict],
+    delta: list[dict], baseline_names: set[str], diff_check_unavailable: bool,
+) -> dict | None:
+    """Commit only admitted run paths, preserving unrelated staged changes."""
+    if not role.get("write"):
+        return None
+    settings_path = run_dir / "auto-commit.json"
+    settings = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
+    record = {"status": "disabled", "subject": settings.get("subject")}
+    if not settings.get("enabled"):
+        record["reason"] = "auto_commit is not effective"
+        return record
+    record["status"] = "skipped"
+    branch_path = run_dir / "WORK_BRANCH"
+    if branch_path.exists():
+        record["branch"] = branch_path.read_text(encoding="utf-8").strip()
+    if status != "success":
+        record["reason"] = "status not success"
+        return record
+    if (run_dir / "ISOLATED_WORKTREE").exists():
+        record["reason"] = "isolated worktree"
+        return record
+    if diff_check_unavailable:
+        record["reason"] = "diff check unavailable"
+        return record
+    candidates = {item["file"] for item in delta}
+    if settings["dirty_worktree_policy"] == "allow_delegated":
+        candidates |= baseline_names
+    excluded = candidates & baseline_names if settings["dirty_worktree_policy"] == "allow" else set()
+    paths = sorted((candidates - excluded) & {item["file"] for item in current})
+    record.update({"paths": paths, "excluded_paths": sorted(excluded)})
+    if not paths:
+        record["reason"] = "overlap with pre-existing changes" if excluded else "no changes"
+        return record
+    index_path = None
+    index_contents = None
+    index_mode = 0o644
+    staged = False
+    try:
+        branch = _current_branch(cwd)
+        record["branch"] = branch
+        if branch is None or branch in settings["protected_branches"]:
+            record["reason"] = "protected branch" if branch is not None else "protected branch (detached HEAD)"
+            return record
+        index_result = _git(cwd, ["rev-parse", "--git-path", "index"])
+        if index_result.returncode:
+            raise HarnessError(index_result.stderr.strip() or "could not locate Git index")
+        index_path = Path(index_result.stdout.strip())
+        if not index_path.is_absolute():
+            index_path = cwd / index_path
+        if index_path.exists():
+            index_contents = index_path.read_bytes()
+            index_mode = stat.S_IMODE(index_path.stat().st_mode)
+        staged = True
+        for args in (
+            ["--literal-pathspecs", "add", "-A", "--", *paths],
+            ["--literal-pathspecs", "commit", "--only", "-m", settings["subject"], "--", *paths],
+        ):
+            result = _git(cwd, args)
+            if result.returncode:
+                error = (result.stderr or result.stdout).strip()[-2000:]
+                raise HarnessError(f"git {args[1]} exited {result.returncode}: {error}")
+        staged = False
+        head = _git(cwd, ["rev-parse", "HEAD"])
+        if head.returncode:
+            raise HarnessError(head.stderr.strip() or "could not read committed HEAD")
+        record.update({"status": "committed", "sha": head.stdout.strip()})
+    except (HarnessError, OSError, subprocess.TimeoutExpired) as exc:
+        reason = str(exc).strip()[-2000:]
+        if staged and index_path is not None:
+            try:
+                if index_contents is None:
+                    index_path.unlink(missing_ok=True)
+                else:
+                    atomic_write(index_path, index_contents, index_mode)
+            except OSError as restore_error:
+                reason += f"; could not restore Git index: {restore_error}"
+        record.update({"status": "failed", "reason": reason})
+    return record
+
+
+def _forget_committed_paths(runtime_root: Path, cwd: Path, paths: list[str]) -> None:
+    descriptor = _acquire_delegated_changes_lock(runtime_root)
+    try:
+        records = _read_delegated_changes(runtime_root) or {}
+        root = str(_git_root(cwd))
+        if root in records:
+            for path in paths:
+                records[root].pop(path, None)
+            atomic_write(_delegated_changes_path(runtime_root), dump_json(records))
     finally:
         _release_lock(descriptor)
 
@@ -1090,12 +1281,30 @@ def adopt(
 
 def _write_baseline(run_dir: Path, cwd: Path) -> None:
     diff_stat, details, changed = _diff_details(cwd)
-    atomic_write(run_dir / "baseline.json", dump_json({
+    baseline = {
         "cwd": str(cwd),
         "diff_stat": diff_stat,
         "diff_summary": details,
         "changed_files": changed,
-    }))
+    }
+    settings_path = run_dir / "auto-commit.json"
+    settings = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
+    if settings.get("enabled") and settings.get("write") and not (run_dir / "ISOLATED_WORKTREE").exists():
+        # A staged change and an inverse unstaged change can cancel in diff
+        # HEAD. Preserve those paths too, without refreshing the user's index.
+        status = _git(cwd, ["--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        if status.returncode:
+            raise HarnessError(status.stderr.strip() or "could not inspect baseline Git paths")
+        entries = iter(status.stdout.split("\0"))
+        dirty_paths = set()
+        for entry in entries:
+            if not entry:
+                continue
+            dirty_paths.add(entry[3:])
+            if "R" in entry[:2] or "C" in entry[:2]:
+                dirty_paths.add(next(entries))
+        baseline["dirty_paths"] = sorted(dirty_paths)
+    atomic_write(run_dir / "baseline.json", dump_json(baseline))
 
 
 def _write_execution_record(
@@ -1145,7 +1354,7 @@ def _execution_delta(run_dir: Path, current: list[dict]) -> tuple[list[dict], se
                 "untracked": item.get("untracked", False),
                 "removed_preexisting_change": True,
             })
-    return delta, set(before)
+    return delta, set(before) | set(baseline.get("dirty_paths", []))
 
 
 def _declared_checks(run_dir: Path) -> list[str]:
@@ -1674,6 +1883,7 @@ def delegate(
     run_task = run_dir / "task.md"
     if task_file.resolve() != run_task.resolve():
         shutil.copy2(task_file, run_task)
+    _prepare_commit_settings(config, role_name, root, run_dir)
     try:
         execution_root = _prepare_write_execution(
             config,
@@ -1684,6 +1894,11 @@ def delegate(
             runtime_root,
             run_dir,
             defaulted_settings=defaulted_settings,
+        )
+        _prepare_work_branch(
+            config, role_name, role, kind, root, runtime_root, run_dir,
+            defaulted_settings=defaulted_settings,
+            max_discussion_rounds=config["max_discussion_rounds"],
         )
         _write_baseline(run_dir, execution_root)
         try:
@@ -1811,10 +2026,11 @@ def start_detached_delegate(
         raise HarnessError("task file is empty")
     if contains_secret(task):
         raise HarnessError("task file appears to contain credential material; refusing delegation")
-    _git_root(cwd)
+    root = _git_root(cwd)
     run_dir = _new_run_dir(Path(config["runtime_root"]))
     run_task = run_dir / "task.md"
     shutil.copy2(task_file, run_task)
+    _prepare_commit_settings(config, role_name, root, run_dir)
     command = [sys.executable, "-m", "cross_harness.cli"]
     if home is not None:
         command.extend(["--home", str(home)])
@@ -2061,6 +2277,9 @@ def finalize_blocked_run(
         "model": role["model"],
         "effort": role["effort"],
     }
+    commit = _auto_commit_run(run_dir, role, cwd, "blocked", [], [], set(), True)
+    if commit is not None:
+        summary["commit"] = commit
     atomic_write(run_dir / "summary.json", dump_json(summary))
     atomic_write(run_dir / "state.json", dump_json(state))
     atomic_write(run_dir / "BLOCKED", f"{category}: {reason}\n")
@@ -2263,6 +2482,15 @@ def finalize_run(
         reported_tests = []
     else:
         reported_tests = [summary_item_text(test) for test in reported_tests]
+    commit = _auto_commit_run(
+        run_dir, role, cwd, status, current_diff_summary, diff_summary,
+        baseline_names, diff_check_unavailable,
+    )
+    if commit is not None and commit["status"] == "failed":
+        status = "partial"
+        combined_error = f"{combined_error}\nauto-commit failed: {commit['reason']}".strip()
+    if commit is not None and commit["status"] == "committed" and runtime_root is not None:
+        _forget_committed_paths(runtime_root, cwd, commit["paths"])
     thread_id = parsed.get("thread_id") or thread_id
     summary = {
         "status": status,
@@ -2302,6 +2530,8 @@ def finalize_run(
         "cwd": str(cwd),
         "defaulted_settings": defaulted_settings or [],
     }
+    if commit is not None:
+        summary["commit"] = commit
     if self_reversion_check_unavailable:
         summary["self_reversion_check"] = "unavailable"
     if diff_check_unavailable:
@@ -2465,7 +2695,7 @@ def _retry_impl(
                 f"retry refused: {blocked_category} is a safety-policy stop; "
                 "authentication and rate-limit blocks must not be retried"
             )
-        elif blocked_category in {"dirty_worktree", "missing_isolated_worktree"}:
+        elif blocked_category in {"dirty_worktree", "missing_isolated_worktree", "work_branch"}:
             raise HarnessError(
                 f"retry refused: {blocked_category} has no reusable result; "
                 "create a new delegate instead"
@@ -2514,6 +2744,7 @@ def _retry_impl(
         atomic_write(retry_root / "task.md", task)
     else:
         shutil.copy2(task_file, retry_root / "task.md")
+    _prepare_commit_settings(config, role_name, source_root, retry_root, run_dir)
     execution_root = _prepare_retry_execution(
         config, role_name, role, state["kind"], source_root, retry_root, run_dir,
         runtime_root=runtime_root,
@@ -2521,6 +2752,12 @@ def _retry_impl(
         thread_id=state["thread_id"],
         signatures=state.get("signatures", []),
         defaulted_settings=defaulted_settings,
+        **discussion,
+    )
+    _prepare_work_branch(
+        config, role_name, role, state["kind"], source_root, runtime_root, retry_root,
+        attempts=state["attempts"], thread_id=state["thread_id"],
+        signatures=state.get("signatures", []), defaulted_settings=defaulted_settings,
         **discussion,
     )
     root_lock_held = (
@@ -2623,6 +2860,7 @@ def _retry_impl(
         escalation = _escalated_role(role, config)
         escalation_root = _new_run_dir(runtime_root)
         shutil.copy2(task_file, escalation_root / "task.md")
+        _prepare_commit_settings(config, role_name, source_root, escalation_root, retry_root)
         escalation_execution_root = _prepare_retry_execution(
             config, role_name, escalation, state["kind"], source_root, escalation_root, retry_root,
             runtime_root=runtime_root,
@@ -2630,6 +2868,12 @@ def _retry_impl(
             signatures=new_state.get("signatures", []),
             defaulted_settings=defaulted_settings,
             root_lock_held=root_lock_held,
+            **discussion,
+        )
+        _prepare_work_branch(
+            config, role_name, escalation, state["kind"], source_root, runtime_root, escalation_root,
+            attempts=new_state["attempts"], thread_id=summary.get("thread_id"),
+            signatures=new_state.get("signatures", []), defaulted_settings=defaulted_settings,
             **discussion,
         )
         _write_baseline(escalation_root, escalation_execution_root)

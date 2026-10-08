@@ -11,10 +11,23 @@ import subprocess
 import pytest
 
 from cross_harness.runner import _claude_command, _codex_command
+from cross_harness.cli import main, parser
 
 
 HELP_TIMEOUT_SECONDS = 10
 _OPTION = re.compile(r"(?<!\w)(--[A-Za-z0-9][A-Za-z0-9-]*|-[A-Za-z0-9])")
+
+
+def test_task_create_commit_message_flag_is_forwarded(tmp_path, capsys):
+    arguments = [
+        "--home", str(tmp_path / "home"), "task", "create", "--role", "implementer",
+        "--kind", "implementation", "--cwd", str(tmp_path), "--goal", "Implement",
+        "--done-when", "Done", "--check", "fixture", "--commit-message", "Add a feature",
+    ]
+    assert parser().parse_args(arguments).commit_message == "Add a feature"
+    assert main(arguments) == 0
+    task = Path(capsys.readouterr().out.strip())
+    assert "# Commit message\nAdd a feature\n" in task.read_text()
 
 
 def _help_options(output: str) -> dict[str, bool]:
