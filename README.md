@@ -197,8 +197,11 @@ Resolve retained runs with these commands before the next wave or reporting:
 ~/.local/bin/cross-harness pending --cwd /path/to/repository
 ```
 
-For a committed unit whose integration failed, conflicted or is pending, remove
-the cause and use `adopt`. For a partial unit verified another way, root or
+For a committed unit whose integration failed or is pending, remove the stated
+cause and use `adopt`. For a committed unit whose integration conflicted,
+delegate that unit again sequentially in the root worktree, citing the kept unit
+commit sha so the executor can read it with `git show <sha>`, then discard the
+conflicted run. For a partial unit verified another way, root or
 isolated, use `commit`; an isolated unit is committed and integrated. For a
 failed isolated unit, retry or discard. `discard` removes an abandoned isolated
 worktree. Adopting or discarding an already integrated unit only completes

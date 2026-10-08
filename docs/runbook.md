@@ -230,10 +230,13 @@ worktrees. Integration statuses mean:
 - `integrated`: unit commits reached the root work branch; successful cleanup
   removes the worktree and writes `INTEGRATED`.
 - `conflict`: cherry-picking conflicted; the wrapper rolls back and keeps the
-  isolated unit. Remove the cause and use `adopt`.
+  isolated unit. Delegate that unit again sequentially in the root worktree,
+  citing the kept unit commit sha so the executor can read it with
+  `git show <sha>`, then discard the conflicted run.
 - `failed`: another integration error; remove the stated cause and use `adopt`.
 - `pending`: integration is outstanding, for example after a root lock timeout
-  or an uncommitted unit; resolve the cause and use `adopt` or retry as appropriate.
+  or an uncommitted unit; for a committed unit, remove the stated cause and use
+  `adopt`; for an uncommitted unit, use `adopt` or retry as appropriate.
 
 Integration refuses any staged root changes or unfinished Git operation. Dirty
 and ignored paths must not collide with any unit path, including parent/child
@@ -254,8 +257,12 @@ run or a discussion awaiting a reply. For an uncommitted isolated result, it
 requires matching root and isolated HEADs and checks for file conflicts before
 copying changes, then writes `ADOPTED`. `discard` removes an abandoned isolated
 worktree and writes `DISCARDED`. Resolution also updates runs sharing the
-worktree through a retry chain. A committed unit whose integration failed,
-conflicted or is pending is resolved by removing the cause and adopting it.
+worktree through a retry chain. A committed unit whose integration failed or
+is pending is resolved by removing the stated cause and using `adopt`.
+A committed unit whose integration conflicted is resolved by delegating that
+unit again sequentially in the root worktree, citing the kept unit commit sha
+so the executor can read it with `git show <sha>`, then discarding the conflicted
+run.
 For a partial unit verified another way, root or isolated, use `commit`; it
 checks recorded file fingerprints, commits the unit, and integrates it if
 isolated. A failed isolated unit is resolved by retry or discard. Adopting or

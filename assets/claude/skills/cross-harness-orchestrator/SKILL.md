@@ -137,9 +137,13 @@ Before the next wave, tester or reviewer, and before reporting, resolve every un
 
 - Committed root unit or integrated isolated unit: done; resolve any cleanup
   warning that leaves a worktree pending too.
-- Committed unit whose integration failed, conflicted or is pending: remove
+- Committed unit whose integration failed or is pending: remove
   the stated cause, then use
   `{{CROSS_HARNESS_BIN}} adopt --run <run_dir>`.
+- Committed unit whose integration conflicted: delegate that unit again
+  sequentially in the root worktree, citing the kept unit commit sha so the
+  executor can read it with `git show <sha>`, then use
+  `{{CROSS_HARNESS_BIN}} discard --run <run_dir>` for the conflicted run.
 - Partial unit verified another way, root or isolated: use
   `{{CROSS_HARNESS_BIN}} commit --run <run_dir>`; otherwise retry.
 - Failed isolated unit: retry or use

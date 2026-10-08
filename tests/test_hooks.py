@@ -230,7 +230,17 @@ class HookTests(unittest.TestCase):
             self.assertIn(f"{home}/.local/bin/cross-harness adopt --run <run_dir>", block)
             self.assertIn(f"{home}/.local/bin/cross-harness discard --run <run_dir>", block)
             self.assertIn(f"{home}/.local/bin/cross-harness commit --run <run_dir>", block)
-            self.assertIn("failed, conflicted or pending integration", block)
+            self.assertIn(
+                "For a committed unit whose integration failed or is pending, remove the stated cause, "
+                f"then use `{home}/.local/bin/cross-harness adopt --run <run_dir>`.",
+                block,
+            )
+            self.assertIn(
+                "For a committed unit whose integration conflicted, delegate that unit again sequentially "
+                "in the root worktree, citing the kept unit commit sha so the executor can read it with "
+                f"`git show <sha>`, then use `{home}/.local/bin/cross-harness discard --run <run_dir>` for the conflicted run.",
+                block,
+            )
             self.assertIn("partial unit verified another way, root or isolated", block)
             self.assertIn("failed isolated unit, retry or", block)
 
