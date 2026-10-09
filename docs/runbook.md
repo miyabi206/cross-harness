@@ -190,10 +190,41 @@ For a correctable failure, write only the changed instruction into a new task
 file and resume from the failed run. The normal budget is two retries. When the
 same normalized signature occurs twice, the wrapper performs one escalation
 (Luna→Terra→Sol and/or one effort step) and marks `escalated=true`. A run whose
-executor explicitly returned `blocked` can be retried. Authentication and
-rate-limit blocks remain safety-policy stops and cannot be resumed. A
+executor explicitly returned `blocked` can be retried. Authentication blocks
+remain safety-policy stops and cannot be resumed. Usage-limit blocks follow
+the continuation policy below. A
 dirty-worktree or missing-isolated-worktree block has no reusable result, so
 create a new delegation instead.
+
+### Delegated usage-limit continuation
+
+Read `rate_limit_resets_at` and `revival` in the blocked run's summary. Stop
+delegating to the limited harness before that reset; finish work that does not
+need it. When revival permits retry, schedule exactly one one-shot continuation
+two to five minutes after reset with the session scheduler `CronCreate`, setting
+`recurring=false` and loading it through `ToolSearch` when deferred. The prompt
+names the repository, blocked run directory and remaining units in order.
+Tell the user what was scheduled, for when, and that the session must stay open,
+then end the turn. Waiting in a loop, API billing and external routers remain forbidden.
+
+When it fires, or a later session shows the reminder, run
+`~/.local/bin/cross-harness revival --cwd <repo>` to confirm eligibility, then
+`~/.local/bin/cross-harness retry --run-dir <run_dir> --task-file <continuation_file>`
+and continue the remaining units. Listing prints run directory, role, reset time
+and `eligible` or `waiting`, separated by tabs. Retry resumes the executor thread
+when present and inherits the root, worktree, commit subject and chain paths.
+It leaves attempts unchanged and never escalates. Two consecutive revivals that
+hit another usage limit stop the chain; any other outcome clears the count.
+If work was continued another way, use
+`~/.local/bin/cross-harness revival --dismiss --run <run_dir>`.
+
+If the scheduler is unavailable, reset time is unknown or revival is disabled,
+stop and report the reset time (or `unknown`) and the retry command above;
+ineligible runs remain refused. `auto_revival` defaults to true and may be
+overridden per launching root. Claude Code itself waits and continues when the
+orchestrator's own claude.ai usage limit resets; this covers delegated runs only.
+Closing the session loses its scheduled continuation; the session-start reminder
+takes over. Session reminders are best effort and never prevent startup.
 
 Executor results have exactly seven fields: `status`, `work_completed`,
 `changed_files`, `tests`, `error`, `next_decision`, and `discussion_points`

@@ -16,7 +16,7 @@ from .inventory import create_backup, inventory
 from .maintenance import cleanup
 from .paths import source_root, user_paths
 from .project import remove as remove_project, setup as setup_project
-from .runner import adopt, commit_run, delegate, discard, pending, reply, retry, start_detached_delegate, wait_for_run
+from .runner import adopt, commit_run, delegate, discard, dismiss_revival, pending, render_revivals, reply, retry, revival, start_detached_delegate, wait_for_run
 from .selfupdate import render as render_self_update, self_update
 from .taskfile import create_task_file
 from .trust import confirm_codex_hook
@@ -98,6 +98,12 @@ def parser() -> argparse.ArgumentParser:
     pending_parser = commands.add_parser("pending", help="list finished isolated runs awaiting resolution")
     pending_parser.add_argument("--cwd", type=Path, default=Path.cwd())
     pending_parser.add_argument("--config", type=Path)
+
+    revival_parser = commands.add_parser("revival", help="list or dismiss delegated usage-limit blocks")
+    revival_parser.add_argument("--cwd", type=Path, default=Path.cwd())
+    revival_parser.add_argument("--dismiss", action="store_true")
+    revival_parser.add_argument("--run", type=Path)
+    revival_parser.add_argument("--config", type=Path)
 
     task_parser = commands.add_parser("task", help="create a credential-screened delegation task file")
     task_commands = task_parser.add_subparsers(dest="task_command", required=True)
@@ -261,6 +267,15 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "pending":
             for run in pending(args.cwd.resolve(), args.config, home):
                 print(f"{run['run_dir']}\t{run['status']}\t{run['worktree']}")
+        elif args.command == "revival":
+            if args.dismiss:
+                if args.run is None:
+                    raise HarnessError("revival --dismiss requires --run")
+                dismiss_revival(args.run.resolve())
+            elif args.run is not None:
+                raise HarnessError("revival --run requires --dismiss")
+            else:
+                print(render_revivals(revival(args.cwd.resolve(), args.config, home)), end="")
         elif args.command == "task":
             if args.task_command == "create":
                 path = create_task_file(

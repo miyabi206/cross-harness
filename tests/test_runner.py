@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 import errno
@@ -3029,7 +3030,7 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
         state = json.loads((run / "state.json").read_text())
         self.assertEqual("rate_limit", state["blocked_category"])
 
-    def test_claude_structured_rate_limit_and_authentication_events_block_without_retry(self):
+    def test_claude_structured_limits_block_before_reset_and_authentication_never_retries(self):
         cases = (
             ("rate_limit", '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1784648400,"rateLimitType":"five_hour","overageStatus":"unavailable","overageResetsAt":null,"isUsingOverage":false}}\n'),
             ("authentication", '{"type":"result","subtype":"error_during_execution","error":"authentication_failed","result":"redacted"}\n'),
@@ -3051,8 +3052,12 @@ git -C /Users/itoutaisei/uec/Latex show HEAD:README.md > README.md"'''
                 self.assertEqual("blocked", summary["status"])
                 state = json.loads((run / "state.json").read_text())
                 self.assertEqual(category, state["blocked_category"])
-                with self.assertRaisesRegex(HarnessError, "safety-policy stop"):
-                    retry(run, self.task, home=self.home)
+                with patch("cross_harness.runner.datetime", wraps=datetime) as clock:
+                    clock.now.return_value = datetime(2026, 1, 1, tzinfo=timezone.utc)
+                    with self.assertRaisesRegex(HarnessError, "safety-policy stop"):
+                        retry(run, self.task, home=self.home)
+                if category == "rate_limit":
+                    self.assertIsNotNone(state["rate_limit_resets_at"])
 
     def test_rejected_overage_allowed_notice_does_not_block_completed_run(self):
         run = self.root / "overage-allowed-completed-run"

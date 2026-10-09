@@ -42,9 +42,8 @@ operational discipline.
 `auto_revival` is a boolean defaulting to `true`: when a delegated run is blocked
 by a usage limit, allow it to be continued after the recorded reset time. It may
 be overridden per project; the closest matching project's value wins, falling
-back to the global value if omitted. Set it to `false` to opt out. This unit
-adds the configuration switch and reset-time extraction; automatic continuation
-is added in the next unit.
+back to the global value if omitted. Set it to `false` to opt out. Policy is
+resolved against the run's recorded launching root, including isolated runs.
 
 `parse_events` exposes `rate_limit_resets_at` as an ISO 8601 timestamp in the
 local timezone with a UTC offset, or `None` if no time can be derived. Rejected
@@ -56,6 +55,27 @@ case and accepts a trailing period. A clock time without a date means its next
 local occurrence after the reference time; `parse_events` accepts a
 `reference_time` datetime, defaulting to the current time. `in less than a
 minute` uses a conservative one-minute delay.
+
+Limit-blocked runs persist `rate_limit_resets_at` in summary and state JSON;
+the text summary prints it (or `unknown`) with a `revival` line saying retry
+after the reset, disabled by configuration, reset time unknown, or stopped
+after two consecutive revivals. `retry` requires a known reset that has passed
+and effective `auto_revival`; authentication remains non-retryable.
+Revival retries preserve attempts and never escalate. State's
+`consecutive_revivals` increments on each revival that hits a new usage limit;
+any other outcome clears it, and a count of two refuses another revival.
+`revival --cwd <repo>` lists finalized, undismissed, unrevived limit blocks;
+`revival --dismiss --run <run_dir>` dismisses work continued another way.
+
+Follow the [runbook's continuation workflow](runbook.md#delegated-usage-limit-continuation):
+stop using the limited harness until reset, finish independent work, and schedule
+exactly one continuation two to five minutes later with `CronCreate` and
+`recurring=false`, loading it through `ToolSearch` when deferred. If scheduling
+is unavailable, reset is unknown or revival is disabled, stop and report the
+reset time and retry command. Never wait in a loop or use API billing or external
+routers. Claude Code itself waits and continues after the orchestrator's own
+claude.ai limit resets; revival covers delegated runs only. Closing the session
+loses the scheduled continuation; the session-start reminder takes over.
 
 ## Automatic commits and work branches
 
@@ -177,8 +197,8 @@ Fallback stays inside the same subscription harness. Rate limits never trigger
 fallback. Retries are capped at two; two identical failure signatures stop the
 normal retry loop and permit one explicit escalation. There is no API-provider
 fallback. A run explicitly blocked by its executor (`blocked_category` of
-`executor_reported`) may be retried. Authentication and rate-limit blocks are
-safety-policy stops and cannot be retried. Dirty-worktree and missing-isolated-
+`executor_reported`) may be retried. Authentication blocks cannot be retried.
+Usage-limit blocks may be revived only under the policy above. Dirty-worktree and missing-isolated-
 worktree blocks have no reusable result; create a new delegation instead.
 
 ## Context and retention

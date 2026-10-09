@@ -9,5 +9,8 @@
   uncommitted work into delegated changes.
 - Use the least sandbox permission that completes the role. Never use
   `danger-full-access` in this harness.
-- Stop on unknown authentication, rate limits, recursion detection, or an
-  exhausted retry budget. Never switch to API billing or an external router.
+- Stop on unknown authentication, recursion detection, or an exhausted retry
+  budget. Never switch to API billing or an external router.
+- At a usage limit, stop delegating to the limited harness until the recorded
+  reset time. One scheduled continuation after that time is allowed when the
+  revival line permits it. Waiting in a loop is forbidden.

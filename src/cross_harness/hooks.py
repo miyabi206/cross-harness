@@ -18,7 +18,7 @@ from .paths import user_paths
 from .project import is_auto_setup_disabled, setup as setup_project
 from .installer import synchronize_claude_agent_roles, synchronize_codex_agent_roles
 from .selfupdate import self_update
-from .runner import pending
+from .runner import pending, render_revivals, revival
 from .taskfile import contains_secret
 
 
@@ -553,6 +553,18 @@ def claude_session_start(home: Path | None = None) -> int:
             )
             warnings.extend(reminders)
     except Exception:  # pending-run collection must be silent and fail open
+        pass
+    try:
+        limit_blocked = revival(Path((data or {}).get("cwd", os.getcwd())), home=paths.home)
+        if limit_blocked:
+            warnings.append("Delegated usage-limit runs (run, role, reset time, eligibility):\n" + render_revivals(limit_blocked).rstrip())
+            warnings.append(
+                f"Confirm eligibility with `{paths.executable} revival --cwd <repo>`, then "
+                f"continue an eligible run with `{paths.executable} retry --run-dir <run_dir> --task-file <continuation_file>`. "
+                "If the work was continued another way, use "
+                f"`{paths.executable} revival --dismiss --run <run_dir>`."
+            )
+    except Exception:  # usage-limit reminders must be silent and fail open
         pass
     state_file = paths.home / ".local/state/cross-harness/session/latest.json"
     if state_file.exists():

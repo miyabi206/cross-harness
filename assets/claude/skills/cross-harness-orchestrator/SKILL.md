@@ -155,7 +155,36 @@ The last summary's pending line must show `none`, or confirm no entries with
 only around an unresolved failure. If correction is needed, write a short delta
 instruction and use `{{CROSS_HARNESS_BIN}} retry` with the recorded run directory.
 Never exceed two normal retries. Two identical failure signatures permit one
-explicit escalation; authentication or rate-limit failures stop immediately.
+explicit escalation; authentication failures stop immediately.
+On a delegated usage-limit block, do not delegate to that harness again before
+the recorded `rate_limit_resets_at`; finish work that does not need it.
+Read the summary's `revival` line. If it allows retry after the reset, schedule
+exactly one one-shot continuation two to five minutes after the reset time with
+the session scheduler tool `CronCreate`, setting `recurring` to `false`; load it
+through `ToolSearch` when it is deferred. The scheduled prompt must name the
+repository, the blocked run directory, and the remaining units in order.
+Tell the user what was scheduled, for when, and that the session must stay open,
+then end the turn. Never wait in a loop, switch to API billing or use external routers.
+
+When the continuation fires, or a later session shows the reminder, confirm
+eligibility with `{{CROSS_HARNESS_BIN}} revival --cwd <repo>`; continue the
+eligible blocked run with
+`{{CROSS_HARNESS_BIN}} retry --run-dir <run_dir> --task-file <continuation_file>`,
+then carry on with the remaining units. Revival retries resume the recorded
+executor thread when present, preserve the normal retry budget, and never
+escalate; a third consecutive revival is refused. If the work was continued
+another way, dismiss the reminder with
+`{{CROSS_HARNESS_BIN}} revival --dismiss --run <run_dir>`.
+If the scheduler tool is unavailable, the reset time is unknown or revival is
+disabled (including a chain stopped after two consecutive revivals), stop and
+report the reset time (or `unknown`), the refusal reason, and the command to continue:
+`{{CROSS_HARNESS_BIN}} retry --run-dir <run_dir> --task-file <continuation_file>`.
+The wrapper still refuses ineligible runs.
+
+Claude Code itself waits and continues when the orchestrator's own claude.ai
+usage limit resets; this feature covers delegated runs only. A scheduled
+continuation is lost when the session closes; the session-start reminder takes
+over in the next session.
 Runtime cleanup marks incomplete runs as ORPHANED only when their
 `supervisor.pid` is not alive.
 

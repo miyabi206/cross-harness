@@ -103,6 +103,32 @@ unchanged, and increment `discussion_rounds` without automatic model escalation.
 Summaries and state retain the points and round count. At the configured round
 limit, send the user's decision with `reply --user-decided`.
 
+Delegated usage-limit blocks record `rate_limit_resets_at` and a `revival` line
+in their summaries. Stop delegating to the limited harness until the reset and
+finish work that does not need it. With effective `auto_revival=true` (the
+default), `retry` may continue the run after a known reset time, resuming its
+executor thread without spending the retry budget or escalating. A third
+consecutive revival is refused; any other outcome clears that count.
+Authentication blocks remain non-retryable.
+
+List reminders with `~/.local/bin/cross-harness revival --cwd /absolute/path/repository`;
+each tab-separated row gives the run directory, role, reset time, and `eligible`
+or `waiting`. The same list appears at session start. If work was continued
+another way, use `~/.local/bin/cross-harness revival --dismiss --run <run_dir>`.
+When the revival line allows it, the orchestrator schedules exactly one one-shot
+continuation two to five minutes after reset using the session's `CronCreate`
+tool with `recurring=false` (loaded through `ToolSearch` when deferred). Its
+prompt names the repository, blocked run and remaining units in order; the
+orchestrator tells the user what is scheduled and when, asks them to keep the
+session open, then ends the turn. On firing, confirm eligibility with `revival`
+and use `~/.local/bin/cross-harness retry --run-dir <run_dir> --task-file <continuation_file>`.
+If scheduling is unavailable, the reset is unknown or revival is disabled,
+stop and report the reset time and continuation command. Waiting in a loop,
+API billing and external routers are forbidden.
+Claude Code itself waits and continues when the orchestrator's own claude.ai
+usage limit resets; this feature covers delegated runs only. Closing the session
+loses its scheduled continuation; the next session's reminder takes over.
+
 ## Watch delegated runs
 
 Follow delegated progress from another terminal with:

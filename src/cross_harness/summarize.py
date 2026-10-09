@@ -551,8 +551,14 @@ def render_summary(summary: dict, limit: int) -> str:
         )
         if not summary.get("discussion_points"):
             discussion_lines.append("- none")
+    revival_lines = []
+    if summary.get("blocked_category") == "rate_limit":
+        revival_lines = [
+            f"rate_limit_resets_at: {summary.get('rate_limit_resets_at') or 'unknown'}",
+            f"revival: {summary.get('revival', 'reset time unknown')}",
+        ]
     prefix = "\n".join([
-        f"status: {summary['status']}", f"run_dir: {summary['run_dir']}", *discussion_lines,
+        f"status: {summary['status']}", f"run_dir: {summary['run_dir']}", *revival_lines, *discussion_lines,
     ]) + "\n"
     checks = summary.get("checks", [])
     if not checks:
@@ -660,7 +666,7 @@ def render_summary(summary: dict, limit: int) -> str:
             f"({summary.get('summary_bytes', 0)}/{summary['raw_artifact_bytes']} bytes)"
         )
     text = "\n".join(lines) + "\n"
-    if not discussion_lines:
+    if not discussion_lines and not revival_lines:
         text = prefix + text
         prefix = ""
     if len(prefix) + len(text) <= limit:
