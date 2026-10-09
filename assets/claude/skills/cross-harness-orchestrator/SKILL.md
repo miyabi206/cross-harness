@@ -133,7 +133,8 @@ to that printed run with:
 Read the summary's `commit`, `integration`, and `pending` lines. Inspect each
 unit through `git show --stat <sha>` and `git show <sha>`, not `git diff`, since
 the tree is clean after a commit; compare against every completion condition.
-Before the next wave, tester or reviewer, and before reporting, resolve every unit:
+Before the next wave, tester or reviewer, and before reporting, resolve every unit
+except usage-limit blocked units awaiting revival, as described below:
 
 - Committed root unit or integrated isolated unit: done; resolve any cleanup
   warning that leaves a worktree pending too.
@@ -151,13 +152,17 @@ Before the next wave, tester or reviewer, and before reporting, resolve every un
 - Abandoned isolated run: use `{{CROSS_HARNESS_BIN}} discard --run <run_dir>`.
 
 The last summary's pending line must show `none`, or confirm no entries with
-`{{CROSS_HARNESS_BIN}} pending --cwd <repo>`, before reporting. Read full logs
-only around an unresolved failure. If correction is needed, write a short delta
+`{{CROSS_HARNESS_BIN}} pending --cwd <repo>`, before reporting.
+Usage-limit blocked isolated units awaiting revival are the exception: they
+appear only in `revival`, are excluded from `pending`, and may remain until continuation.
+Read full logs only around an unresolved failure. If correction is needed, write a short delta
 instruction and use `{{CROSS_HARNESS_BIN}} retry` with the recorded run directory.
 Never exceed two normal retries. Two identical failure signatures permit one
 explicit escalation; authentication failures stop immediately.
 On a delegated usage-limit block, do not delegate to that harness again before
 the recorded `rate_limit_resets_at`; finish work that does not need it.
+This reset applies to the harness account across all repositories; the wrapper
+refuses new delegate, retry and reply calls on that harness until the reset.
 Read the summary's `revival` line. If it allows retry after the reset, schedule
 exactly one one-shot continuation two to five minutes after the reset time with
 the session scheduler tool `CronCreate`, setting `recurring` to `false`; load it
@@ -172,14 +177,21 @@ eligible blocked run with
 `{{CROSS_HARNESS_BIN}} retry --run-dir <run_dir> --task-file <continuation_file>`,
 then carry on with the remaining units. Revival retries resume the recorded
 executor thread when present, preserve the normal retry budget, and never
-escalate; a third consecutive revival is refused. If the work was continued
+escalate; a third consecutive revival is refused. Checks carry over from the
+blocked task when the continuation declares none. If the work was continued
 another way, dismiss the reminder with
 `{{CROSS_HARNESS_BIN}} revival --dismiss --run <run_dir>`.
+The listing distinguishes `eligible`, `waiting until <reset time>`, and
+`not revivable: <reason>`. Retry is only for eligible runs. For a run that is
+not revivable (unknown reset, disabled configuration or two consecutive revivals),
+continue the remaining work with a new delegation after any known reset, then
+dismiss the blocked run with `{{CROSS_HARNESS_BIN}} revival --dismiss --run <run_dir>`.
 If the scheduler tool is unavailable, the reset time is unknown or revival is
-disabled (including a chain stopped after two consecutive revivals), stop and
-report the reset time (or `unknown`), the refusal reason, and the command to continue:
+disabled, stop and report the reset time (or `unknown`), the refusal reason, and
+the command to continue. For an eligible run use:
 `{{CROSS_HARNESS_BIN}} retry --run-dir <run_dir> --task-file <continuation_file>`.
-The wrapper still refuses ineligible runs.
+For a not revivable run, report a new `{{CROSS_HARNESS_BIN}} delegate` command for
+the remaining work followed by dismissal. The wrapper still refuses ineligible runs.
 
 Claude Code itself waits and continues when the orchestrator's own claude.ai
 usage limit resets; this feature covers delegated runs only. A scheduled

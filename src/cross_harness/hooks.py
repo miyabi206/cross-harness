@@ -561,6 +561,8 @@ def claude_session_start(home: Path | None = None) -> int:
             warnings.append(
                 f"Confirm eligibility with `{paths.executable} revival --cwd <repo>`, then "
                 f"continue an eligible run with `{paths.executable} retry --run-dir <run_dir> --task-file <continuation_file>`. "
+                "A not revivable run requires a new delegation of the remaining work, after any known reset; "
+                f"after that work is continued, dismiss the blocked run with `{paths.executable} revival --dismiss --run <run_dir>`. "
                 "If the work was continued another way, use "
                 f"`{paths.executable} revival --dismiss --run <run_dir>`."
             )

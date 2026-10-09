@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 import errno
@@ -1289,10 +1290,24 @@ def _validate_isolated_path(runtime_root: Path, worktree: Path) -> Path:
 
 def _pending_isolated_runs(
     runtime_root: Path, root: Path, current_run: Path | None = None, current_status: str | None = None,
+    current_blocked_category: str | None = None,
 ) -> list[dict]:
     runs = runtime_root / "runs"
     if not runs.is_dir():
         return []
+    revival_worktrees = set()
+    for candidate in runs.iterdir():
+        try:
+            current_limit = (
+                candidate == current_run and current_status == "blocked"
+                and current_blocked_category == "rate_limit"
+            )
+            if current_limit or _awaiting_revival(candidate):
+                marker = candidate / "ISOLATED_WORKTREE"
+                if marker.is_file():
+                    revival_worktrees.add(_validate_isolated_path(runtime_root, Path(marker.read_text().strip())))
+        except (HarnessError, OSError, ValueError, TypeError):
+            continue
     result = []
     for candidate in sorted(runs.iterdir()):
         marker = candidate / "ISOLATED_WORKTREE"
@@ -1312,6 +1327,8 @@ def _pending_isolated_runs(
                 continue
             worktree = _validate_isolated_path(runtime_root, Path(raw))
             if not worktree.is_dir():
+                continue
+            if worktree in revival_worktrees:
                 continue
             if (candidate / "ROOT_WORKTREE").exists():
                 if _run_root(candidate, worktree) != root.resolve():
@@ -1341,13 +1358,16 @@ def pending(cwd: Path, config_path: Path | None = None, home: Path | None = None
     return _pending_isolated_runs(runtime_root, root)
 
 
-def _run_pending(run_dir: Path, cwd: Path, status: str, runtime_root: Path | None = None) -> list[dict]:
+def _run_pending(
+    run_dir: Path, cwd: Path, status: str, runtime_root: Path | None = None,
+    blocked_category: str | None = None,
+) -> list[dict]:
     settings = load_final(run_dir / "auto-commit.json") or {}
     runtime = runtime_root or (Path(settings["runtime_root"]) if settings.get("runtime_root") else None)
     if runtime is None:
         return []
     root = _run_root(run_dir, cwd)
-    return _pending_isolated_runs(runtime.resolve(), root, run_dir, status)
+    return _pending_isolated_runs(runtime.resolve(), root, run_dir, status, blocked_category)
 
 
 def _save_summary(run_dir: Path, summary: dict, limit: int = 12000) -> None:
@@ -2627,6 +2647,7 @@ def delegate(
     root = _git_root(cwd)
     effective_policy = _effective_dirty_worktree_policy(config, root)
     runtime_root = Path(config["runtime_root"])
+    _guard_harness_reset(config, role["harness"])
     lock_path = _root_lock_path(runtime_root, root)
     held_before = lock_path in _HELD_ROOT_LOCKS
     run_dir = run_dir or _new_run_dir(runtime_root)
@@ -2781,6 +2802,7 @@ def start_detached_delegate(
     if contains_secret(task):
         raise HarnessError("task file appears to contain credential material; refusing delegation")
     root = _git_root(cwd)
+    _guard_harness_reset(config, role["harness"])
     run_dir = _new_run_dir(Path(config["runtime_root"]))
     run_task = run_dir / "task.md"
     shutil.copy2(task_file, run_task)
@@ -2997,11 +3019,90 @@ def _record_revival_policy(
         state.update(policy)
 
 
-def _revival_refusal(run_dir: Path, state: dict, config: dict, root: Path) -> str | None:
+@contextmanager
+def _revival_lock(run_dir: Path, action: str):
+    descriptor = os.open(run_dir / "revival.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise HarnessError(f"{action} refused: revival is already in progress") from exc
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def _run_revived(run_dir: Path, state: dict, *, lock_held: bool = False) -> bool:
+    """An unfinished successor consumes its predecessor only while locked."""
+    marker = run_dir / "REVIVED"
+    if not state.get("revived") and not marker.exists():
+        return False
+    successor = state.get("revived_by")
+    if not successor and marker.is_file():
+        successor = marker.read_text(encoding="utf-8").strip()
+    # Preserve legacy markers with no recorded absolute successor.
+    if not successor or not Path(successor).is_absolute():
+        return True
+    summary = _completed_summary(Path(successor))
+    if isinstance(summary, dict) and summary.get("status") in {"success", "failed", "blocked", "partial", "discussion"}:
+        return True
+    if lock_held:
+        return False
+    try:
+        descriptor = os.open(run_dir / "revival.lock", os.O_RDWR)
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        return False
+    finally:
+        os.close(descriptor)
+
+
+def _awaiting_revival(run_dir: Path, state: dict | None = None, *, lock_held: bool = False) -> bool:
+    state = state if state is not None else load_final(run_dir / "state.json") or {}
+    return (
+        state.get("status") == "blocked" and state.get("blocked_category") == "rate_limit"
+        and not state.get("revival_dismissed")
+        and not (run_dir / "REVIVAL_DISMISSED").exists()
+        and not (run_dir / "DISCARDED").exists()
+        and not _run_revived(run_dir, state, lock_held=lock_held)
+    )
+
+
+def _guard_harness_reset(config: dict, harness: str) -> None:
+    runs = Path(config["runtime_root"]) / "runs"
+    if not runs.is_dir():
+        return
+    for candidate in sorted(runs.iterdir()):
+        try:
+            state = load_final(candidate / "state.json") or {}
+            recorded_harness = state.get("harness") or config["roles"].get(state.get("role"), {}).get("harness")
+            reset = _reset_time(state.get("rate_limit_resets_at"))
+            if (
+                recorded_harness == harness and reset is not None
+                and reset > datetime.now(timezone.utc)
+                and isinstance(_completed_summary(candidate), dict)
+                and _awaiting_revival(candidate, state)
+            ):
+                raise HarnessError(
+                    f"{harness} is awaiting revival: {candidate}; "
+                    f"rate_limit_resets_at: {state['rate_limit_resets_at']}"
+                )
+        except (OSError, ValueError, TypeError):
+            continue
+
+
+def _revival_refusal(
+    run_dir: Path, state: dict, config: dict, root: Path, *, lock_held: bool = False,
+) -> str | None:
     reset = state.get("rate_limit_resets_at")
     reset_time = _reset_time(reset)
     known_reset = reset if reset_time is not None else "unknown"
-    if state.get("revived") or (run_dir / "REVIVED").exists():
+    if _run_revived(run_dir, state, lock_held=lock_held):
         reason = "run was already revived"
     elif state.get("revival_dismissed") or (run_dir / "REVIVAL_DISMISSED").exists():
         reason = "run was dismissed"
@@ -3034,15 +3135,25 @@ def revival(
                 not isinstance(summary, dict) or summary.get("status") != "blocked"
                 or not isinstance(state, dict) or state.get("status") != "blocked"
                 or state.get("blocked_category") != "rate_limit"
-                or state.get("revived") or state.get("revival_dismissed")
-                or (run_dir / "REVIVED").exists() or (run_dir / "REVIVAL_DISMISSED").exists()
+                or not _awaiting_revival(run_dir, state)
                 or _run_root(run_dir, Path(state["cwd"])) != root
             ):
                 continue
+            refusal = _revival_refusal(run_dir, state, config, root)
+            policy = _revival_message(
+                effective_auto_revival(config, root), state.get("rate_limit_resets_at"),
+                state.get("consecutive_revivals", 0),
+            )
+            eligibility = "eligible"
+            if refusal:
+                eligibility = (
+                    f"waiting until {state['rate_limit_resets_at']}" if policy.startswith("retry after ")
+                    else f"not revivable: {policy}"
+                )
             result.append({
                 "run_dir": str(run_dir), "role": state["role"],
                 "rate_limit_resets_at": state.get("rate_limit_resets_at") or "unknown",
-                "eligibility": "waiting" if _revival_refusal(run_dir, state, config, root) else "eligible",
+                "eligibility": eligibility,
             })
         except (OSError, ValueError, TypeError, KeyError, HarnessError, subprocess.TimeoutExpired):
             continue
@@ -3057,6 +3168,11 @@ def render_revivals(runs: list[dict]) -> str:
 
 
 def dismiss_revival(run_dir: Path) -> None:
+    with _revival_lock(run_dir, "revival dismissal"):
+        _dismiss_revival_locked(run_dir)
+
+
+def _dismiss_revival_locked(run_dir: Path) -> None:
     state = load_final(run_dir / "state.json") or {}
     summary = _completed_summary(run_dir)
     if (
@@ -3148,7 +3264,7 @@ def finalize_blocked_run(
     if commit is not None:
         summary["commit"] = commit
         try:
-            summary["pending"] = _run_pending(run_dir, cwd, "blocked")
+            summary["pending"] = _run_pending(run_dir, cwd, "blocked", blocked_category=category)
         except Exception as exc:
             summary["pending"] = []
             summary["cleanup_errors"] = [f"pending collection failed: {exc}"]
@@ -3408,7 +3524,7 @@ def finalize_run(
     pending_runs = []
     if commit is not None:
         try:
-            pending_runs = _run_pending(run_dir, cwd, status, runtime_root)
+            pending_runs = _run_pending(run_dir, cwd, status, runtime_root, blocked_category)
         except Exception as exc:
             cleanup_errors.append(f"pending collection failed: {exc}")
             if integration is not None and integration["status"] == "integrated":
@@ -3572,7 +3688,6 @@ def _resume_run(
     runtime_root: Path | None = None
     lock_path: Path | None = None
     held_before = False
-    revival_lock: int | None = None
     state = {}
     state_path = run_dir / "state.json"
     if state_path.exists():
@@ -3589,19 +3704,14 @@ def _resume_run(
             lock_path = _root_lock_path(runtime_root, root)
             held_before = lock_path in _HELD_ROOT_LOCKS
     try:
-        if state.get("status") == "blocked" and state.get("blocked_category") == "rate_limit":
-            revival_lock = os.open(run_dir / "revival.lock", os.O_CREAT | os.O_RDWR, 0o600)
-            try:
-                fcntl.flock(revival_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                raise HarnessError("retry refused: revival is already in progress") from exc
-        return _retry_impl(
-            run_dir, task_file, config_path=config_path, home=home,
-            discussion_reply=discussion_reply, user_decided=user_decided,
-        )
+        limited = state.get("status") == "blocked" and state.get("blocked_category") == "rate_limit"
+        with _revival_lock(run_dir, action) if limited else nullcontext():
+            return _retry_impl(
+                run_dir, task_file, config_path=config_path, home=home,
+                discussion_reply=discussion_reply, user_decided=user_decided,
+                revival_lock_held=limited,
+            )
     finally:
-        if revival_lock is not None:
-            os.close(revival_lock)
         if root is not None and runtime_root is not None and lock_path is not None:
             if not held_before and lock_path in _HELD_ROOT_LOCKS:
                 _release_root_lock(runtime_root, root)
@@ -3609,7 +3719,7 @@ def _resume_run(
 
 def _retry_impl(
     run_dir: Path, task_file: Path, config_path: Path | None = None, home: Path | None = None,
-    *, discussion_reply: bool = False, user_decided: bool = False,
+    *, discussion_reply: bool = False, user_decided: bool = False, revival_lock_held: bool = False,
 ) -> dict:
     action = "reply" if discussion_reply else "retry"
     if os.environ.get("CROSS_HARNESS_ACTIVE") == "1":
@@ -3654,7 +3764,7 @@ def _retry_impl(
             )
         elif blocked_category == "rate_limit":
             source_root = _run_root(run_dir, Path(state["cwd"]))
-            refusal = _revival_refusal(run_dir, state, config, source_root)
+            refusal = _revival_refusal(run_dir, state, config, source_root, lock_held=revival_lock_held)
             if refusal:
                 raise HarnessError(f"retry refused: rate_limit safety-policy stop: {refusal}")
             if _completed_summary(run_dir) is None:
@@ -3673,6 +3783,8 @@ def _retry_impl(
                 f"retry refused: blocked run category {blocked_category!r} is not eligible for retry"
             )
     continuation = discussion_reply or revival_retry
+    if not revival_retry:
+        _guard_harness_reset(config, role["harness"])
     if not continuation and state["attempts"] > role["retries"]:
         raise HarnessError("normal retry budget exhausted")
     if not task_file.is_file():
@@ -3682,7 +3794,7 @@ def _retry_impl(
     task = task_file.read_text(encoding="utf-8")
     if not task.strip():
         raise HarnessError("task file is empty")
-    if discussion_reply:
+    if continuation:
         inherited_checks = _declared_checks(run_dir) if not _task_checks(task) else []
         if inherited_checks:
             checks_text = "\n".join(f"- {check}" for check in inherited_checks)
@@ -3694,6 +3806,7 @@ def _retry_impl(
                     break
             else:
                 task = f"{task}\n\n# Checks\n{checks_text}\n"
+    if discussion_reply:
         header = f"Discussion round {discussion_rounds} of {config['max_discussion_rounds']}."
         if user_decided:
             header += " This decision comes from the user and is final."
@@ -3711,7 +3824,7 @@ def _retry_impl(
     source_root = _run_root(run_dir, Path(state["cwd"]))
     effective_policy = _effective_dirty_worktree_policy(config, source_root)
     retry_root = _new_run_dir(runtime_root)
-    if discussion_reply:
+    if continuation:
         atomic_write(retry_root / "task.md", task)
     else:
         shutil.copy2(task_file, retry_root / "task.md")

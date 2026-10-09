@@ -136,6 +136,10 @@ class AssetTests(unittest.TestCase):
             "report the reset time", "command to continue", "third consecutive revival is refused",
             "Claude Code itself waits and continues", "orchestrator's own claude.ai usage limit resets",
             "covers delegated runs only", "lost when the session closes", "session-start reminder takes over",
+            "Usage-limit blocked isolated units awaiting revival are the exception",
+            "are excluded from `pending`", "`waiting until <reset time>`", "`not revivable: <reason>`",
+            "Retry is only for eligible runs", "continue the remaining work with a new delegation after any known reset",
+            "then dismiss the blocked run", "Checks carry over", "across all repositories",
         ):
             self.assertIn(phrase, verify)
         for path in ("README.md", "docs/runbook.md", "docs/configuration.md"):

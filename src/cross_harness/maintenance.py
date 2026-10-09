@@ -10,7 +10,8 @@ from .config import load_config
 from .errors import HarnessError
 from .files import atomic_write
 from .paths import user_paths
-from .runner import _supervisor_alive
+from .runner import _awaiting_revival, _reset_time, _supervisor_alive
+from .summarize import load_final
 
 
 def cleanup(config_path: Path | None = None, home: Path | None = None, now: datetime | None = None) -> dict:
@@ -29,14 +30,31 @@ def cleanup(config_path: Path | None = None, home: Path | None = None, now: date
         raise HarnessError("unsafe runtime path; refusing cleanup") from exc
     cutoff = now - timedelta(days=config["retention_days"])
     orphan_cutoff = now - timedelta(hours=1)
+    retained_runs = set()
+    retained_worktrees = set()
+    for path in runs.iterdir():
+        try:
+            state = load_final(path / "state.json") or {}
+            reset = _reset_time(state.get("rate_limit_resets_at"))
+            if _awaiting_revival(path, state) and reset is not None and reset >= cutoff:
+                retained_runs.add(path.resolve())
+                marker = path / "ISOLATED_WORKTREE"
+                if marker.is_file():
+                    retained_worktrees.add(Path(marker.read_text(encoding="utf-8").strip()).resolve())
+        except (OSError, ValueError, TypeError):
+            continue
     for path in runs.iterdir():
         if not path.is_dir():
             continue
         modified = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
         if modified < cutoff:
             marker = path / "ISOLATED_WORKTREE"
+            if path.resolve() in retained_runs or any(path.resolve() in tree.parents for tree in retained_worktrees):
+                continue
             if marker.is_file():
                 worktree = Path(marker.read_text(encoding="utf-8").strip()).resolve()
+                if worktree in retained_worktrees:
+                    continue
                 try:
                     worktree.relative_to(path.resolve())
                 except ValueError:

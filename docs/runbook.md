@@ -161,14 +161,15 @@ Stop delegation immediately for any of the following:
 - Codex cannot prove ChatGPT authentication;
 - Claude authentication is unavailable;
 - user or project Codex config selects a non-OpenAI provider or custom base URL;
-- a rate or usage limit is reported;
+- a rate or usage limit is reported: stop using that harness across repositories
+  until its recorded reset;
 - a delegated run attempts to start Claude or another Codex executor;
 - a write task finds unrecorded dirty changes under `allow_delegated`, or any
   dirty changes under `stop`;
 - two identical failures have already triggered the single escalation run;
 - a high-risk task lacks explicit human confirmation.
 
-Do not wait automatically, buy credits, switch login method, seed an auth file,
+Do not wait in a loop, buy credits, switch login method, seed an auth file,
 or route to an API model.
 
 ## Failure and recovery
@@ -211,16 +212,21 @@ When it fires, or a later session shows the reminder, run
 `~/.local/bin/cross-harness revival --cwd <repo>` to confirm eligibility, then
 `~/.local/bin/cross-harness retry --run-dir <run_dir> --task-file <continuation_file>`
 and continue the remaining units. Listing prints run directory, role, reset time
-and `eligible` or `waiting`, separated by tabs. Retry resumes the executor thread
+and `eligible`, `waiting until <reset time>`, or `not revivable: <reason>`,
+separated by tabs. Retry is only for eligible runs and resumes the executor thread
 when present and inherits the root, worktree, commit subject and chain paths.
-It leaves attempts unchanged and never escalates. Two consecutive revivals that
+It leaves attempts unchanged and never escalates, and inherits the blocked task's
+checks when the continuation declares none. Two consecutive revivals that
 hit another usage limit stop the chain; any other outcome clears the count.
 If work was continued another way, use
 `~/.local/bin/cross-harness revival --dismiss --run <run_dir>`.
 
 If the scheduler is unavailable, reset time is unknown or revival is disabled,
-stop and report the reset time (or `unknown`) and the retry command above;
-ineligible runs remain refused. `auto_revival` defaults to true and may be
+stop and report the reset time (or `unknown`) and the command to continue.
+For a not revivable run, use a new delegation of the remaining work after any
+known reset, then dismiss the blocked run; the retry command above is only for
+eligible runs. The wrapper enforces known future resets per harness account
+across repositories for delegate, retry and reply. `auto_revival` defaults to true and may be
 overridden per launching root. Claude Code itself waits and continues when the
 orchestrator's own claude.ai usage limit resets; this covers delegated runs only.
 Closing the session loses its scheduled continuation; the session-start reminder
@@ -301,7 +307,9 @@ isolated. A failed isolated unit is resolved by retry or discard. Adopting or
 discarding an already integrated unit only completes cleanup and retains the
 integrated record; removal requires a clean worktree at the integrated unit's
 commit. The last summary must say `pending: none`, or `pending` must
-return no entries, before reporting.
+return no entries, before reporting. Usage-limit blocked isolated units awaiting
+revival are the exception: they appear only in `revival` and are excluded from
+`pending` and its session reminder.
 
 With `dirty_worktree_policy="allow"`, write delegations and retries run in the
 current worktree even when it contains uncommitted changes. The wrapper still

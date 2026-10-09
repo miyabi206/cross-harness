@@ -1,11 +1,12 @@
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 import fcntl
 import json
+import os
 import subprocess
 
 import pytest
@@ -15,7 +16,8 @@ from cross_harness.cli import main
 from cross_harness.config import load_config
 from cross_harness.errors import AuthError, HarnessError
 from cross_harness.hooks import claude_session_start
-from cross_harness.summarize import render_summary
+from cross_harness.maintenance import cleanup
+from cross_harness.summarize import parse_events, render_summary
 
 
 PAST = "2000-01-01T00:00:00+00:00"
@@ -187,7 +189,7 @@ def test_reset_boundary_uses_timezone_offsets_and_rechecks_configuration(case):
         clock.now.return_value = reset.astimezone(timezone.utc)
         assert runner.revival(case.repo, home=case.home)[0]["eligibility"] == "eligible"
         case.configure("auto_revival = false\n")
-        assert runner.revival(case.repo, home=case.home)[0]["eligibility"] == "waiting"
+        assert runner.revival(case.repo, home=case.home)[0]["eligibility"] == "not revivable: disabled by configuration"
         with pytest.raises(HarnessError, match="disabled by configuration"):
             runner.retry(run, case.task, home=case.home)
     case.invoke.assert_not_called()
@@ -284,7 +286,7 @@ def test_two_consecutive_revivals_stop_third_and_hide_revived_predecessors(case)
     assert case.invoke.call_count == 2
     assert runner.revival(case.repo, home=case.home) == [{
         "run_dir": str(run), "role": "reviewer", "rate_limit_resets_at": summary["rate_limit_resets_at"],
-        "eligibility": "waiting",
+        "eligibility": "not revivable: stopped after two consecutive revivals",
     }]
 
 
@@ -358,7 +360,8 @@ def test_listing_filters_finalization_root_category_and_resolution(case):
     nested.mkdir()
     rows = runner.revival(nested, home=case.home)
     assert {row["run_dir"]: row["eligibility"] for row in rows} == {
-        str(eligible): "eligible", str(waiting): "waiting", str(unknown): "waiting",
+        str(eligible): "eligible", str(waiting): f"waiting until {read_state(waiting)['rate_limit_resets_at']}",
+        str(unknown): "not revivable: reset time unknown",
     }
     stdout = StringIO()
     with redirect_stdout(stdout):
@@ -393,6 +396,8 @@ def test_cli_rejects_incomplete_dismissal_and_nonlimit_run(case):
 def test_session_start_prints_same_list_and_collection_fails_open(case):
     case.make_run("eligible")
     case.make_run("waiting", reset=FUTURE)
+    case.make_run("isolated", reset=FUTURE, isolated=True)
+    case.make_run("unknown", reset=None)
     expected = runner.render_revivals(runner.revival(case.repo, home=case.home)).rstrip()
     real_run = subprocess.run
 
@@ -424,8 +429,236 @@ def test_session_start_prints_same_list_and_collection_fails_open(case):
                 assert expected in block
                 assert "revival --cwd <repo>" in block
                 assert "revival --dismiss --run <run_dir>" in block
+                assert "not revivable run requires a new delegation of the remaining work" in block
+                assert "waiting until " in block
+                assert "not revivable: reset time unknown" in block
+                assert "Pending isolated run:" not in block
             else:
                 assert "Delegated usage-limit" not in text
                 assert "revival --" not in text
                 assert "unreadable" not in text
                 assert "collection failed" not in text
+
+
+def test_interrupted_revival_is_listed_and_retryable_when_its_lock_is_free(case):
+    run, _ = case.make_run("limited")
+    case.invoke.side_effect = RuntimeError("wrapper interrupted")
+    with pytest.raises(RuntimeError, match="wrapper interrupted"):
+        runner.retry(run, case.task, home=case.home)
+    successor = Path(read_state(run)["revived_by"])
+    assert runner._completed_summary(successor) is None
+    assert runner.revival(case.repo, home=case.home)[0]["run_dir"] == str(run)
+    assert runner.revival(case.repo, home=case.home)[0]["eligibility"] == "eligible"
+    case.invoke.side_effect = case.outcome()
+    summary = runner.retry(run, case.task, home=case.home)
+    assert summary["status"] == "success"
+    assert read_state(run)["revived_by"] == summary["run_dir"]
+    assert summary["attempt"] == 1
+    assert runner.revival(case.repo, home=case.home) == []
+    assert case.invoke.call_count == 2
+
+
+def test_revival_lock_covers_eligibility_execution_and_finalization(case):
+    run, _ = case.make_run("limited")
+    refusal = runner._revival_refusal
+    finalize = runner.finalize_run
+    observed = []
+
+    def assert_locked(stage):
+        with pytest.raises(HarnessError, match="already in progress"):
+            runner.dismiss_revival(run)
+        assert not read_state(run).get("revival_dismissed")
+        observed.append(stage)
+
+    def eligibility(*args, **kwargs):
+        assert_locked("eligibility")
+        return refusal(*args, **kwargs)
+
+    def invoke(*args):
+        assert_locked("execution")
+        assert runner.revival(case.repo, home=case.home) == []
+        return case.outcome()(*args)
+
+    def finalization(*args, **kwargs):
+        assert_locked("finalization")
+        return finalize(*args, **kwargs)
+
+    case.invoke.side_effect = invoke
+    with patch("cross_harness.runner._revival_refusal", side_effect=eligibility), patch(
+        "cross_harness.runner.finalize_run", side_effect=finalization,
+    ):
+        summary = runner.retry(run, case.task, home=case.home)
+    assert summary["status"] == "success"
+    assert observed == ["eligibility", "execution", "finalization"]
+    with runner._revival_lock(run, "test"):
+        assert runner._completed_summary(Path(summary["run_dir"])) is not None
+
+
+def test_dismissal_takes_revival_lock_and_then_prevents_retry(case):
+    run, _ = case.make_run("limited")
+    with runner._revival_lock(run, "test"):
+        with pytest.raises(HarnessError, match="revival dismissal refused.*already in progress"):
+            runner.dismiss_revival(run)
+        assert not (run / "REVIVAL_DISMISSED").exists()
+    runner.dismiss_revival(run)
+    with pytest.raises(HarnessError, match="dismissed"):
+        runner.retry(run, case.task, home=case.home)
+    assert runner.revival(case.repo, home=case.home) == []
+    case.invoke.assert_not_called()
+
+
+@pytest.mark.parametrize("reset,count", [(FUTURE, 0), (None, 0), (PAST, 2)])
+def test_awaiting_isolated_limit_is_only_in_revival_and_discard_removes_it(case, reset, count):
+    run, summary = case.make_run("isolated", reset=reset, count=count, isolated=True)
+    assert summary["pending"] == []
+    assert runner.pending(case.repo, home=case.home) == []
+    assert [row["run_dir"] for row in runner.revival(case.repo, home=case.home)] == [str(run)]
+    runner.discard(run, home=case.home)
+    assert (run / "DISCARDED").exists()
+    assert runner.revival(case.repo, home=case.home) == []
+
+
+def test_shared_isolated_chain_awaiting_revival_is_excluded_from_pending(case):
+    run, _ = case.make_run("isolated", isolated=True)
+    complete = case.outcome("blocked", "usage limit")
+
+    def limit_again(*args):
+        code = complete(*args)
+        (args[4] / "events.jsonl").write_text(limit_event(FUTURE))
+        return code
+
+    case.invoke.side_effect = limit_again
+    summary = runner.retry(run, case.task, home=case.home)
+    assert summary["status"] == "blocked"
+    assert summary["pending"] == []
+    assert runner.pending(case.repo, home=case.home) == []
+    assert [row["run_dir"] for row in runner.revival(case.repo, home=case.home)] == [summary["run_dir"]]
+
+
+def test_cleanup_retains_waiting_run_and_worktree_until_retention_after_reset(case):
+    blocked_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    reset = blocked_at + timedelta(days=10)
+    run, _ = case.make_run("isolated", reset=reset.isoformat(), isolated=True)
+    unknown, _ = case.make_run("unknown", reset=None, isolated=True)
+    worktree = Path((run / "ISOLATED_WORKTREE").read_text().strip())
+    (worktree / "partial.txt").write_text("keep this work\n")
+    for candidate in (run, unknown):
+        os.utime(candidate, (blocked_at.timestamp(), blocked_at.timestamp()))
+    result = cleanup(home=case.home, now=blocked_at + timedelta(days=8))
+    assert str(run) not in result["removed"]
+    assert run.exists() and worktree.exists()
+    assert (worktree / "partial.txt").read_text() == "keep this work\n"
+    assert not unknown.exists()
+    result = cleanup(home=case.home, now=reset + timedelta(days=7))
+    assert str(run) not in result["removed"]
+    result = cleanup(home=case.home, now=reset + timedelta(days=7, seconds=1))
+    assert str(run) in result["removed"]
+    assert not run.exists() and not worktree.exists()
+    registered = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"], cwd=case.repo, check=True, capture_output=True, text=True,
+    ).stdout
+    assert str(worktree) not in registered
+
+
+def test_cleanup_retains_worktree_owner_of_waiting_revival_successor(case):
+    run, _ = case.make_run("isolated", isolated=True)
+    case.invoke.side_effect = case.outcome("blocked", "usage limit")
+    summary = runner.retry(run, case.task, home=case.home)
+    successor = Path(summary["run_dir"])
+    state = read_state(successor)
+    state["rate_limit_resets_at"] = FUTURE
+    (successor / "state.json").write_text(json.dumps(state))
+    now = datetime(2026, 1, 10, tzinfo=timezone.utc)
+    for candidate in (run, successor):
+        modified = (now - timedelta(days=8)).timestamp()
+        os.utime(candidate, (modified, modified))
+    worktree = Path((successor / "ISOLATED_WORKTREE").read_text().strip())
+    result = cleanup(home=case.home, now=now)
+    assert result["removed"] == []
+    assert run.exists() and successor.exists() and worktree.exists()
+
+
+@pytest.mark.parametrize("elapsed,day", [(0, 9), (10, 9), (59, 9), (60, 9), (61, 10)])
+def test_dateless_clock_reset_uses_minute_end_and_sixty_second_today_window(case, elapsed, day):
+    start = datetime(2026, 10, 9, 15, 45).astimezone()
+    events = case.root / "clock.jsonl"
+    events.write_text(json.dumps({
+        "type": "turn.failed", "message": "Usage limit reached. Try again at 3:45 PM.",
+    }) + "\n")
+    parsed = parse_events(events, reference_time=start + timedelta(seconds=elapsed))
+    assert parsed["rate_limit_resets_at"] == datetime(2026, 10, day, 15, 46).astimezone().isoformat()
+    assert datetime.fromisoformat(parsed["rate_limit_resets_at"]) >= start + timedelta(seconds=59)
+
+
+def test_latest_rejected_claude_reset_wins_over_later_shorter_reset(case):
+    events = case.root / "limits.jsonl"
+    events.write_text(limit_event(FUTURE) + limit_event(PAST) + limit_event(None))
+    parsed = parse_events(events)
+    assert datetime.fromisoformat(parsed["rate_limit_resets_at"]) == datetime.fromisoformat(FUTURE)
+
+
+@pytest.mark.parametrize("checks_section", ["", "\n# Checks\n"])
+def test_revival_inherits_original_checks_when_continuation_declares_none(case, checks_section):
+    run, _ = case.make_run("limited", isolated=True)
+    case.task.write_text("# Goal\nContinue the remaining work.\n" + checks_section)
+    with patch.dict("os.environ", {"TZ": "UTC"}):
+        summary = runner.retry(run, case.task, home=case.home)
+    continued = Path(summary["run_dir"])
+    assert summary["status"] == "success"
+    assert summary["checks"] == [{"check": "fixture", "status": "passed", "exit_code": 0}]
+    assert runner._declared_checks(continued) == ["fixture"]
+    assert "- fixture" in case.invoke.call_args.args[1]
+    assert case.invoke.call_args.args[2]["TZ"] == "UTC"
+    assert summary["attempt"] == 1
+
+
+@pytest.mark.parametrize("action", ["delegate", "detached", "retry", "reply"])
+def test_future_account_reset_gates_all_launch_paths_across_repositories_before_run_creation(case, action):
+    source, _ = case.make_run("source")
+    state = read_state(source)
+    state["status"] = "discussion" if action == "reply" else "failed"
+    state.pop("blocked_category")
+    (source / "state.json").write_text(json.dumps(state))
+    blocked, blocked_summary = case.make_run("foreign-limit", reset=FUTURE)
+    (blocked / "ROOT_WORKTREE").write_text(str(case.root / "another-repository"))
+    before = set((case.runtime / "runs").iterdir())
+    with patch("cross_harness.runner._new_run_dir") as create:
+        with pytest.raises(HarnessError, match="codex is awaiting revival") as error:
+            if action == "delegate":
+                runner.delegate("reviewer", "review", case.task, case.repo, home=case.home)
+            elif action == "detached":
+                runner.start_detached_delegate("reviewer", "review", case.task, case.repo, home=case.home)
+            elif action == "reply":
+                runner.reply(source, case.task, home=case.home)
+            else:
+                runner.retry(source, case.task, home=case.home)
+        create.assert_not_called()
+    assert str(blocked) in str(error.value)
+    assert blocked_summary["rate_limit_resets_at"] in str(error.value)
+    assert set((case.runtime / "runs").iterdir()) == before
+    case.invoke.assert_not_called()
+
+
+def test_account_reset_does_not_gate_other_harness_or_eligible_revival(case):
+    case.make_run("future", reset=FUTURE)
+    eligible, _ = case.make_run("eligible")
+    summary = runner.delegate("explorer", "exploration", case.task, case.repo, home=case.home)
+    assert summary["status"] == "success"
+    assert read_state(Path(summary["run_dir"]))["harness"] == "claude"
+    summary = runner.retry(eligible, case.task, home=case.home)
+    assert summary["status"] == "success"
+    assert case.invoke.call_count == 2
+
+
+@pytest.mark.parametrize("resolution", ["unknown", "dismissed", "revived", "discarded"])
+def test_unknown_or_resolved_limit_does_not_gate_new_delegation(case, resolution):
+    run, _ = case.make_run("limit", reset=None if resolution == "unknown" else FUTURE)
+    if resolution == "dismissed":
+        runner.dismiss_revival(run)
+    elif resolution == "revived":
+        (run / "REVIVED").write_text("legacy revival\n")
+    elif resolution == "discarded":
+        (run / "DISCARDED").write_text("discarded\n")
+    summary = runner.delegate("reviewer", "review", case.task, case.repo, home=case.home)
+    assert summary["status"] == "success"
+    assert case.invoke.call_count == 1

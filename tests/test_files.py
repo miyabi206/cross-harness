@@ -428,12 +428,12 @@ class FileTests(unittest.TestCase):
     def test_parse_events_extracts_codex_clock_and_date_reset_forms(self):
         reference = datetime(2026, 10, 9, 2, 0).astimezone()
         cases = (
-            ("try again at 3:01 AM", reference, datetime(2026, 10, 9, 3, 1)),
-            ("TRY AGAIN AT 3:01 am.", reference, datetime(2026, 10, 9, 3, 1)),
-            ("try again at 3:01 AM.", datetime(2026, 10, 9, 4).astimezone(), datetime(2026, 10, 10, 3, 1)),
-            ("try again at 3:01 AM", datetime(2026, 10, 9, 3, 1).astimezone(), datetime(2026, 10, 10, 3, 1)),
-            ("try again at 12:00 AM", reference, datetime(2026, 10, 10)),
-            ("try again at 12:00 PM", reference, datetime(2026, 10, 9, 12)),
+            ("try again at 3:01 AM", reference, datetime(2026, 10, 9, 3, 2)),
+            ("TRY AGAIN AT 3:01 am.", reference, datetime(2026, 10, 9, 3, 2)),
+            ("try again at 3:01 AM.", datetime(2026, 10, 9, 4).astimezone(), datetime(2026, 10, 10, 3, 2)),
+            ("try again at 3:01 AM", datetime(2026, 10, 9, 3, 1).astimezone(), datetime(2026, 10, 9, 3, 2)),
+            ("try again at 12:00 AM", reference, datetime(2026, 10, 10, 0, 1)),
+            ("try again at 12:00 PM", reference, datetime(2026, 10, 9, 12, 1)),
             ("try again at Oct 12th, 2026 9:00 AM", reference, datetime(2026, 10, 12, 9)),
             ("TRY AGAIN AT oct 12TH, 2026 9:00 am.", reference, datetime(2026, 10, 12, 9)),
             ("try again at Jan 1st, 2027 12:00 PM.", reference, datetime(2027, 1, 1, 12)),

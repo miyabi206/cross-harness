@@ -231,8 +231,10 @@ def _codex_rate_limit_reset(text: str, reference_time: datetime) -> str | None:
                 reset = datetime(int(year), _RESET_MONTHS.index(month.lower()) + 1, int(day), hour, minute)
             else:
                 reset = reference_time.replace(hour=hour, minute=minute, second=0, microsecond=0, tzinfo=None)
-                if reset.astimezone().timestamp() <= reference_time.timestamp():
+                if reset.astimezone().timestamp() < reference_time.timestamp() - 60:
                     reset += timedelta(days=1)
+                # Codex omits seconds: wait through the entire reported minute.
+                reset += timedelta(minutes=1)
             return reset.astimezone().isoformat()
         match = _RESET_DURATION.search(text)
         if match:
@@ -357,7 +359,9 @@ def parse_events(path: Path, reference_time: datetime | None = None) -> dict:
     ]
     for error_index, reset in reset_candidates:
         if error_index not in recovered_error_indices:
-            result["rate_limit_resets_at"] = reset
+            previous = result["rate_limit_resets_at"]
+            if previous is None or datetime.fromisoformat(reset) > datetime.fromisoformat(previous):
+                result["rate_limit_resets_at"] = reset
     return result
 
 
