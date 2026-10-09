@@ -173,6 +173,61 @@ def test_disabled_auto_commit_preserves_detached_head(execution):
     assert not (Path(summary["run_dir"]) / "WORK_BRANCH").exists()
 
 
+@pytest.mark.parametrize("project_override", [False, True])
+@pytest.mark.parametrize("resume", [False, True])
+def test_disabled_auto_commit_allows_unfinished_operation(execution, project_override, resume):
+    state = execution
+    repo = state["repo"]
+    state["config"].write_text(
+        'auto_commit = true\n'
+        f'[projects.{json.dumps(str(repo.resolve()))}]\nauto_commit = false\n'
+        if project_override else 'auto_commit = false\n'
+    )
+    head = git(repo, "rev-parse", "HEAD")
+    operation = repo / ".git/MERGE_HEAD"
+    operation.write_text(head + "\n")
+    if resume:
+        state["status"] = "partial"
+        first = delegate(state)
+        state["status"] = "success"
+        state["change"] = lambda cwd, run: (cwd / "second.txt").write_text("second\n")
+        summary = runner.retry(Path(first["run_dir"]), state["task"], state["config"], state["home"])
+    else:
+        summary = delegate(state)
+    assert summary["status"] == "success"
+    assert summary["commit"]["status"] == "disabled"
+    assert git(repo, "rev-parse", "HEAD") == head
+    assert runner._current_branch(repo) == "main"
+    assert operation.read_text() == head + "\n"
+    assert (repo / "delegated.txt").read_text() == "delegated\n"
+    assert not (Path(summary["run_dir"]) / "WORK_BRANCH").exists()
+
+
+def test_repository_without_commits_runs_without_a_branch_or_commit(execution):
+    state = execution
+    repo = state["repo"].parent / "unborn"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    state["repo"] = repo
+
+    def change(cwd, run):
+        (cwd / "delegated.txt").write_text("delegated\n")
+        git(cwd, "add", "delegated.txt")
+
+    state["change"] = change
+    summary = delegate(state)
+    assert summary["status"] == "success"
+    assert summary["commit"]["status"] == "skipped"
+    assert summary["commit"]["reason"] == "repository has no commits"
+    assert state["branch_at_execution"] == runner._current_branch(repo) == "main"
+    head = subprocess.run(["git", "rev-parse", "--verify", "--quiet", "HEAD"], cwd=repo, capture_output=True)
+    assert head.returncode == 1
+    assert git(repo, "branch", "--list") == ""
+    assert git(repo, "status", "--porcelain") == "A  delegated.txt"
+    assert (repo / ".git/index").read_bytes() == state["index_before_commit"]
+    assert not (Path(summary["run_dir"]) / "WORK_BRANCH").exists()
+
+
 def test_work_branch_lock_contention_is_bounded_and_separate_from_root_lock(execution, monkeypatch):
     state = execution
     runtime = Path(load_config(state["config"], state["home"])["runtime_root"])

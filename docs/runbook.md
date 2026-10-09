@@ -219,9 +219,10 @@ write role so the worktree can be reviewed before continuing.
 
 With `dirty_worktree_policy="isolate"`, the wrapper creates a detached Git
 worktree below the run directory and records it in `ISOLATED_WORKTREE`.
-Successful unit commits integrate automatically into the launching worktree,
+Successful unit commits with a recorded `ROOT_WORKTREE` integrate automatically into the launching worktree,
 which is the root even when it is a linked worktree. Other worktrees are left
-untouched. Cleanup does not remove a retained isolated worktree before the run's seven-day retention window.
+untouched. Legacy isolated runs without that marker remain pending for explicit,
+file-by-file `adopt`. Cleanup does not remove a retained isolated worktree before the run's seven-day retention window.
 
 The summary's `commit` line describes the unit commit, `integration` describes
 its root integration, and `pending` lists finished isolated runs with remaining
@@ -267,7 +268,8 @@ For a partial unit verified another way, root or isolated, use `commit`; it
 checks recorded file fingerprints, commits the unit, and integrates it if
 isolated. A failed isolated unit is resolved by retry or discard. Adopting or
 discarding an already integrated unit only completes cleanup and retains the
-integrated record. The last summary must say `pending: none`, or `pending` must
+integrated record; removal requires a clean worktree at the integrated unit's
+commit. The last summary must say `pending: none`, or `pending` must
 return no entries, before reporting.
 
 With `dirty_worktree_policy="allow"`, write delegations and retries run in the

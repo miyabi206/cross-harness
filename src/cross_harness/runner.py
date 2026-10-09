@@ -493,14 +493,21 @@ def _primary_repository_root(cwd: Path) -> Path:
 
 
 def _run_root(run_dir: Path, cwd: Path) -> Path:
-    """Use the launching worktree, with the old primary-root rule only for legacy runs."""
+    """Use the recorded launching worktree, or the recorded cwd's Git toplevel."""
     marker = run_dir / "ROOT_WORKTREE"
     if marker.exists():
         raw = marker.read_text(encoding="utf-8").strip()
         if not raw or not Path(raw).is_absolute():
             raise HarnessError("ROOT_WORKTREE must contain an absolute worktree path")
         return Path(raw).resolve()
-    return _primary_repository_root(cwd)
+    return _git_root(cwd)
+
+
+def _has_commits(root: Path) -> bool:
+    head = _git(root, ["rev-parse", "--verify", "--quiet", "HEAD"])
+    if head.returncode not in {0, 1}:
+        raise HarnessError(head.stderr.strip() or "could not inspect Git HEAD")
+    return head.returncode == 0
 
 
 def _chain_paths(run_dir: Path) -> set[str]:
@@ -526,7 +533,9 @@ def _refuse_unfinished_operation(root: Path) -> None:
 
 def _ensure_work_branch(
     root: Path, settings: dict, run_dir: Path, *, created_branches: list[str] | None = None,
-) -> str:
+) -> str | None:
+    if not _has_commits(root):
+        return None
     _refuse_unfinished_operation(root)
     branch = _current_branch(root)
     if branch is None or branch in settings["protected_branches"]:
@@ -565,14 +574,16 @@ def _prepare_work_branch(
     discussion_rounds: int = 0, max_discussion_rounds: int = 3, user_decided: bool = False,
 ) -> None:
     """Move a root writer off a protected or detached HEAD without a checkout."""
-    if not role["write"]:
+    if not role["write"] or not effective_auto_commit(config, root):
         return
     digest = hashlib.sha256(str(root.resolve()).encode("utf-8")).hexdigest()
     lock_path = runtime_root / "locks" / f"work-branch-{digest}.lock"
     descriptor = None
     try:
+        if not _has_commits(root):
+            return
         _refuse_unfinished_operation(root)
-        if (run_dir / "ISOLATED_WORKTREE").exists() or not effective_auto_commit(config, root):
+        if (run_dir / "ISOLATED_WORKTREE").exists():
             return
         deadline = time.monotonic() + _DELEGATED_CHANGES_LOCK_TIMEOUT_SECONDS
         while descriptor is None:
@@ -622,8 +633,18 @@ def _auto_commit_run(
         record["reason"] = "status not success"
         return record
     isolated = (run_dir / "ISOLATED_WORKTREE").exists()
+    if isolated and not (run_dir / "ROOT_WORKTREE").exists():
+        record["reason"] = "isolated run has no ROOT_WORKTREE; explicit adopt required"
+        return record
     if diff_check_unavailable:
         record["reason"] = "diff check unavailable"
+        return record
+    try:
+        if not _has_commits(cwd):
+            record["reason"] = "repository has no commits"
+            return record
+    except Exception as exc:
+        record.update({"status": "failed", "reason": str(exc).strip()[-2000:]})
         return record
     candidates = {item["file"] for item in delta}
     chain_paths = _chain_paths(run_dir)
@@ -739,7 +760,8 @@ def _forget_committed_paths(runtime_root: Path, cwd: Path, paths: list[str]) -> 
 def _guard_write_operation(
     run_dir: Path, role_name: str, role: dict, kind: str, root: Path, **metadata,
 ) -> None:
-    if not role.get("write"):
+    settings = load_final(run_dir / "auto-commit.json") or {}
+    if not role.get("write") or not settings.get("enabled"):
         return
     try:
         _refuse_unfinished_operation(root)
@@ -918,7 +940,13 @@ def _prepare_retry_execution(
                            thread_id=thread_id, signatures=signatures,
                            defaulted_settings=defaulted_settings, **discussion)
 
-    if (previous_run / "ISOLATED_WORKTREE").exists():
+    previous_summary = load_final(previous_run / "summary.json") or {}
+    resolved = (
+        previous_summary.get("integration", {}).get("status") == "integrated"
+        or (previous_run / "INTEGRATED").exists()
+        or (previous_run / "ADOPTED").exists()
+    )
+    if (previous_run / "ISOLATED_WORKTREE").exists() and not resolved:
         execution_root = _reusable_isolated_worktree(root, previous_run)
         if execution_root is None:
             reason = "retry blocked: missing isolated worktree"
@@ -932,6 +960,9 @@ def _prepare_retry_execution(
             )
             raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
         atomic_write(run_dir / "ISOLATED_WORKTREE", str(execution_root) + "\n")
+        if not (previous_run / "ROOT_WORKTREE").exists():
+            # Resuming a legacy isolated run cannot establish its launching root.
+            (run_dir / "ROOT_WORKTREE").unlink(missing_ok=True)
         for name in ("ISOLATED_BASE", "UNIT_COMMIT"):
             if (previous_run / name).exists():
                 shutil.copy2(previous_run / name, run_dir / name)
@@ -1278,8 +1309,19 @@ def _pending_isolated_runs(
             if not raw or not Path(raw).is_absolute():
                 continue
             worktree = _validate_isolated_path(runtime_root, Path(raw))
-            if not worktree.is_dir() or _run_root(candidate, worktree) != root.resolve():
+            if not worktree.is_dir():
                 continue
+            if (candidate / "ROOT_WORKTREE").exists():
+                if _run_root(candidate, worktree) != root.resolve():
+                    continue
+            else:
+                # A legacy unit has no launching root. List it for its repository
+                # without choosing any worktree as an execution/integration target.
+                listing = _git(worktree, ["worktree", "list", "--porcelain"])
+                registered = {Path(line[9:]).resolve() for line in listing.stdout.splitlines()
+                              if line.startswith("worktree ")}
+                if listing.returncode or worktree not in registered or root.resolve() not in registered:
+                    continue
         except (HarnessError, OSError, UnicodeError, subprocess.TimeoutExpired):
             continue
         result.append({"run_dir": str(candidate), "worktree": str(worktree), "status": summary["status"]})
@@ -1414,6 +1456,12 @@ def _finish_integrated_cleanup(
             if check_shared:
                 _adopt_reject_live_shared_worktree(runtime_root, run_dir, worktree)
             if worktree.exists():
+                dirty = _git(worktree, ["--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all"])
+                if dirty.returncode or dirty.stdout:
+                    raise HarnessError("cleanup refused: integrated worktree has uncommitted changes")
+                head = _git(worktree, ["rev-parse", "HEAD"])
+                if head.returncode or not integration.get("unit_sha") or head.stdout.strip() != integration["unit_sha"]:
+                    raise HarnessError("cleanup refused: isolated HEAD differs from integrated unit commit")
                 _remove_isolated_worktree(runtime_root, root, worktree)
             _mark_resolved_worktree(runtime_root, root, worktree, "INTEGRATED",
                                     integration.get("sha", "unknown"), integration)
@@ -1424,9 +1472,14 @@ def _finish_integrated_cleanup(
 def _integrate_isolated_unit(
     run_dir: Path, runtime_root: Path, worktree: Path, settings: dict, commit: dict,
     timeout_seconds: float, *, wait: bool = True,
+    interruptions: list[BaseException] | None = None,
 ) -> dict:
     """Cherry-pick under the root lock, preserving unrelated uncommitted paths."""
     record = {"status": "pending", "unit_sha": commit.get("sha")}
+    if not (run_dir / "ROOT_WORKTREE").exists():
+        record["reason"] = "isolated run has no ROOT_WORKTREE; explicit adopt required"
+        return record
+    interruption = None
     acquired = False
     root = None
     old_branch = None
@@ -1443,14 +1496,20 @@ def _integrate_isolated_unit(
         record["root"] = str(root)
         _adopt_reject_live_shared_worktree(runtime_root, run_dir, worktree)
         deadline = time.monotonic() + timeout_seconds
-        while not _acquire_root_lock(runtime_root, root):
-            if not wait:
-                raise HarnessError("adopt blocked: another write delegation owns the root worktree")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                record["reason"] = "timed out waiting for root worktree lock"
-                return record
-            time.sleep(min(_INTEGRATION_LOCK_POLL_INTERVAL_SECONDS, remaining))
+        try:
+            while not _acquire_root_lock(runtime_root, root):
+                if not wait:
+                    raise HarnessError("adopt blocked: another write delegation owns the root worktree")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    record["reason"] = "timed out waiting for root worktree lock"
+                    return record
+                time.sleep(min(_INTEGRATION_LOCK_POLL_INTERVAL_SECONDS, remaining))
+        except BaseException as exc:
+            if isinstance(exc, Exception):
+                raise
+            interruption = exc
+            raise HarnessError("integration interrupted while waiting for root worktree lock") from exc
         acquired = True
         index = _git(root, ["rev-parse", "--git-path", "index"])
         if index.returncode:
@@ -1479,6 +1538,7 @@ def _integrate_isolated_unit(
         head = _git(worktree, ["rev-parse", "HEAD"])
         if head.returncode or (commit.get("sha") and head.stdout.strip() != commit["sha"]):
             raise HarnessError("integration refused: isolated HEAD differs from recorded unit commit")
+        record["unit_sha"] = head.stdout.strip()
         base_path = run_dir / "ISOLATED_BASE"
         base = base_path.read_text(encoding="utf-8").strip() if base_path.exists() else f"{head.stdout.strip()}^"
         units = _git(worktree, ["rev-list", "--reverse", f"{base}..{head.stdout.strip()}"])
@@ -1513,7 +1573,13 @@ def _integrate_isolated_unit(
         if shas:
             record["branch"] = _ensure_work_branch(root, settings, run_dir, created_branches=created_branches)
             attempted = True
-            picked = _git(root, ["cherry-pick", *shas], timeout=600)
+            try:
+                picked = _git(root, ["cherry-pick", *shas], timeout=600)
+            except BaseException as exc:
+                if isinstance(exc, Exception):
+                    raise
+                interruption = exc
+                raise HarnessError("integration interrupted during cherry-pick") from exc
             if picked.returncode:
                 conflicts = _git(root, ["diff", "--name-only", "--diff-filter=U", "-z"])
                 record["conflicted_paths"] = [name for name in conflicts.stdout.split("\0") if name]
@@ -1528,7 +1594,9 @@ def _integrate_isolated_unit(
         record.update({"status": "integrated", "sha": integrated_head.stdout.strip()})
     except Exception as exc:
         record["reason"] = str(exc)
-        if record["status"] not in {"conflict", "integrated"}:
+        if interruption is not None:
+            record["status"] = "pending"
+        elif record["status"] not in {"conflict", "integrated"}:
             record["status"] = "failed"
         if record["status"] != "integrated" and root is not None and old_head is not None:
             try:
@@ -1559,6 +1627,10 @@ def _integrate_isolated_unit(
             _release_root_lock(runtime_root, root)
     if record["status"] == "integrated":
         _finish_integrated_cleanup(run_dir, runtime_root, root, record, check_shared=False)
+    if interruption is not None:
+        if interruptions is None:
+            raise interruption.with_traceback(interruption.__traceback__)
+        interruptions.append(interruption)
     return record
 
 
@@ -1619,10 +1691,11 @@ def adopt(
         ) from exc
     if not marker_path.is_dir():
         raise HarnessError(f"isolated worktree not found: {marker_path}")
-    isolated, root = _adopt_worktree_roots(marker_path, _run_root(run_dir, marker_path))
+    recorded_root = _run_root(run_dir, marker_path) if (run_dir / "ROOT_WORKTREE").exists() else None
+    isolated, root = _adopt_worktree_roots(marker_path, recorded_root)
     _adopt_reject_live_shared_worktree(runtime_root, run_dir, isolated)
     commit = completed_summary.get("commit", {})
-    if commit.get("status") == "committed":
+    if commit.get("status") == "committed" and recorded_root is not None:
         subject = commit.get("subject") or f"cross-harness: adopt {run_dir.name}"
         settings = {
             "protected_branches": effective_protected_branches(config, root),
@@ -1834,9 +1907,15 @@ def discard(run_dir: Path, config_path: Path | None = None, home: Path | None = 
     if not raw or not Path(raw).is_absolute():
         raise HarnessError("ISOLATED_WORKTREE must contain an absolute worktree path")
     worktree = _validate_isolated_path(runtime_root, Path(raw))
-    isolated, root = _adopt_worktree_roots(worktree, _run_root(run_dir, worktree))
+    if worktree.exists():
+        recorded_root = _run_root(run_dir, worktree) if (run_dir / "ROOT_WORKTREE").exists() else None
+        isolated, root = _adopt_worktree_roots(worktree, recorded_root)
+    else:
+        isolated = worktree
+        root = _run_root(run_dir, worktree) if (run_dir / "ROOT_WORKTREE").exists() else worktree
     _adopt_reject_live_shared_worktree(runtime_root, run_dir, isolated)
-    _remove_isolated_worktree(runtime_root, root, isolated)
+    if isolated.exists():
+        _remove_isolated_worktree(runtime_root, root, isolated)
     _mark_resolved_worktree(runtime_root, root, isolated, "DISCARDED", str(isolated))
     return {"run_dir": str(run_dir), "worktree": str(isolated)}
 
@@ -1863,6 +1942,8 @@ def commit_run(run_dir: Path, config_path: Path | None = None, home: Path | None
     runtime_root = Path(config["runtime_root"]).resolve()
     isolated = (run_dir / "ISOLATED_WORKTREE").is_file()
     if isolated:
+        if not (run_dir / "ROOT_WORKTREE").exists():
+            raise HarnessError("cannot commit: isolated run has no ROOT_WORKTREE; explicit adopt required")
         marker = Path((run_dir / "ISOLATED_WORKTREE").read_text(encoding="utf-8").strip())
         if not marker.is_absolute() or _validate_isolated_path(runtime_root, marker) != cwd:
             raise HarnessError("cannot commit: isolated worktree marker differs from recorded cwd")
@@ -1890,6 +1971,20 @@ def commit_run(run_dir: Path, config_path: Path | None = None, home: Path | None
         to_verify = {item["file"] for item in summary["diff_summary"]
                      if not item.get("removed_preexisting_change")}
         to_verify |= set(baseline["changed_files"]) & _chain_paths(run_dir)
+        if isolated:
+            dirty = _git(cwd, ["--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all"])
+            if dirty.returncode:
+                raise HarnessError("cannot commit: could not inspect isolated Git paths")
+            dirty_paths = set(current_by_path)
+            entries = iter(dirty.stdout.split("\0"))
+            for entry in entries:
+                if entry:
+                    dirty_paths.add(entry[3:])
+                    if "R" in entry[:2] or "C" in entry[:2]:
+                        dirty_paths.add(next(entries))
+            if dirty_paths - to_verify:
+                raise HarnessError("cannot commit: isolated worktree has changes outside recorded paths: "
+                                   + ", ".join(sorted(dirty_paths - to_verify)))
         for name in to_verify:
             item = recorded[name]
             actual = current_by_path.get(name)
@@ -3165,14 +3260,18 @@ def finalize_run(
         combined_error = f"{combined_error}\ncommit recording failed: {commit['reason']}".strip()
     isolated = (run_dir / "ISOLATED_WORKTREE").exists()
     integration = None
+    integration_interruptions: list[BaseException] = []
     if isolated and role.get("write"):
         integration = {"status": "pending", "reason": f"run status is {status}"}
         settings = load_final(run_dir / "auto-commit.json") or {}
-        if status == "success" and settings.get("enabled"):
+        if not (run_dir / "ROOT_WORKTREE").exists():
+            integration["reason"] = "isolated run has no ROOT_WORKTREE; explicit adopt required"
+        elif status == "success" and settings.get("enabled"):
             if commit["status"] == "committed" or commit.get("reason") == "no changes":
                 integration = _integrate_isolated_unit(
                     run_dir, runtime_root or Path(settings["runtime_root"]), cwd, settings,
                     commit, role["timeout_seconds"],
+                    interruptions=integration_interruptions,
                 )
                 if integration["status"] == "integrated":
                     cwd = Path(integration["root"])
@@ -3307,6 +3406,9 @@ def finalize_run(
     if blocked_category:
         atomic_write(run_dir / "BLOCKED", f"{blocked_category}: {combined_error}\n")
     atomic_write(run_dir / "summary.txt", summary_text)
+    if integration_interruptions:
+        interruption = integration_interruptions[0]
+        raise interruption.with_traceback(interruption.__traceback__)
     return summary
 
 
