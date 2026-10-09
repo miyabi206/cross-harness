@@ -584,6 +584,77 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue((run / "BLOCKED").exists())
         invoke.assert_not_called()
 
+    def test_recovered_errors_do_not_override_success_or_other_outcome_rules(self):
+        reconnect_messages = [
+            f"Reconnecting... {attempt}/5 (request timed out)" for attempt in range(1, 6)
+        ]
+        cases = (
+            ("reconnected", reconnect_messages, 0, 0, "success", False, "success"),
+            ("recovered-limit", ["usage limit reached; try again in 1 hour"], 0, 0, "success", False, "success"),
+            ("recovered-auth", ["authentication failed"], 0, 0, "success", False, "success"),
+            ("nonzero-exit", reconnect_messages, 1, 0, "success", False, "failed"),
+            ("failed-check", reconnect_messages, 0, 1, "success", False, "failed"),
+            ("failed-report", reconnect_messages, 0, 0, "failed", False, "failed"),
+            ("readonly-change", reconnect_messages, 0, 0, "success", True, "failed"),
+        )
+        role = {"model": "gpt-5.6-luna", "effort": "low", "output_limit_chars": 8000, "write": False}
+        for name, messages, exit_code, check_exit, reported_status, modify, expected in cases:
+            with self.subTest(name=name):
+                run = self.root / name
+                run.mkdir()
+                _write_baseline(run, self.repo)
+                if modify:
+                    (self.repo / "README.md").write_text("after\n")
+                (run / "task.md").write_text("# Checks\n- scripts/test.sh\n")
+                sequence = [
+                    {"type": "thread.started", "thread_id": "reconnected-thread"},
+                    {"type": "turn.started"},
+                    {"type": "item.started", "item": {"type": "command_execution", "command": "scripts/test.sh"}},
+                    *[{"type": "error", "message": message} for message in messages],
+                    {"type": "item.completed", "item": {
+                        "type": "command_execution", "command": "scripts/test.sh",
+                        "exit_code": check_exit, "status": "completed" if check_exit == 0 else "failed",
+                    }},
+                    {"type": "turn.completed", "usage": {}},
+                ]
+                (run / "events.jsonl").write_text("".join(json.dumps(event) + "\n" for event in sequence))
+                (run / "stderr.log").write_text("")
+                (run / "final.json").write_text(json.dumps({
+                    "status": reported_status, "work_completed": "done", "changed_files": [],
+                    "tests": ["scripts/test.sh"], "error": None, "next_decision": None,
+                }))
+
+                summary = finalize_run(run, "tester", role, "test", self.repo, exit_code, 1)
+
+                self.assertEqual(expected, summary["status"])
+                self.assertEqual(messages, summary["recovered_errors"])
+                self.assertIn("recovered_errors: " + "; ".join(messages), (run / "summary.txt").read_text())
+                state = json.loads((run / "state.json").read_text())
+                self.assertNotIn("blocked_category", state)
+                self.assertFalse((run / "BLOCKED").exists())
+                if expected == "success":
+                    self.assertIsNone(summary["error"])
+                    self.assertIsNone(summary["failure_signature"])
+                    self.assertEqual("passed", summary["checks"][0]["status"])
+
+    def test_unrecovered_event_errors_still_override_success(self):
+        cases = (
+            [{"type": "turn.started"}, {"type": "error", "message": "unrecovered failure"}],
+            [{"type": "turn.failed", "message": "unrecovered failure"}, {"type": "turn.completed"}],
+            [{"type": "result", "is_error": True, "result": "unrecovered failure"}, {"type": "turn.completed"}],
+        )
+        role = {"model": "gpt-5.6-luna", "effort": "low", "output_limit_chars": 8000}
+        for index, sequence in enumerate(cases):
+            with self.subTest(sequence=sequence):
+                run = self.root / f"unrecovered-{index}"
+                run.mkdir()
+                (run / "events.jsonl").write_text("".join(json.dumps(event) + "\n" for event in sequence))
+                (run / "final.json").write_text(json.dumps({"status": "success", "error": None}))
+                summary = finalize_run(run, "tester", role, "review", self.repo, 0, 1)
+                self.assertEqual("failed", summary["status"])
+                self.assertIn("unrecovered failure", summary["error"])
+                self.assertEqual([], summary["recovered_errors"])
+
     def test_turn_failure_overrides_zero_process_exit(self):
         run = self.root / "failed-run"
         run.mkdir()

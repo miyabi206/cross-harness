@@ -3328,6 +3328,7 @@ def finalize_run(
         "self_reversions": self_reversions,
         "work_completed": str(final.get("work_completed", "")),
         "error": combined_error[:4000] or None,
+        "recovered_errors": parsed.get("recovered_errors", []),
         "next_decision": final.get("next_decision"),
         "usage": parsed.get("usage", {}),
         "failure_signature": signature,

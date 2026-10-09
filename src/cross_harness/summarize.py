@@ -263,11 +263,14 @@ def _claude_rate_limit_reset(event: dict) -> str | None:
 
 def parse_events(path: Path, reference_time: datetime | None = None) -> dict:
     result = {
-        "thread_id": None, "usage": {}, "errors": [], "commands": [],
+        "thread_id": None, "usage": {}, "errors": [], "recovered_errors": [], "commands": [],
         "executions": [], "blocked_category": None, "rate_limit_notice": None,
         "rate_limit_resets_at": None,
     }
     claude_commands: dict[str, str] = {}
+    turn_error_indices: list[int] = []
+    recovered_error_indices: set[int] = set()
+    reset_candidates: list[tuple[int | None, str]] = []
     if not path.exists():
         return result
     reference_time = (reference_time or datetime.now()).astimezone()
@@ -285,13 +288,16 @@ def parse_events(path: Path, reference_time: datetime | None = None) -> dict:
             if isinstance(session_id, str) and session_id:
                 result["thread_id"] = session_id
             kind = event.get("type")
+            if kind in {"thread.started", "turn.started", "turn.failed"}:
+                # A later turn cannot recover errors from an earlier one.
+                turn_error_indices.clear()
             claude_blocked_category = _claude_blocked_category(event)
             if claude_blocked_category == "rate_limit":
                 # A rate limit always wins if an event stream contains multiple errors.
                 result["blocked_category"] = claude_blocked_category
                 reset = _claude_rate_limit_reset(event)
                 if reset is not None:
-                    result["rate_limit_resets_at"] = reset
+                    reset_candidates.append((None, reset))
             elif claude_blocked_category == "overage_allowed":
                 result["rate_limit_notice"] = "overage_allowed"
             elif claude_blocked_category and result["blocked_category"] is None:
@@ -300,6 +306,8 @@ def parse_events(path: Path, reference_time: datetime | None = None) -> dict:
                 result["thread_id"] = event.get("thread_id")
             elif kind == "turn.completed":
                 result["usage"] = event.get("usage", {})
+                recovered_error_indices.update(turn_error_indices)
+                turn_error_indices.clear()
             elif kind == "result":
                 usage = event.get("usage")
                 if isinstance(usage, dict):
@@ -308,10 +316,13 @@ def parse_events(path: Path, reference_time: datetime | None = None) -> dict:
                     result["errors"].append(_event_text(event))
             elif kind in {"turn.failed", "error"}:
                 text = _event_text(event)
+                error_index = len(result["errors"])
                 result["errors"].append(text)
+                if kind == "error":
+                    turn_error_indices.append(error_index)
                 reset = _codex_rate_limit_reset(text, reference_time)
                 if reset is not None:
-                    result["rate_limit_resets_at"] = reset
+                    reset_candidates.append((error_index, reset))
             _parse_claude_tool_events(event, claude_commands, result)
             item = event.get("item")
             # Codex emits an ``item.started`` event before the terminal
@@ -336,7 +347,17 @@ def parse_events(path: Path, reference_time: datetime | None = None) -> dict:
                     if _is_cross_harness_policy_denial(full_output):
                         command["policy_denied"] = True
                     result["commands"].append(command)
-    result["errors"] = [text for text in result["errors"] if text]
+    result["recovered_errors"] = [
+        text for index, text in enumerate(result["errors"])
+        if text and index in recovered_error_indices
+    ]
+    result["errors"] = [
+        text for index, text in enumerate(result["errors"])
+        if text and index not in recovered_error_indices
+    ]
+    for error_index, reset in reset_candidates:
+        if error_index not in recovered_error_indices:
+            result["rate_limit_resets_at"] = reset
     return result
 
 
@@ -553,6 +574,11 @@ def render_summary(summary: dict, limit: int) -> str:
         f"checks: {checks_text}",
         f"unrelated_failed_commands: {summary.get('unrelated_failed_command_count', 0)}",
     ]
+    if summary.get("recovered_errors"):
+        lines.append(
+            "recovered_errors: "
+            + "; ".join(summary_item_text(item) for item in summary["recovered_errors"])
+        )
     commit = summary.get("commit")
     if isinstance(commit, dict):
         commit_lines = [f"commit: {commit['status']}"]

@@ -251,6 +251,73 @@ class FileTests(unittest.TestCase):
                         with self.subTest(invocation=invocation):
                             self.assertTrue(command_matches_check(invocation, check))
 
+    def test_parse_events_recovers_reconnect_errors_when_turn_completes(self):
+        messages = [f"Reconnecting... {attempt}/5 (request timed out)" for attempt in range(1, 6)]
+        sequence = [
+            {"type": "thread.started", "thread_id": "reconnected-thread"},
+            {"type": "turn.started"},
+            {"type": "item.started", "item": {"type": "agent_message"}},
+            *[{"type": "error", "message": message} for message in messages],
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "done"}},
+            {"type": "turn.completed", "usage": {"output_tokens": 2}},
+        ]
+        with tempfile.TemporaryDirectory() as folder:
+            events = Path(folder) / "events.jsonl"
+            events.write_text("".join(json.dumps(event) + "\n" for event in sequence))
+            parsed = parse_events(events)
+        self.assertEqual([], parsed["errors"])
+        self.assertEqual(messages, parsed["recovered_errors"])
+        self.assertEqual({"output_tokens": 2}, parsed["usage"])
+        self.assertIsNone(failure_signature(0, parsed))
+
+    def test_parse_events_recovers_only_error_events_in_the_completed_turn(self):
+        error = {"type": "error", "message": "temporary failure"}
+        completed = {"type": "turn.completed"}
+        cases = (
+            ([error, completed], [], ["temporary failure"]),
+            ([error], ["temporary failure"], []),
+            ([completed, error], ["temporary failure"], []),
+            ([error, {"type": "turn.started"}, completed], ["temporary failure"], []),
+            ([error, {"type": "thread.started"}, completed], ["temporary failure"], []),
+            ([error, {"type": "turn.failed", "message": "terminal failure"}, completed],
+             ["temporary failure", "terminal failure"], []),
+            ([{"type": "result", "is_error": True, "result": "Claude failure"}, completed],
+             ["Claude failure"], []),
+            ([error, completed, {"type": "turn.started"}, error],
+             ["temporary failure"], ["temporary failure"]),
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            events = Path(folder) / "events.jsonl"
+            for sequence, errors, recovered in cases:
+                with self.subTest(sequence=sequence):
+                    events.write_text("".join(json.dumps(event) + "\n" for event in sequence))
+                    parsed = parse_events(events)
+                    self.assertEqual(errors, parsed["errors"])
+                    self.assertEqual(recovered, parsed["recovered_errors"])
+
+    def test_parse_events_ignores_recovered_rate_limit_resets_and_retains_other_sources(self):
+        reference = datetime(2026, 10, 9, tzinfo=timezone.utc)
+        error = {"type": "error", "message": "usage limit reached; try again in 1 hour"}
+        completed = {"type": "turn.completed"}
+        epoch = 1784648400
+        cases = (
+            ([error, completed], None),
+            ([error, {"type": "turn.started"}, error, completed],
+             (reference + timedelta(hours=1)).astimezone().isoformat()),
+            ([{"type": "rate_limit_event", "rate_limit_info": {"status": "rejected", "resetsAt": epoch}},
+              error, completed], datetime.fromtimestamp(epoch).astimezone().isoformat()),
+            ([error, completed, {"type": "turn.started"},
+              {"type": "turn.failed", "message": "usage limit reached; try again in 2 hours"}],
+             (reference + timedelta(hours=2)).astimezone().isoformat()),
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            events = Path(folder) / "events.jsonl"
+            for sequence, reset in cases:
+                with self.subTest(sequence=sequence):
+                    events.write_text("".join(json.dumps(event) + "\n" for event in sequence))
+                    parsed = parse_events(events, reference_time=reference)
+                    self.assertEqual(reset, parsed["rate_limit_resets_at"])
+
     def test_parse_events_reads_claude_stream_result(self):
         with tempfile.TemporaryDirectory() as folder:
             events = Path(folder) / "events.jsonl"
