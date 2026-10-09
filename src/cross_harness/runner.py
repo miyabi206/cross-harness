@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 import errno
@@ -29,6 +30,9 @@ from .config import (
     CODEX_EFFORTS,
     defaulted_config_paths,
     delegation_kind_error,
+    effective_auto_commit,
+    effective_auto_revival,
+    effective_protected_branches,
     load_config,
     project_config,
 )
@@ -69,6 +73,7 @@ Do not follow the orchestrator charter from CLAUDE.md: this is an execution-role
 charter. Make the smallest change that satisfies its completion conditions.
 Do not ask the user questions, broaden scope on your own, delegate to another agent, or launch Codex.
 Never launch the wrapper or either harness.
+Do not create commits, switch branches or rewrite Git history, because the wrapper commits a successful run.
 Run each declared check exactly as written as its own command with nothing piped
 or appended, because the wrapper reads that command's exit status.
 When you disagree with the task direction, see a materially better approach, or
@@ -90,6 +95,7 @@ You are the bounded execution worker for a task file supplied by Claude. Make
 the smallest change that satisfies its completion conditions. Do not ask the
 user questions, broaden scope on your own, delegate to another agent, or launch Claude.
 Never launch the wrapper or either harness.
+Do not create commits, switch branches or rewrite Git history, because the wrapper commits a successful run.
 Run each declared check exactly as written as its own command with nothing piped
 or appended, because the wrapper reads that command's exit status.
 When you disagree with the task direction, see a materially better approach, or
@@ -109,6 +115,7 @@ _DETACHED_SUPERVISORS: dict[int, subprocess.Popen] = {}
 _HELD_ROOT_LOCKS: dict[Path, int] = {}
 _DELEGATED_CHANGES_LOCK_TIMEOUT_SECONDS = 5.0
 _LOCK_POLL_INTERVAL_SECONDS = 0.01
+_INTEGRATION_LOCK_POLL_INTERVAL_SECONDS = 0.5
 _ROLE_MARKER = "role"
 
 
@@ -424,6 +431,371 @@ def _record_delegated_changes(
         _release_lock(descriptor)
 
 
+def _task_subject(task: str, section: str) -> str | None:
+    """Read the first non-empty line of a task section as a subject."""
+    in_section = False
+    for line in task.splitlines():
+        if _HEADING.match(line):
+            in_section = bool(re.fullmatch(rf"#{{1,6}}\s+{section}\s*", line, re.IGNORECASE))
+        elif in_section and line.strip():
+            item = _CHECK_ITEM.match(line)
+            return (item.group(1) if item else line).strip()
+    return None
+
+
+def _prepare_commit_settings(
+    config: dict, role_name: str, root: Path, run_dir: Path, previous_run: Path | None = None,
+) -> None:
+    """Persist the resolved subject and root-specific policy before execution."""
+    root = root.resolve()
+    atomic_write(run_dir / "ROOT_WORKTREE", str(root) + "\n")
+    chain_paths = set()
+    if previous_run is not None:
+        chain_paths = _chain_paths(previous_run)
+    atomic_write(run_dir / "chain-paths.json", dump_json(sorted(chain_paths)))
+    task = (run_dir / "task.md").read_text(encoding="utf-8")
+    subject = _task_subject(task, "Commit message")
+    if not subject and previous_run is not None:
+        previous_subject = previous_run / "commit-subject.txt"
+        if previous_subject.exists():
+            subject = previous_subject.read_text(encoding="utf-8").strip() or None
+    subject = subject or (_task_subject(task, "Goal") or "")[:72]
+    subject = subject or f"cross-harness: {role_name} {run_dir.name}"
+    atomic_write(run_dir / "commit-subject.txt", subject + "\n")
+    atomic_write(run_dir / "auto-commit.json", dump_json({
+        "enabled": effective_auto_commit(config, root),
+        "auto_revival": effective_auto_revival(config, root),
+        "write": config["roles"][role_name]["write"],
+        "protected_branches": effective_protected_branches(config, root),
+        "dirty_worktree_policy": _effective_dirty_worktree_policy(config, root),
+        "subject": subject,
+        "root": str(root),
+        "runtime_root": str(Path(config["runtime_root"]).resolve()),
+        "work_branch_prefix": config["work_branch_prefix"],
+        "previous_run": str(previous_run) if previous_run is not None else None,
+    }))
+
+
+def _current_branch(root: Path) -> str | None:
+    result = _git(root, ["symbolic-ref", "--quiet", "--short", "HEAD"])
+    if result.returncode == 1:
+        return None
+    if result.returncode:
+        raise HarnessError(result.stderr.strip() or "could not inspect Git branch")
+    return result.stdout.strip()
+
+
+def _primary_repository_root(cwd: Path) -> Path:
+    listing = _git(cwd, ["worktree", "list", "--porcelain"])
+    if listing.returncode:
+        raise HarnessError(listing.stderr.strip() or "could not inspect Git worktrees")
+    for line in listing.stdout.splitlines():
+        if line.startswith("worktree "):
+            return Path(line[9:]).resolve()
+    raise HarnessError("could not locate primary repository root")
+
+
+def _run_root(run_dir: Path, cwd: Path) -> Path:
+    """Use the recorded launching worktree, or the recorded cwd's Git toplevel."""
+    marker = run_dir / "ROOT_WORKTREE"
+    if marker.exists():
+        raw = marker.read_text(encoding="utf-8").strip()
+        if not raw or not Path(raw).is_absolute():
+            raise HarnessError("ROOT_WORKTREE must contain an absolute worktree path")
+        return Path(raw).resolve()
+    return _git_root(cwd)
+
+
+def _has_commits(root: Path) -> bool:
+    head = _git(root, ["rev-parse", "--verify", "--quiet", "HEAD"])
+    if head.returncode not in {0, 1}:
+        raise HarnessError(head.stderr.strip() or "could not inspect Git HEAD")
+    return head.returncode == 0
+
+
+def _chain_paths(run_dir: Path) -> set[str]:
+    marker = run_dir / "chain-paths.json"
+    if marker.exists():
+        return set(json.loads(marker.read_text(encoding="utf-8")))
+    # Legacy runs can still identify their own delta, but not unrelated baseline paths.
+    baseline = load_final(run_dir / "baseline.json") or {}
+    summary = load_final(run_dir / "summary.json") or {}
+    return {item["file"] for item in summary.get("diff_summary", [])} - set(baseline.get("changed_files", []))
+
+
+def _refuse_unfinished_operation(root: Path) -> None:
+    for name in ("CHERRY_PICK_HEAD", "MERGE_HEAD", "REVERT_HEAD", "rebase-merge",
+                 "rebase-apply", "sequencer", "BISECT_START", "BISECT_LOG"):
+        location = _git(root, ["rev-parse", "--git-path", name])
+        if location.returncode:
+            raise HarnessError("could not inspect root Git operation")
+        path = Path(location.stdout.strip())
+        if (path if path.is_absolute() else root / path).exists():
+            raise HarnessError("root has an unfinished Git operation")
+
+
+def _ensure_work_branch(
+    root: Path, settings: dict, run_dir: Path, *, created_branches: list[str] | None = None,
+) -> str | None:
+    if not _has_commits(root):
+        return None
+    _refuse_unfinished_operation(root)
+    branch = _current_branch(root)
+    if branch is None or branch in settings["protected_branches"]:
+        subject = settings["subject"]
+        slug = re.sub(r"[^a-z0-9]+", "-", subject.lower()).strip("-")[:40].rstrip("-")
+        slug = slug or re.sub(r"[^a-z0-9]+", "-", run_dir.name.lower()).strip("-")[:40].rstrip("-")
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        base = f"{settings['work_branch_prefix']}{stamp}-{slug}"
+        branch = base
+        suffix = 1
+        while True:
+            exists = _git(root, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"])
+            if exists.returncode == 1:
+                break
+            if exists.returncode:
+                raise HarnessError(exists.stderr.strip() or "could not inspect work branch")
+            branch = f"{base}-{suffix}"
+            suffix += 1
+        if branch in settings["protected_branches"]:
+            raise HarnessError("generated work branch is protected")
+        # Both refs point at the same tree; leave the user's files and index alone.
+        for args in (["branch", branch], ["symbolic-ref", "HEAD", f"refs/heads/{branch}"]):
+            result = _git(root, args)
+            if result.returncode:
+                raise HarnessError(result.stderr.strip() or result.stdout.strip() or "could not create work branch")
+            if args[0] == "branch" and created_branches is not None:
+                created_branches.append(branch)
+    atomic_write(run_dir / "WORK_BRANCH", branch + "\n")
+    return branch
+
+
+def _prepare_work_branch(
+    config: dict, role_name: str, role: dict, kind: str, root: Path, runtime_root: Path,
+    run_dir: Path, *, attempts: int = 0, thread_id: str | None = None,
+    signatures: list[str] | None = None, defaulted_settings: list[str] | None = None,
+    discussion_rounds: int = 0, max_discussion_rounds: int = 3, user_decided: bool = False,
+) -> None:
+    """Move a root writer off a protected or detached HEAD without a checkout."""
+    if not role["write"] or not effective_auto_commit(config, root):
+        return
+    digest = hashlib.sha256(str(root.resolve()).encode("utf-8")).hexdigest()
+    lock_path = runtime_root / "locks" / f"work-branch-{digest}.lock"
+    descriptor = None
+    try:
+        if not _has_commits(root):
+            return
+        _refuse_unfinished_operation(root)
+        if (run_dir / "ISOLATED_WORKTREE").exists():
+            return
+        deadline = time.monotonic() + _DELEGATED_CHANGES_LOCK_TIMEOUT_SECONDS
+        while descriptor is None:
+            descriptor = _try_lock(lock_path)
+            if descriptor is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise HarnessError(f"timed out waiting for lock: {lock_path}")
+                time.sleep(min(_LOCK_POLL_INTERVAL_SECONDS, remaining))
+        _ensure_work_branch(root, {
+            "protected_branches": effective_protected_branches(config, root),
+            "work_branch_prefix": config["work_branch_prefix"],
+            "subject": (run_dir / "commit-subject.txt").read_text(encoding="utf-8").strip(),
+        }, run_dir)
+    except (HarnessError, OSError, subprocess.TimeoutExpired) as exc:
+        reason = f"work branch preparation failed: {exc}"
+        finalize_blocked_run(
+            run_dir, role_name, role, kind, root, reason, "work_branch",
+            attempts=attempts, thread_id=thread_id, signatures=signatures,
+            defaulted_settings=defaulted_settings, discussion_rounds=discussion_rounds,
+            max_discussion_rounds=max_discussion_rounds, user_decided=user_decided,
+        )
+        raise HarnessError(f"{reason}\nrun state: {run_dir}") from exc
+    finally:
+        if descriptor is not None:
+            _release_lock(descriptor)
+
+
+def _auto_commit_run(
+    run_dir: Path, role: dict, cwd: Path, status: str, current: list[dict],
+    delta: list[dict], baseline_names: set[str], diff_check_unavailable: bool,
+) -> dict | None:
+    """Commit only admitted run paths, preserving unrelated staged changes."""
+    if not role.get("write"):
+        return None
+    settings_path = run_dir / "auto-commit.json"
+    settings = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
+    record = {"status": "disabled", "subject": settings.get("subject")}
+    if not settings.get("enabled"):
+        record["reason"] = "auto_commit is not effective"
+        return record
+    record["status"] = "skipped"
+    branch_path = run_dir / "WORK_BRANCH"
+    if branch_path.exists():
+        record["branch"] = branch_path.read_text(encoding="utf-8").strip()
+    if status != "success":
+        record["reason"] = "status not success"
+        return record
+    isolated = (run_dir / "ISOLATED_WORKTREE").exists()
+    if isolated and not (run_dir / "ROOT_WORKTREE").exists():
+        record["reason"] = "isolated run has no ROOT_WORKTREE; explicit adopt required"
+        return record
+    if diff_check_unavailable:
+        record["reason"] = "diff check unavailable"
+        return record
+    try:
+        if not _has_commits(cwd):
+            record["reason"] = "repository has no commits"
+            return record
+    except Exception as exc:
+        record.update({"status": "failed", "reason": str(exc).strip()[-2000:]})
+        return record
+    candidates = {item["file"] for item in delta}
+    chain_paths = _chain_paths(run_dir)
+    candidates |= baseline_names & chain_paths
+    excluded = baseline_names - chain_paths
+    paths = sorted((candidates - excluded) & {item["file"] for item in current})
+    record.update({"paths": paths, "excluded_paths": sorted(excluded)})
+    if not paths and not isolated:
+        record["reason"] = "overlap with pre-existing changes" if excluded else "no changes"
+        return record
+    index_path = None
+    index_contents = None
+    index_mode = 0o644
+    staged = False
+    try:
+        _refuse_unfinished_operation(_run_root(run_dir, cwd))
+        if isolated:
+            _refuse_unfinished_operation(cwd)
+        branch = _current_branch(cwd)
+        record["branch"] = branch
+        if isolated and branch is not None:
+            record["reason"] = "isolated worktree is not on detached HEAD"
+            return record
+        if not isolated and (branch is None or branch in settings["protected_branches"]):
+            record["reason"] = "protected branch" if branch is not None else "protected branch (detached HEAD)"
+            return record
+        index_result = _git(cwd, ["rev-parse", "--git-path", "index"])
+        if index_result.returncode:
+            raise HarnessError(index_result.stderr.strip() or "could not locate Git index")
+        index_path = Path(index_result.stdout.strip())
+        if not index_path.is_absolute():
+            index_path = cwd / index_path
+        if index_path.exists():
+            index_contents = index_path.read_bytes()
+            index_mode = stat.S_IMODE(index_path.stat().st_mode)
+        staged = True
+        # An isolated execution can stage a change and undo it before finishing.
+        # Normalize only paths that were clean at baseline, never another unit's paths.
+        stage_paths = paths
+        if isolated:
+            dirty = _git(cwd, ["--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all"])
+            if dirty.returncode:
+                raise HarnessError("could not inspect isolated Git paths")
+            entries = iter(dirty.stdout.split("\0"))
+            stage_names = set(paths)
+            for entry in entries:
+                if entry:
+                    stage_names.add(entry[3:])
+                    if "R" in entry[:2] or "C" in entry[:2]:
+                        stage_names.add(next(entries))
+            stage_paths = sorted(stage_names - excluded)
+        add_args = ["--literal-pathspecs", "add", "-A", "--", *stage_paths]
+        if not stage_paths:
+            result = None
+        else:
+            result = _git(cwd, add_args)
+        if result is not None and result.returncode:
+            raise HarnessError(f"git add exited {result.returncode}: {(result.stderr or result.stdout).strip()[-2000:]}")
+        if isolated:
+            listed = _git(cwd, ["diff", "--cached", "--name-only", "--no-renames", "-z"])
+            if listed.returncode:
+                raise HarnessError("could not inspect staged isolated changes")
+            record["paths"] = [path for path in listed.stdout.split("\0") if path and path not in excluded]
+            if not record["paths"]:
+                staged = False
+                unit = run_dir / "UNIT_COMMIT"
+                if unit.exists():
+                    record.update({"status": "committed", "sha": unit.read_text(encoding="utf-8").strip()})
+                else:
+                    record["reason"] = "no changes"
+                return record
+        commit_args = ["--literal-pathspecs", "commit", "-m", settings["subject"]]
+        commit_args += ["--only", "--", *record["paths"]]
+        result = _git(cwd, commit_args, timeout=600)
+        if result.returncode:
+            error = (result.stderr or result.stdout).strip()[-2000:]
+            raise HarnessError(f"git commit exited {result.returncode}: {error}")
+        staged = False
+        record["status"] = "committed"
+        head = _git(cwd, ["rev-parse", "HEAD"])
+        if head.returncode:
+            raise HarnessError(head.stderr.strip() or "could not read committed HEAD")
+        record.update({"status": "committed", "sha": head.stdout.strip()})
+        if isolated:
+            atomic_write(run_dir / "UNIT_COMMIT", head.stdout.strip() + "\n")
+    except Exception as exc:
+        reason = str(exc).strip()[-2000:]
+        if staged and index_path is not None:
+            try:
+                if index_contents is None:
+                    index_path.unlink(missing_ok=True)
+                else:
+                    atomic_write(index_path, index_contents, index_mode)
+            except OSError as restore_error:
+                reason += f"; could not restore Git index: {restore_error}"
+        record.update({"status": "committed" if record["status"] == "committed" else "failed", "reason": reason})
+    return record
+
+
+def _forget_committed_paths(runtime_root: Path, cwd: Path, paths: list[str]) -> None:
+    descriptor = _acquire_delegated_changes_lock(runtime_root)
+    try:
+        records = _read_delegated_changes(runtime_root) or {}
+        root = str(_git_root(cwd))
+        if root in records:
+            for path in paths:
+                records[root].pop(path, None)
+            atomic_write(_delegated_changes_path(runtime_root), dump_json(records))
+    finally:
+        _release_lock(descriptor)
+
+
+def _guard_write_operation(
+    run_dir: Path, role_name: str, role: dict, kind: str, root: Path, **metadata,
+) -> None:
+    settings = load_final(run_dir / "auto-commit.json") or {}
+    if not role.get("write") or not settings.get("enabled"):
+        return
+    try:
+        _refuse_unfinished_operation(root)
+    except (HarnessError, OSError, subprocess.TimeoutExpired) as exc:
+        reason = f"work branch preparation failed: {exc}"
+        finalize_blocked_run(run_dir, role_name, role, kind, root, reason, "work_branch", **metadata)
+        raise HarnessError(f"{reason}\nrun state: {run_dir}") from exc
+
+
+def _prepare_baseline(
+    run_dir: Path, role_name: str, role: dict, kind: str, cwd: Path, **metadata,
+) -> None:
+    try:
+        _write_baseline(run_dir, cwd)
+        settings = load_final(run_dir / "auto-commit.json") or {}
+        if settings.get("previous_run"):
+            allowed, _ = _recorded_retry_changes(Path(settings["previous_run"]))
+            baseline = load_final(run_dir / "baseline.json")
+            names = set(baseline["changed_files"]) | set(baseline.get("dirty_paths", []))
+            eligible = {item["file"] for item in baseline["diff_summary"]
+                        if (item["file"], item.get("fingerprint")) in (allowed or set())}
+            # Even allow-mode retries cannot claim edits made since the prior
+            # run's evidence was captured, including staged inverse changes.
+            owned = _chain_paths(run_dir) - (names - eligible)
+            atomic_write(run_dir / "chain-paths.json", dump_json(sorted(owned)))
+    except Exception as exc:
+        reason = f"baseline capture failed: {exc}"
+        finalize_blocked_run(run_dir, role_name, role, kind, cwd, reason, "work_branch", **metadata)
+        raise
+
+
 def _prepare_write_execution(
     config: dict,
     role_name: str,
@@ -442,6 +814,9 @@ def _prepare_write_execution(
     policy = _effective_dirty_worktree_policy(config, root)
     if not role["write"]:
         return root
+    _guard_write_operation(run_dir, role_name, role, kind, root, attempts=attempts,
+                           thread_id=thread_id, signatures=signatures,
+                           defaulted_settings=defaulted_settings)
     if policy == "isolate":
         return _create_isolated_worktree(root, run_dir)
     if not _acquire_root_lock(runtime_root, root):
@@ -564,8 +939,17 @@ def _prepare_retry_execution(
     }
     if not role["write"]:
         return root
+    _guard_write_operation(run_dir, role_name, role, kind, root, attempts=attempts,
+                           thread_id=thread_id, signatures=signatures,
+                           defaulted_settings=defaulted_settings, **discussion)
 
-    if (previous_run / "ISOLATED_WORKTREE").exists():
+    previous_summary = load_final(previous_run / "summary.json") or {}
+    resolved = (
+        previous_summary.get("integration", {}).get("status") == "integrated"
+        or (previous_run / "INTEGRATED").exists()
+        or (previous_run / "ADOPTED").exists()
+    )
+    if (previous_run / "ISOLATED_WORKTREE").exists() and not resolved:
         execution_root = _reusable_isolated_worktree(root, previous_run)
         if execution_root is None:
             reason = "retry blocked: missing isolated worktree"
@@ -579,6 +963,12 @@ def _prepare_retry_execution(
             )
             raise DirtyWorktreeError(f"{reason}\nrun state: {run_dir}")
         atomic_write(run_dir / "ISOLATED_WORKTREE", str(execution_root) + "\n")
+        if not (previous_run / "ROOT_WORKTREE").exists():
+            # Resuming a legacy isolated run cannot establish its launching root.
+            (run_dir / "ROOT_WORKTREE").unlink(missing_ok=True)
+        for name in ("ISOLATED_BASE", "UNIT_COMMIT"):
+            if (previous_run / name).exists():
+                shutil.copy2(previous_run / name, run_dir / name)
     else:
         execution_root = root
         lock_path = _root_lock_path(runtime_root, root)
@@ -820,8 +1210,8 @@ def _adopt_write(
     raise HarnessError(f"unsupported path type while adopting: {path}")
 
 
-def _adopt_worktree_roots(worktree: Path) -> tuple[Path, Path]:
-    """Return (isolated worktree, primary worktree) after validating registration."""
+def _adopt_worktree_roots(worktree: Path, root: Path | None = None) -> tuple[Path, Path]:
+    """Validate registration of the isolated and launching worktrees."""
     try:
         isolated = _git_root(worktree)
     except HarnessError as exc:
@@ -836,9 +1226,10 @@ def _adopt_worktree_roots(worktree: Path) -> tuple[Path, Path]:
     ]
     if isolated not in roots:
         raise HarnessError("ISOLATED_WORKTREE is not a registered Git worktree")
-    if not roots or roots[0] == isolated:
+    root = root.resolve() if root is not None else roots[0] if roots else None
+    if root not in roots or root == isolated:
         raise HarnessError("run does not have an isolated worktree; root runs need no adoption")
-    return isolated, roots[0]
+    return isolated, root
 
 
 def _adopt_reject_live_shared_worktree(
@@ -886,12 +1277,391 @@ def _adopt_reject_live_shared_worktree(
             continue
 
 
+def _validate_isolated_path(runtime_root: Path, worktree: Path) -> Path:
+    worktree = worktree.resolve()
+    try:
+        relative = worktree.relative_to((runtime_root / "runs").resolve())
+    except ValueError as exc:
+        raise HarnessError("unsafe isolated worktree marker outside runtime_root/runs (outside run directory)") from exc
+    if not relative.parts:
+        raise HarnessError("unsafe isolated worktree marker at runtime_root/runs")
+    return worktree
+
+
+def _pending_isolated_runs(
+    runtime_root: Path, root: Path, current_run: Path | None = None, current_status: str | None = None,
+    current_blocked_category: str | None = None,
+) -> list[dict]:
+    runs = runtime_root / "runs"
+    if not runs.is_dir():
+        return []
+    revival_worktrees = set()
+    for candidate in runs.iterdir():
+        try:
+            current_limit = (
+                candidate == current_run and current_status == "blocked"
+                and current_blocked_category == "rate_limit"
+            )
+            if current_limit or _awaiting_revival(candidate):
+                marker = candidate / "ISOLATED_WORKTREE"
+                if marker.is_file():
+                    revival_worktrees.add(_validate_isolated_path(runtime_root, Path(marker.read_text().strip())))
+        except (HarnessError, OSError, ValueError, TypeError):
+            continue
+    result = []
+    for candidate in sorted(runs.iterdir()):
+        marker = candidate / "ISOLATED_WORKTREE"
+        try:
+            if not marker.is_file():
+                continue
+            summary = _completed_summary(candidate)
+        except (OSError, UnicodeError):
+            continue
+        if candidate == current_run:
+            summary = {"status": current_status}
+        if not isinstance(summary, dict) or summary.get("status") not in {"success", "failed", "blocked", "partial", "discussion"}:
+            continue
+        try:
+            raw = marker.read_text(encoding="utf-8").strip()
+            if not raw or not Path(raw).is_absolute():
+                continue
+            worktree = _validate_isolated_path(runtime_root, Path(raw))
+            if not worktree.is_dir():
+                continue
+            if worktree in revival_worktrees:
+                continue
+            if (candidate / "ROOT_WORKTREE").exists():
+                if _run_root(candidate, worktree) != root.resolve():
+                    continue
+            else:
+                # A legacy unit has no launching root. List it for its repository
+                # without choosing any worktree as an execution/integration target.
+                listing = _git(worktree, ["worktree", "list", "--porcelain"])
+                registered = {Path(line[9:]).resolve() for line in listing.stdout.splitlines()
+                              if line.startswith("worktree ")}
+                if listing.returncode or worktree not in registered or root.resolve() not in registered:
+                    continue
+        except (HarnessError, OSError, UnicodeError, subprocess.TimeoutExpired):
+            continue
+        result.append({"run_dir": str(candidate), "worktree": str(worktree), "status": summary["status"]})
+    return result
+
+
+def pending(cwd: Path, config_path: Path | None = None, home: Path | None = None) -> list[dict]:
+    config = load_config(config_path, user_paths(home).home)
+    runtime_root = Path(config["runtime_root"]).resolve()
+    root = _git_root(cwd)
+    marker = root.parent / "ISOLATED_WORKTREE"
+    if marker.is_file() and Path(marker.read_text(encoding="utf-8").strip()).resolve() == root:
+        _validate_isolated_path(runtime_root, root)
+        root = _run_root(root.parent, root)
+    return _pending_isolated_runs(runtime_root, root)
+
+
+def _run_pending(
+    run_dir: Path, cwd: Path, status: str, runtime_root: Path | None = None,
+    blocked_category: str | None = None,
+) -> list[dict]:
+    settings = load_final(run_dir / "auto-commit.json") or {}
+    runtime = runtime_root or (Path(settings["runtime_root"]) if settings.get("runtime_root") else None)
+    if runtime is None:
+        return []
+    root = _run_root(run_dir, cwd)
+    return _pending_isolated_runs(runtime.resolve(), root, run_dir, status, blocked_category)
+
+
+def _save_summary(run_dir: Path, summary: dict, limit: int = 12000) -> None:
+    atomic_write(run_dir / "summary.json", dump_json(summary))
+    # Legacy runs may have only a minimal summary; retain their existing text.
+    if all(key in summary for key in ("exit_code", "role", "model", "effort", "run_dir")):
+        atomic_write(run_dir / "summary.txt", render_summary(summary, limit))
+
+
+def _save_resolution(
+    run_dir: Path, summary: dict, state: dict, root: Path, runtime_root: Path, limit: int = 12000,
+) -> None:
+    if summary.get("integration", {}).get("status") == "integrated":
+        summary["cwd"] = state["cwd"] = str(root)
+    try:
+        summary["pending"] = _pending_isolated_runs(runtime_root, root)
+    except Exception as exc:
+        summary["pending"] = []
+        summary.setdefault("cleanup_errors", []).append(f"pending collection failed: {exc}")
+        if summary.get("integration", {}).get("status") == "integrated":
+            _record_integration_cleanup_failure(summary["integration"], exc)
+    atomic_write(run_dir / "state.json", dump_json(state))
+    atomic_write(run_dir / "summary.json", dump_json(summary))
+    try:
+        _save_summary(run_dir, summary, limit)
+    except Exception as exc:
+        summary.setdefault("cleanup_errors", []).append(f"summary rewriting failed: {exc}")
+        if summary.get("integration", {}).get("status") == "integrated":
+            _record_integration_cleanup_failure(summary["integration"], exc)
+        atomic_write(run_dir / "summary.json", dump_json(summary))
+        atomic_write(run_dir / "summary.txt", f"status: {summary['status']}\nsummary rewriting failed: {exc}\n")
+
+
+def _remove_isolated_worktree(runtime_root: Path, root: Path, worktree: Path) -> None:
+    worktree = _validate_isolated_path(runtime_root, worktree)
+    isolated, registered_root = _adopt_worktree_roots(worktree, root)
+    if isolated != worktree or registered_root != root.resolve():
+        raise HarnessError("isolated worktree registration changed; refusing removal")
+    removed = _git(root, ["worktree", "remove", "--force", str(worktree)], timeout=60)
+    if removed.returncode:
+        raise HarnessError(removed.stderr.strip() or "could not remove isolated worktree")
+
+
+def _mark_resolved_worktree(
+    runtime_root: Path, root: Path, worktree: Path, marker_name: str, value: str,
+    integration: dict | None = None,
+) -> None:
+    """Resolve every finished run in a chain that reused this worktree."""
+    resolved = []
+    failures = []
+    for candidate in (runtime_root / "runs").iterdir():
+        marker = candidate / "ISOLATED_WORKTREE"
+        try:
+            if not marker.is_file() or Path(marker.read_text(encoding="utf-8").strip()).resolve() != worktree:
+                continue
+            atomic_write(candidate / marker_name, value + "\n")
+            marker.unlink()
+            for name in ("state.json", "summary.json"):
+                path = candidate / name
+                if not path.is_file():
+                    continue
+                record = json.loads(path.read_text(encoding="utf-8"))
+                record["cwd"] = str(root)
+                if name == "summary.json":
+                    if integration is not None:
+                        record["integration"] = integration
+                    elif marker_name == "ADOPTED":
+                        record["integration"] = {"status": "integrated", "method": "file-by-file", "root": str(root)}
+                    elif marker_name == "DISCARDED":
+                        record["integration"] = {"status": "failed", "reason": "isolated unit discarded"}
+                    resolved.append((candidate, record))
+                else:
+                    atomic_write(path, dump_json(record))
+        except Exception as exc:
+            # One unreadable marker or damaged prior summary must not prevent
+            # resolving the current run and the rest of its retry chain.
+            failures.append(f"{candidate}: {exc}")
+    try:
+        remaining = _pending_isolated_runs(runtime_root, root)
+    except Exception as exc:
+        failures.append(str(exc))
+        remaining = []
+    for candidate, summary in resolved:
+        summary["pending"] = remaining
+        try:
+            _save_summary(candidate, summary)
+        except Exception as exc:
+            failures.append(f"{candidate}: {exc}")
+    if failures:
+        raise HarnessError("; ".join(failures))
+
+
+def _record_integration_cleanup_failure(integration: dict, error: Exception) -> None:
+    reason = f"worktree cleanup failed: {error}"
+    integration["reason"] = "; ".join(filter(None, (integration.get("reason"), reason)))
+
+
+def _finish_integrated_cleanup(
+    run_dir: Path, runtime_root: Path, root: Path, integration: dict, *, check_shared: bool = True,
+) -> None:
+    marker = run_dir / "ISOLATED_WORKTREE"
+    try:
+        if marker.is_file():
+            raw = marker.read_text(encoding="utf-8").strip()
+            if not raw or not Path(raw).is_absolute():
+                raise HarnessError("ISOLATED_WORKTREE must contain an absolute worktree path")
+            worktree = _validate_isolated_path(runtime_root, Path(raw))
+            if check_shared:
+                _adopt_reject_live_shared_worktree(runtime_root, run_dir, worktree)
+            if worktree.exists():
+                dirty = _git(worktree, ["--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all"])
+                if dirty.returncode or dirty.stdout:
+                    raise HarnessError("cleanup refused: integrated worktree has uncommitted changes")
+                head = _git(worktree, ["rev-parse", "HEAD"])
+                if head.returncode or not integration.get("unit_sha") or head.stdout.strip() != integration["unit_sha"]:
+                    raise HarnessError("cleanup refused: isolated HEAD differs from integrated unit commit")
+                _remove_isolated_worktree(runtime_root, root, worktree)
+            _mark_resolved_worktree(runtime_root, root, worktree, "INTEGRATED",
+                                    integration.get("sha", "unknown"), integration)
+    except Exception as exc:
+        _record_integration_cleanup_failure(integration, exc)
+
+
+def _integrate_isolated_unit(
+    run_dir: Path, runtime_root: Path, worktree: Path, settings: dict, commit: dict,
+    timeout_seconds: float, *, wait: bool = True,
+    interruptions: list[BaseException] | None = None,
+) -> dict:
+    """Cherry-pick under the root lock, preserving unrelated uncommitted paths."""
+    record = {"status": "pending", "unit_sha": commit.get("sha")}
+    if not (run_dir / "ROOT_WORKTREE").exists():
+        record["reason"] = "isolated run has no ROOT_WORKTREE; explicit adopt required"
+        return record
+    interruption = None
+    acquired = False
+    root = None
+    old_branch = None
+    old_head = None
+    index_path = None
+    index_snapshot = None
+    attempted = False
+    created_branches: list[str] = []
+    try:
+        worktree = _validate_isolated_path(runtime_root, worktree)
+        isolated, root = _adopt_worktree_roots(worktree, _run_root(run_dir, worktree))
+        if isolated != worktree:
+            raise HarnessError("isolated worktree marker must name the worktree root")
+        record["root"] = str(root)
+        _adopt_reject_live_shared_worktree(runtime_root, run_dir, worktree)
+        deadline = time.monotonic() + timeout_seconds
+        try:
+            while not _acquire_root_lock(runtime_root, root):
+                if not wait:
+                    raise HarnessError("adopt blocked: another write delegation owns the root worktree")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    record["reason"] = "timed out waiting for root worktree lock"
+                    return record
+                time.sleep(min(_INTEGRATION_LOCK_POLL_INTERVAL_SECONDS, remaining))
+        except BaseException as exc:
+            if isinstance(exc, Exception):
+                raise
+            interruption = exc
+            raise HarnessError("integration interrupted while waiting for root worktree lock") from exc
+        acquired = True
+        index = _git(root, ["rev-parse", "--git-path", "index"])
+        if index.returncode:
+            raise HarnessError("could not locate root Git index")
+        index_path = Path(index.stdout.strip())
+        if not index_path.is_absolute():
+            index_path = root / index_path
+        index_snapshot = _adopt_snapshot(index_path)
+        dirty = _git(root, ["--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        staged = _git(root, ["--no-optional-locks", "diff", "--cached", "--quiet"])
+        if dirty.returncode or staged.returncode not in {0, 1}:
+            raise HarnessError("could not inspect root worktree changes")
+        if staged.returncode:
+            raise HarnessError("integration refused: root index has staged changes")
+        dirty_paths = set()
+        entries = iter(dirty.stdout.split("\0"))
+        for entry in entries:
+            if entry:
+                dirty_paths.add(entry[3:])
+                if "R" in entry[:2] or "C" in entry[:2]:
+                    dirty_paths.add(next(entries))
+        _refuse_unfinished_operation(root)
+        isolated_dirty = _git(worktree, ["--no-optional-locks", "status", "--porcelain", "--untracked-files=all"])
+        if isolated_dirty.returncode or isolated_dirty.stdout:
+            raise HarnessError("integration refused: committed isolated worktree has uncommitted changes")
+        head = _git(worktree, ["rev-parse", "HEAD"])
+        if head.returncode or (commit.get("sha") and head.stdout.strip() != commit["sha"]):
+            raise HarnessError("integration refused: isolated HEAD differs from recorded unit commit")
+        record["unit_sha"] = head.stdout.strip()
+        base_path = run_dir / "ISOLATED_BASE"
+        base = base_path.read_text(encoding="utf-8").strip() if base_path.exists() else f"{head.stdout.strip()}^"
+        units = _git(worktree, ["rev-list", "--reverse", f"{base}..{head.stdout.strip()}"])
+        if units.returncode:
+            raise HarnessError("could not inspect isolated unit commits")
+        shas = units.stdout.splitlines()
+        record["unit_commits"] = shas
+        # Include intermediate commit paths as well as the final tree delta:
+        # a retry can touch a path and later undo it in the same unit.
+        changed_paths = set()
+        for sha in shas:
+            changed = _git(worktree, ["diff-tree", "--no-commit-id", "--name-only", "--no-renames", "-r", "-z", sha])
+            if changed.returncode:
+                raise HarnessError("could not inspect integration path collisions")
+            changed_paths.update(name for name in changed.stdout.split("\0") if name)
+        ignored = _git(root, ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"])
+        if ignored.returncode:
+            raise HarnessError("could not inspect integration path collisions")
+        for name in sorted(dirty_paths):
+            if any(path == name or path.startswith(name + "/") or name.startswith(path + "/") for path in changed_paths):
+                raise HarnessError(f"integration refused: root path collides with unit: {name}")
+        for raw in ignored.stdout.split("\0"):
+            name = raw.rstrip("/")
+            if name and any(path == name or path.startswith(name + "/") or name.startswith(path + "/") for path in changed_paths):
+                raise HarnessError(f"integration refused: ignored root path would be overwritten: {name}")
+        old_branch = _current_branch(root)
+        old_head_result = _git(root, ["rev-parse", "HEAD"])
+        if old_head_result.returncode:
+            raise HarnessError("could not read root HEAD")
+        old_head = old_head_result.stdout.strip()
+        record["branch"] = old_branch
+        if shas:
+            record["branch"] = _ensure_work_branch(root, settings, run_dir, created_branches=created_branches)
+            attempted = True
+            try:
+                picked = _git(root, ["cherry-pick", *shas], timeout=600)
+            except BaseException as exc:
+                if isinstance(exc, Exception):
+                    raise
+                interruption = exc
+                raise HarnessError("integration interrupted during cherry-pick") from exc
+            if picked.returncode:
+                conflicts = _git(root, ["diff", "--name-only", "--diff-filter=U", "-z"])
+                record["conflicted_paths"] = [name for name in conflicts.stdout.split("\0") if name]
+                record["status"] = "conflict" if record["conflicted_paths"] else "failed"
+                raise HarnessError(f"git cherry-pick exited {picked.returncode}: {(picked.stderr or picked.stdout).strip()[-2000:]}")
+        # Once the pick succeeds, subsequent inspection or cleanup failures
+        # cannot roll back a completed integration or escape finalization.
+        record["status"] = "integrated"
+        integrated_head = _git(root, ["rev-parse", "HEAD"])
+        if integrated_head.returncode:
+            raise HarnessError("could not read integrated HEAD")
+        record.update({"status": "integrated", "sha": integrated_head.stdout.strip()})
+    except Exception as exc:
+        record["reason"] = str(exc)
+        if interruption is not None:
+            record["status"] = "pending"
+        elif record["status"] not in {"conflict", "integrated"}:
+            record["status"] = "failed"
+        if record["status"] != "integrated" and root is not None and old_head is not None:
+            try:
+                if attempted:
+                    aborted = _git(root, ["cherry-pick", "--abort"])
+                    if aborted.returncode:
+                        # A failed hook can leave no CHERRY_PICK_HEAD. Keep all
+                        # pre-existing dirty paths when returning to old HEAD.
+                        restored = _git(root, ["reset", "--keep", old_head])
+                        if restored.returncode:
+                            raise HarnessError(restored.stderr.strip() or "could not restore root HEAD")
+                restored = _git(root, ["symbolic-ref", "HEAD", f"refs/heads/{old_branch}"] if old_branch else ["update-ref", "--no-deref", "HEAD", old_head])
+                if restored.returncode:
+                    raise HarnessError("could not restore root branch")
+                if index_path is not None and index_snapshot is not None:
+                    _adopt_write(index_path, index_snapshot)
+                for branch in created_branches:
+                    merged = _git(root, ["merge-base", "--is-ancestor", branch, old_head])
+                    if merged.returncode:
+                        raise HarnessError(f"refusing to delete work branch with unmerged commits: {branch}")
+                    deleted = _git(root, ["branch", "--delete", branch])
+                    if deleted.returncode:
+                        raise HarnessError(deleted.stderr.strip() or f"could not delete work branch: {branch}")
+            except (HarnessError, OSError, subprocess.TimeoutExpired) as rollback_error:
+                record["reason"] += f"; integration rollback failed: {rollback_error}"
+    finally:
+        if acquired and root is not None:
+            _release_root_lock(runtime_root, root)
+    if record["status"] == "integrated":
+        _finish_integrated_cleanup(run_dir, runtime_root, root, record, check_shared=False)
+    if interruption is not None:
+        if interruptions is None:
+            raise interruption.with_traceback(interruption.__traceback__)
+        interruptions.append(interruption)
+    return record
+
+
 def adopt(
     run_dir: Path,
     config_path: Path | None = None,
     home: Path | None = None,
 ) -> dict:
-    """Adopt an isolated run's worktree delta into the primary worktree."""
+    """Adopt an isolated run's worktree delta into its launching worktree."""
     run_dir = run_dir.resolve()
     if not run_dir.is_dir():
         raise HarnessError(f"run directory not found: {run_dir}")
@@ -910,6 +1680,16 @@ def adopt(
         or completed_summary.get("status") not in completed_statuses
     ):
         raise HarnessError("cannot adopt: run summary is not finalized")
+    config = load_config(config_path, user_paths(home).home)
+    runtime_root = Path(config["runtime_root"]).resolve()
+    if completed_summary.get("integration", {}).get("status") == "integrated":
+        root = _run_root(run_dir, Path(state["cwd"]))
+        integration = dict(completed_summary["integration"])
+        integration.pop("reason", None)
+        _finish_integrated_cleanup(run_dir, runtime_root, root, integration)
+        completed_summary["integration"] = integration
+        _save_resolution(run_dir, completed_summary, state, root, runtime_root)
+        return {"root": str(root), "changed_files": [], "integration": integration}
     if state["status"] == "discussion" or completed_summary["status"] == "discussion":
         raise HarnessError("cannot adopt: discussion run awaits a reply")
     marker = run_dir / "ISOLATED_WORKTREE"
@@ -921,7 +1701,6 @@ def adopt(
         raw_marker_path = marker.read_text(encoding="utf-8").strip()
     except (OSError, UnicodeError) as exc:
         raise HarnessError(f"could not read ISOLATED_WORKTREE: {exc}") from exc
-    runtime_root = Path(load_config(config_path, user_paths(home).home)["runtime_root"]).resolve()
     marker_path = Path(raw_marker_path)
     if not raw_marker_path or not marker_path.is_absolute():
         raise HarnessError("ISOLATED_WORKTREE must contain an absolute worktree path")
@@ -934,8 +1713,49 @@ def adopt(
         ) from exc
     if not marker_path.is_dir():
         raise HarnessError(f"isolated worktree not found: {marker_path}")
-    isolated, root = _adopt_worktree_roots(marker_path)
+    recorded_root = _run_root(run_dir, marker_path) if (run_dir / "ROOT_WORKTREE").exists() else None
+    isolated, root = _adopt_worktree_roots(marker_path, recorded_root)
     _adopt_reject_live_shared_worktree(runtime_root, run_dir, isolated)
+    commit = completed_summary.get("commit", {})
+    if commit.get("status") == "committed" and recorded_root is not None:
+        subject = commit.get("subject") or f"cross-harness: adopt {run_dir.name}"
+        settings = {
+            "protected_branches": effective_protected_branches(config, root),
+            "work_branch_prefix": config["work_branch_prefix"],
+            "subject": subject,
+        }
+        base_path = run_dir / "ISOLATED_BASE"
+        base = base_path.read_text(encoding="utf-8").strip() if base_path.exists() else f"{commit['sha']}^"
+        changed = _git(isolated, ["diff", "--name-only", "--no-renames", "-z", base, commit["sha"]])
+        if changed.returncode:
+            raise HarnessError("could not inspect committed unit paths")
+        integration = _integrate_isolated_unit(
+            run_dir, runtime_root, isolated, settings, commit, 0, wait=False,
+        )
+        if integration["status"] != "integrated":
+            completed_summary["integration"] = integration
+            completed_summary["pending"] = _pending_isolated_runs(runtime_root, root)
+            _save_summary(run_dir, completed_summary)
+            raise HarnessError(integration.get("reason") or "adopt integration failed")
+        if integration.get("reason"):
+            # The unit is already on the root branch; cleanup failures must
+            # not turn that successful cherry-pick into an unfinished action.
+            completed_summary.update({"integration": integration, "cwd": str(root), "pending": []})
+            state["cwd"] = str(root)
+            try:
+                completed_summary["pending"] = _pending_isolated_runs(runtime_root, root)
+            except Exception as exc:
+                _record_integration_cleanup_failure(integration, exc)
+            try:
+                atomic_write(run_dir / "state.json", dump_json(state))
+                _save_summary(run_dir, completed_summary)
+            except Exception as exc:
+                _record_integration_cleanup_failure(integration, exc)
+        return {"root": str(root), "worktree": str(isolated),
+                "changed_files": [name for name in changed.stdout.split("\0") if name],
+                "integration": integration}
+    if state["status"] == "failed" or completed_summary["status"] == "failed":
+        raise HarnessError("cannot adopt: failed isolated unit requires retry or discard")
     isolated_head = _git(isolated, ["rev-parse", "HEAD"])
     root_head = _git(root, ["rev-parse", "HEAD"])
     if isolated_head.returncode or root_head.returncode or isolated_head.stdout.strip() != root_head.stdout.strip():
@@ -1085,17 +1905,174 @@ def adopt(
         if delegated_changes_descriptor is not None:
             _release_lock(delegated_changes_descriptor)
         _release_root_lock(runtime_root, root)
+    _remove_isolated_worktree(runtime_root, root, isolated)
+    _mark_resolved_worktree(runtime_root, root, isolated, "ADOPTED", str(root))
     return {"root": str(root), "worktree": str(isolated), "changed_files": applied}
+
+
+def discard(run_dir: Path, config_path: Path | None = None, home: Path | None = None) -> dict:
+    run_dir = run_dir.resolve()
+    if _supervisor_alive(run_dir):
+        raise HarnessError("cannot discard: run is still in progress")
+    summary = _completed_summary(run_dir)
+    if not summary or summary.get("status") not in {"success", "failed", "blocked", "partial", "discussion"}:
+        raise HarnessError("cannot discard: run summary is not finalized")
+    if summary.get("integration", {}).get("status") == "integrated":
+        # Discard cannot undo a unit that is already on the launching branch.
+        return adopt(run_dir, config_path, home)
+    marker = run_dir / "ISOLATED_WORKTREE"
+    if not marker.is_file():
+        raise HarnessError("cannot discard: run is not isolated")
+    config = load_config(config_path, user_paths(home).home)
+    runtime_root = Path(config["runtime_root"]).resolve()
+    raw = marker.read_text(encoding="utf-8").strip()
+    if not raw or not Path(raw).is_absolute():
+        raise HarnessError("ISOLATED_WORKTREE must contain an absolute worktree path")
+    worktree = _validate_isolated_path(runtime_root, Path(raw))
+    if worktree.exists():
+        recorded_root = _run_root(run_dir, worktree) if (run_dir / "ROOT_WORKTREE").exists() else None
+        isolated, root = _adopt_worktree_roots(worktree, recorded_root)
+    else:
+        isolated = worktree
+        root = _run_root(run_dir, worktree) if (run_dir / "ROOT_WORKTREE").exists() else worktree
+    _adopt_reject_live_shared_worktree(runtime_root, run_dir, isolated)
+    if isolated.exists():
+        _remove_isolated_worktree(runtime_root, root, isolated)
+    _mark_resolved_worktree(runtime_root, root, isolated, "DISCARDED", str(isolated))
+    return {"run_dir": str(run_dir), "worktree": str(isolated)}
+
+
+def commit_run(run_dir: Path, config_path: Path | None = None, home: Path | None = None) -> dict:
+    """Commit a verified partial unit, integrating it when it is still isolated."""
+    run_dir = run_dir.resolve()
+    if _supervisor_alive(run_dir):
+        raise HarnessError("cannot commit: run is still in progress")
+    config = load_config(config_path, user_paths(home).home)
+    summary = _completed_summary(run_dir)
+    state = load_final(run_dir / "state.json")
+    role = config["roles"].get(state.get("role")) if state else None
+    if (
+        not summary or not state or not role or not role.get("write")
+        or summary.get("status") != "partial" or state.get("status") != "partial"
+        or summary.get("commit", {}).get("status") not in {"skipped", "failed"}
+    ):
+        raise HarnessError("cannot commit: requires a finalized partial write run with a skipped or failed commit")
+    if (run_dir / "DISCARDED").exists():
+        raise HarnessError("cannot commit: isolated unit was discarded")
+    cwd = Path(state["cwd"]).resolve()
+    root = _run_root(run_dir, cwd)
+    runtime_root = Path(config["runtime_root"]).resolve()
+    isolated = (run_dir / "ISOLATED_WORKTREE").is_file()
+    if isolated:
+        if not (run_dir / "ROOT_WORKTREE").exists():
+            raise HarnessError("cannot commit: isolated run has no ROOT_WORKTREE; explicit adopt required")
+        marker = Path((run_dir / "ISOLATED_WORKTREE").read_text(encoding="utf-8").strip())
+        if not marker.is_absolute() or _validate_isolated_path(runtime_root, marker) != cwd:
+            raise HarnessError("cannot commit: isolated worktree marker differs from recorded cwd")
+        _adopt_worktree_roots(cwd, root)
+        _adopt_reject_live_shared_worktree(runtime_root, run_dir, cwd)
+    elif cwd != root or Path(summary["cwd"]).resolve() != root:
+        raise HarnessError("cannot commit: changes must be in the root worktree")
+    acquired = False
+    if not isolated:
+        if not _acquire_root_lock(runtime_root, root):
+            raise HarnessError("commit blocked: another write delegation owns the root worktree")
+        acquired = True
+    try:
+        _refuse_unfinished_operation(root)
+        _refuse_unfinished_operation(cwd)
+        if summary.get("diff_check") == "unavailable":
+            raise HarnessError("cannot commit: recorded diff is unavailable")
+        _, current, _ = _diff_details(cwd)
+        current_by_path = {item["file"]: item for item in current}
+        baseline = load_final(run_dir / "baseline.json")
+        if not baseline or not isinstance(summary.get("diff_summary"), list):
+            raise HarnessError("cannot commit: recorded diff is missing")
+        recorded = {item["file"]: item for item in baseline["diff_summary"]}
+        recorded.update({item["file"]: item for item in summary["diff_summary"]})
+        to_verify = {item["file"] for item in summary["diff_summary"]
+                     if not item.get("removed_preexisting_change")}
+        to_verify |= set(baseline["changed_files"]) & _chain_paths(run_dir)
+        if isolated:
+            dirty = _git(cwd, ["--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all"])
+            if dirty.returncode:
+                raise HarnessError("cannot commit: could not inspect isolated Git paths")
+            dirty_paths = set(current_by_path)
+            entries = iter(dirty.stdout.split("\0"))
+            for entry in entries:
+                if entry:
+                    dirty_paths.add(entry[3:])
+                    if "R" in entry[:2] or "C" in entry[:2]:
+                        dirty_paths.add(next(entries))
+            if dirty_paths - to_verify:
+                raise HarnessError("cannot commit: isolated worktree has changes outside recorded paths: "
+                                   + ", ".join(sorted(dirty_paths - to_verify)))
+        for name in to_verify:
+            item = recorded[name]
+            actual = current_by_path.get(name)
+            if (
+                actual is None or actual.get("fingerprint") != item.get("fingerprint")
+                or (item.get("fingerprint") is None and _adopt_snapshot(cwd / name)[0] != "missing")
+            ):
+                raise HarnessError(f"cannot commit: recorded fingerprint changed: {name}")
+        settings = load_final(run_dir / "auto-commit.json")
+        if not settings:
+            raise HarnessError("cannot commit: commit settings are missing")
+        settings["protected_branches"] = effective_protected_branches(config, root)
+        settings["work_branch_prefix"] = config["work_branch_prefix"]
+        if not isolated:
+            _ensure_work_branch(root, settings, run_dir)
+        atomic_write(run_dir / "auto-commit.json", dump_json(settings))
+        names = set(baseline["changed_files"]) | set(baseline.get("dirty_paths", []))
+        record = _auto_commit_run(run_dir, role, cwd, "success", current, summary["diff_summary"], names, False)
+        summary["commit"] = record
+        if record["status"] == "committed":
+            if isolated:
+                summary["integration"] = _integrate_isolated_unit(
+                    run_dir, runtime_root, cwd, settings, record, role["timeout_seconds"],
+                )
+            else:
+                try:
+                    _forget_committed_paths(runtime_root, root, record["paths"])
+                except Exception as exc:
+                    summary.setdefault("cleanup_errors", []).append(f"delegated-changes cleanup failed: {exc}")
+        _save_resolution(run_dir, summary, state, root, runtime_root, role["output_limit_chars"])
+        if record["status"] != "committed":
+            raise HarnessError(f"commit {record['status']}: {record.get('reason', 'unknown reason')}")
+        if isolated and summary["integration"]["status"] != "integrated":
+            raise HarnessError(summary["integration"].get("reason") or "integration failed")
+        return summary
+    finally:
+        if acquired:
+            _release_root_lock(runtime_root, root)
 
 
 def _write_baseline(run_dir: Path, cwd: Path) -> None:
     diff_stat, details, changed = _diff_details(cwd)
-    atomic_write(run_dir / "baseline.json", dump_json({
+    baseline = {
         "cwd": str(cwd),
         "diff_stat": diff_stat,
         "diff_summary": details,
         "changed_files": changed,
-    }))
+    }
+    settings_path = run_dir / "auto-commit.json"
+    settings = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
+    if settings.get("enabled") and settings.get("write"):
+        # A staged change and an inverse unstaged change can cancel in diff
+        # HEAD. Preserve those paths too, without refreshing the user's index.
+        status = _git(cwd, ["--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        if status.returncode:
+            raise HarnessError(status.stderr.strip() or "could not inspect baseline Git paths")
+        entries = iter(status.stdout.split("\0"))
+        dirty_paths = set()
+        for entry in entries:
+            if not entry:
+                continue
+            dirty_paths.add(entry[3:])
+            if "R" in entry[:2] or "C" in entry[:2]:
+                dirty_paths.add(next(entries))
+        baseline["dirty_paths"] = sorted(dirty_paths)
+    atomic_write(run_dir / "baseline.json", dump_json(baseline))
 
 
 def _write_execution_record(
@@ -1145,7 +2122,7 @@ def _execution_delta(run_dir: Path, current: list[dict]) -> tuple[list[dict], se
                 "untracked": item.get("untracked", False),
                 "removed_preexisting_change": True,
             })
-    return delta, set(before)
+    return delta, set(before) | set(baseline.get("dirty_paths", []))
 
 
 def _declared_checks(run_dir: Path) -> list[str]:
@@ -1278,6 +2255,10 @@ def _create_isolated_worktree(root: Path, run_dir: Path) -> Path:
     if result.returncode:
         raise HarnessError(f"could not create isolated worktree: {result.stderr.strip()}")
     atomic_write(run_dir / "ISOLATED_WORKTREE", str(worktree) + "\n")
+    head = _git(worktree, ["rev-parse", "HEAD"])
+    if head.returncode:
+        raise HarnessError("could not read isolated worktree base")
+    atomic_write(run_dir / "ISOLATED_BASE", head.stdout.strip() + "\n")
     return worktree
 
 
@@ -1666,6 +2647,7 @@ def delegate(
     root = _git_root(cwd)
     effective_policy = _effective_dirty_worktree_policy(config, root)
     runtime_root = Path(config["runtime_root"])
+    _guard_harness_reset(config, role["harness"])
     lock_path = _root_lock_path(runtime_root, root)
     held_before = lock_path in _HELD_ROOT_LOCKS
     run_dir = run_dir or _new_run_dir(runtime_root)
@@ -1674,6 +2656,7 @@ def delegate(
     run_task = run_dir / "task.md"
     if task_file.resolve() != run_task.resolve():
         shutil.copy2(task_file, run_task)
+    _prepare_commit_settings(config, role_name, root, run_dir)
     try:
         execution_root = _prepare_write_execution(
             config,
@@ -1685,7 +2668,14 @@ def delegate(
             run_dir,
             defaulted_settings=defaulted_settings,
         )
-        _write_baseline(run_dir, execution_root)
+        _prepare_work_branch(
+            config, role_name, role, kind, root, runtime_root, run_dir,
+            defaulted_settings=defaulted_settings,
+            max_discussion_rounds=config["max_discussion_rounds"],
+        )
+        _prepare_baseline(run_dir, role_name, role, kind, execution_root,
+                          defaulted_settings=defaulted_settings,
+                          max_discussion_rounds=config["max_discussion_rounds"])
         try:
             if role["harness"] == "codex":
                 verify_codex_config_ownership(paths.home, root, execution_root)
@@ -1811,10 +2801,12 @@ def start_detached_delegate(
         raise HarnessError("task file is empty")
     if contains_secret(task):
         raise HarnessError("task file appears to contain credential material; refusing delegation")
-    _git_root(cwd)
+    root = _git_root(cwd)
+    _guard_harness_reset(config, role["harness"])
     run_dir = _new_run_dir(Path(config["runtime_root"]))
     run_task = run_dir / "task.md"
     shutil.copy2(task_file, run_task)
+    _prepare_commit_settings(config, role_name, root, run_dir)
     command = [sys.executable, "-m", "cross_harness.cli"]
     if home is not None:
         command.extend(["--home", str(home)])
@@ -1987,6 +2979,212 @@ def wait_for_run(run_dir: Path, timeout_seconds: float, poll_seconds: float = 0.
         time.sleep(min(poll_seconds, remaining))
 
 
+def _reset_time(value: str | None) -> datetime | None:
+    try:
+        reset = datetime.fromisoformat(value)
+        return reset if reset.utcoffset() is not None else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _revival_message(enabled: bool, reset: str | None, count: int) -> str:
+    if not enabled:
+        return "disabled by configuration"
+    if count >= 2:
+        return "stopped after two consecutive revivals"
+    if _reset_time(reset) is None:
+        return "reset time unknown"
+    return f"retry after {reset}"
+
+
+def _record_revival_policy(
+    run_dir: Path, summary: dict, state: dict, category: str | None, reset: str | None,
+) -> None:
+    context = load_final(run_dir / "revival.json") or {}
+    limited = summary["status"] == "blocked" and category == "rate_limit"
+    count = context.get("consecutive_revivals", 0) if limited else 0
+    state["consecutive_revivals"] = count
+    summary["consecutive_revivals"] = count
+    if limited:
+        settings = load_final(run_dir / "auto-commit.json") or {}
+        enabled = settings.get("auto_revival", True)
+        reset = reset if _reset_time(reset) is not None else None
+        policy = {
+            "blocked_category": "rate_limit",
+            "rate_limit_resets_at": reset,
+            "auto_revival": enabled,
+            "revival": _revival_message(enabled, reset, count),
+        }
+        summary.update(policy)
+        state.update(policy)
+
+
+@contextmanager
+def _revival_lock(run_dir: Path, action: str):
+    descriptor = os.open(run_dir / "revival.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise HarnessError(f"{action} refused: revival is already in progress") from exc
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def _run_revived(run_dir: Path, state: dict, *, lock_held: bool = False) -> bool:
+    """An unfinished successor consumes its predecessor only while locked."""
+    marker = run_dir / "REVIVED"
+    if not state.get("revived") and not marker.exists():
+        return False
+    successor = state.get("revived_by")
+    if not successor and marker.is_file():
+        successor = marker.read_text(encoding="utf-8").strip()
+    # Preserve legacy markers with no recorded absolute successor.
+    if not successor or not Path(successor).is_absolute():
+        return True
+    summary = _completed_summary(Path(successor))
+    if isinstance(summary, dict) and summary.get("status") in {"success", "failed", "blocked", "partial", "discussion"}:
+        return True
+    if lock_held:
+        return False
+    try:
+        descriptor = os.open(run_dir / "revival.lock", os.O_RDWR)
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        return False
+    finally:
+        os.close(descriptor)
+
+
+def _awaiting_revival(run_dir: Path, state: dict | None = None, *, lock_held: bool = False) -> bool:
+    state = state if state is not None else load_final(run_dir / "state.json") or {}
+    return (
+        state.get("status") == "blocked" and state.get("blocked_category") == "rate_limit"
+        and not state.get("revival_dismissed")
+        and not (run_dir / "REVIVAL_DISMISSED").exists()
+        and not (run_dir / "DISCARDED").exists()
+        and not _run_revived(run_dir, state, lock_held=lock_held)
+    )
+
+
+def _guard_harness_reset(config: dict, harness: str) -> None:
+    runs = Path(config["runtime_root"]) / "runs"
+    if not runs.is_dir():
+        return
+    for candidate in sorted(runs.iterdir()):
+        try:
+            state = load_final(candidate / "state.json") or {}
+            recorded_harness = state.get("harness") or config["roles"].get(state.get("role"), {}).get("harness")
+            reset = _reset_time(state.get("rate_limit_resets_at"))
+            if (
+                recorded_harness == harness and reset is not None
+                and reset > datetime.now(timezone.utc)
+                and isinstance(_completed_summary(candidate), dict)
+                and _awaiting_revival(candidate, state)
+            ):
+                raise HarnessError(
+                    f"{harness} is awaiting revival: {candidate}; "
+                    f"rate_limit_resets_at: {state['rate_limit_resets_at']}"
+                )
+        except (OSError, ValueError, TypeError):
+            continue
+
+
+def _revival_refusal(
+    run_dir: Path, state: dict, config: dict, root: Path, *, lock_held: bool = False,
+) -> str | None:
+    reset = state.get("rate_limit_resets_at")
+    reset_time = _reset_time(reset)
+    known_reset = reset if reset_time is not None else "unknown"
+    if _run_revived(run_dir, state, lock_held=lock_held):
+        reason = "run was already revived"
+    elif state.get("revival_dismissed") or (run_dir / "REVIVAL_DISMISSED").exists():
+        reason = "run was dismissed"
+    else:
+        reason = _revival_message(
+            effective_auto_revival(config, root), reset, state.get("consecutive_revivals", 0),
+        )
+        if reason.startswith("retry after "):
+            if datetime.now(timezone.utc) >= reset_time:
+                return None
+            reason = "reset time has not passed"
+    return f"{reason}; rate_limit_resets_at: {known_reset}"
+
+
+def revival(
+    cwd: Path, config_path: Path | None = None, home: Path | None = None,
+) -> list[dict]:
+    """List finalized, unresolved usage-limit blocks for the launching root."""
+    config = load_config(config_path, user_paths(home).home)
+    root = _git_root(cwd)
+    runs = Path(config["runtime_root"]) / "runs"
+    if not runs.is_dir():
+        return []
+    result = []
+    for run_dir in sorted(runs.iterdir()):
+        try:
+            summary = _completed_summary(run_dir)
+            state = load_final(run_dir / "state.json")
+            if (
+                not isinstance(summary, dict) or summary.get("status") != "blocked"
+                or not isinstance(state, dict) or state.get("status") != "blocked"
+                or state.get("blocked_category") != "rate_limit"
+                or not _awaiting_revival(run_dir, state)
+                or _run_root(run_dir, Path(state["cwd"])) != root
+            ):
+                continue
+            refusal = _revival_refusal(run_dir, state, config, root)
+            policy = _revival_message(
+                effective_auto_revival(config, root), state.get("rate_limit_resets_at"),
+                state.get("consecutive_revivals", 0),
+            )
+            eligibility = "eligible"
+            if refusal:
+                eligibility = (
+                    f"waiting until {state['rate_limit_resets_at']}" if policy.startswith("retry after ")
+                    else f"not revivable: {policy}"
+                )
+            result.append({
+                "run_dir": str(run_dir), "role": state["role"],
+                "rate_limit_resets_at": state.get("rate_limit_resets_at") or "unknown",
+                "eligibility": eligibility,
+            })
+        except (OSError, ValueError, TypeError, KeyError, HarnessError, subprocess.TimeoutExpired):
+            continue
+    return result
+
+
+def render_revivals(runs: list[dict]) -> str:
+    return "".join(
+        f"{run['run_dir']}\t{run['role']}\t{run['rate_limit_resets_at']}\t{run['eligibility']}\n"
+        for run in runs
+    )
+
+
+def dismiss_revival(run_dir: Path) -> None:
+    with _revival_lock(run_dir, "revival dismissal"):
+        _dismiss_revival_locked(run_dir)
+
+
+def _dismiss_revival_locked(run_dir: Path) -> None:
+    state = load_final(run_dir / "state.json") or {}
+    summary = _completed_summary(run_dir)
+    if (
+        not isinstance(summary, dict) or summary.get("status") != "blocked"
+        or state.get("status") != "blocked" or state.get("blocked_category") != "rate_limit"
+    ):
+        raise HarnessError("revival dismissal requires a finalized usage-limit blocked run")
+    state["revival_dismissed"] = True
+    atomic_write(run_dir / "state.json", dump_json(state))
+    atomic_write(run_dir / "REVIVAL_DISMISSED", "dismissed\n")
+
+
 def finalize_blocked_run(
     run_dir: Path,
     role_name: str,
@@ -2002,6 +3200,7 @@ def finalize_blocked_run(
     discussion_rounds: int = 0,
     max_discussion_rounds: int = 3,
     user_decided: bool = False,
+    rate_limit_resets_at: str | None = None,
 ) -> dict:
     final = {
         "status": "blocked",
@@ -2061,6 +3260,17 @@ def finalize_blocked_run(
         "model": role["model"],
         "effort": role["effort"],
     }
+    commit = _auto_commit_run(run_dir, role, cwd, "blocked", [], [], set(), True)
+    if commit is not None:
+        summary["commit"] = commit
+        try:
+            summary["pending"] = _run_pending(run_dir, cwd, "blocked", blocked_category=category)
+        except Exception as exc:
+            summary["pending"] = []
+            summary["cleanup_errors"] = [f"pending collection failed: {exc}"]
+        if (run_dir / "ISOLATED_WORKTREE").exists():
+            summary["integration"] = {"status": "pending", "reason": "run status is blocked"}
+    _record_revival_policy(run_dir, summary, state, category, rate_limit_resets_at)
     atomic_write(run_dir / "summary.json", dump_json(summary))
     atomic_write(run_dir / "state.json", dump_json(state))
     atomic_write(run_dir / "BLOCKED", f"{category}: {reason}\n")
@@ -2263,6 +3473,66 @@ def finalize_run(
         reported_tests = []
     else:
         reported_tests = [summary_item_text(test) for test in reported_tests]
+    cleanup_errors = []
+    if role.get("write"):
+        try:
+            owned = _chain_paths(run_dir) | (set(detected_changed) - baseline_names)
+            atomic_write(run_dir / "chain-paths.json", dump_json(sorted(owned)))
+        except Exception as exc:
+            cleanup_errors.append(f"chain paths recording failed: {exc}")
+    commit = _auto_commit_run(
+        run_dir, role, cwd, status, current_diff_summary, diff_summary,
+        baseline_names, diff_check_unavailable,
+    )
+    if commit is not None and commit["status"] == "failed":
+        status = "partial"
+        combined_error = f"{combined_error}\nauto-commit failed: {commit['reason']}".strip()
+    elif commit is not None and commit["status"] == "committed" and commit.get("reason"):
+        status = "partial"
+        combined_error = f"{combined_error}\ncommit recording failed: {commit['reason']}".strip()
+    isolated = (run_dir / "ISOLATED_WORKTREE").exists()
+    integration = None
+    integration_interruptions: list[BaseException] = []
+    if isolated and role.get("write"):
+        integration = {"status": "pending", "reason": f"run status is {status}"}
+        settings = load_final(run_dir / "auto-commit.json") or {}
+        if not (run_dir / "ROOT_WORKTREE").exists():
+            integration["reason"] = "isolated run has no ROOT_WORKTREE; explicit adopt required"
+        elif status == "success" and settings.get("enabled"):
+            if commit["status"] == "committed" or commit.get("reason") == "no changes":
+                integration = _integrate_isolated_unit(
+                    run_dir, runtime_root or Path(settings["runtime_root"]), cwd, settings,
+                    commit, role["timeout_seconds"],
+                    interruptions=integration_interruptions,
+                )
+                if integration["status"] == "integrated":
+                    cwd = Path(integration["root"])
+                if integration["status"] != "integrated" or integration.get("reason"):
+                    status = "partial"
+                    combined_error = f"{combined_error}\nintegration {integration['status']}: {integration.get('reason', 'unknown reason')}".strip()
+            else:
+                integration["reason"] = commit.get("reason", "unit was not committed")
+                status = "partial"
+                combined_error = f"{combined_error}\nintegration pending: {integration['reason']}".strip()
+        elif not settings.get("enabled"):
+            integration["reason"] = "auto_commit is not effective"
+    if commit is not None and commit["status"] == "committed" and runtime_root is not None and not isolated:
+        try:
+            _forget_committed_paths(runtime_root, cwd, commit["paths"])
+        except Exception as exc:
+            cleanup_errors.append(f"delegated-changes cleanup failed: {exc}")
+    pending_runs = []
+    if commit is not None:
+        try:
+            pending_runs = _run_pending(run_dir, cwd, status, runtime_root, blocked_category)
+        except Exception as exc:
+            cleanup_errors.append(f"pending collection failed: {exc}")
+            if integration is not None and integration["status"] == "integrated":
+                _record_integration_cleanup_failure(integration, exc)
+    if cleanup_errors:
+        if status == "success":
+            status = "partial"
+        combined_error = "\n".join(filter(None, (combined_error, *cleanup_errors)))
     thread_id = parsed.get("thread_id") or thread_id
     summary = {
         "status": status,
@@ -2290,6 +3560,7 @@ def finalize_run(
         "self_reversions": self_reversions,
         "work_completed": str(final.get("work_completed", "")),
         "error": combined_error[:4000] or None,
+        "recovered_errors": parsed.get("recovered_errors", []),
         "next_decision": final.get("next_decision"),
         "usage": parsed.get("usage", {}),
         "failure_signature": signature,
@@ -2302,6 +3573,13 @@ def finalize_run(
         "cwd": str(cwd),
         "defaulted_settings": defaulted_settings or [],
     }
+    if commit is not None:
+        summary["commit"] = commit
+        summary["pending"] = pending_runs
+    if integration is not None:
+        summary["integration"] = integration
+    if cleanup_errors:
+        summary["cleanup_errors"] = cleanup_errors
     if self_reversion_check_unavailable:
         summary["self_reversion_check"] = "unavailable"
     if diff_check_unavailable:
@@ -2326,30 +3604,45 @@ def finalize_run(
     if blocked_category:
         state["blocked_category"] = blocked_category
         state["blocked_reason"] = combined_error
-    raw_paths = (
-        run_dir / "events.jsonl", run_dir / "stderr.log", run_dir / "final.json", run_dir / "final.txt",
-    )
-    summary["raw_artifact_bytes"] = sum(path.stat().st_size for path in raw_paths if path.exists())
-    summary["summary_bytes"] = 0
-    summary["compression_percent"] = 0.0
-    summary_text = ""
-    for _ in range(4):
-        summary_text = render_summary(summary, role["output_limit_chars"])
-        byte_count = len(summary_text.encode("utf-8", errors="backslashreplace"))
-        percent = (
-            (1 - byte_count / summary["raw_artifact_bytes"]) * 100
-            if summary["raw_artifact_bytes"]
-            else 0.0
+    _record_revival_policy(run_dir, summary, state, blocked_category, parsed.get("rate_limit_resets_at"))
+    # Persist the essential outcome before optional statistics and text rendering.
+    atomic_write(run_dir / "summary.json", dump_json(summary))
+    atomic_write(run_dir / "state.json", dump_json(state))
+    try:
+        raw_paths = (
+            run_dir / "events.jsonl", run_dir / "stderr.log", run_dir / "final.json", run_dir / "final.txt",
         )
-        if byte_count == summary["summary_bytes"] and abs(percent - summary["compression_percent"]) < 0.01:
-            break
-        summary["summary_bytes"] = byte_count
-        summary["compression_percent"] = percent
+        summary["raw_artifact_bytes"] = sum(path.stat().st_size for path in raw_paths if path.exists())
+        summary["summary_bytes"] = 0
+        summary["compression_percent"] = 0.0
+        summary_text = ""
+        for _ in range(4):
+            summary_text = render_summary(summary, role["output_limit_chars"])
+            byte_count = len(summary_text.encode("utf-8", errors="backslashreplace"))
+            percent = (
+                (1 - byte_count / summary["raw_artifact_bytes"]) * 100
+                if summary["raw_artifact_bytes"]
+                else 0.0
+            )
+            if byte_count == summary["summary_bytes"] and abs(percent - summary["compression_percent"]) < 0.01:
+                break
+            summary["summary_bytes"] = byte_count
+            summary["compression_percent"] = percent
+    except Exception as exc:
+        summary.setdefault("cleanup_errors", []).append(f"summary rendering failed: {exc}")
+        if summary.get("integration", {}).get("status") == "integrated":
+            _record_integration_cleanup_failure(summary["integration"], exc)
+        if summary["status"] == "success":
+            summary["status"] = state["status"] = "partial"
+        summary_text = f"status: {summary['status']}\nsummary rendering failed: {exc}\n"
     atomic_write(run_dir / "summary.json", dump_json(summary))
     atomic_write(run_dir / "state.json", dump_json(state))
     if blocked_category:
         atomic_write(run_dir / "BLOCKED", f"{blocked_category}: {combined_error}\n")
     atomic_write(run_dir / "summary.txt", summary_text)
+    if integration_interruptions:
+        interruption = integration_interruptions[0]
+        raise interruption.with_traceback(interruption.__traceback__)
     return summary
 
 
@@ -2395,6 +3688,7 @@ def _resume_run(
     runtime_root: Path | None = None
     lock_path: Path | None = None
     held_before = False
+    state = {}
     state_path = run_dir / "state.json"
     if state_path.exists():
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -2404,17 +3698,19 @@ def _resume_run(
             isinstance(role, dict)
             and role.get("write")
             and isinstance(state_cwd, str)
-            and not (run_dir / "ISOLATED_WORKTREE").exists()
         ):
-            root = _git_root(Path(state_cwd))
+            root = _run_root(run_dir, Path(state_cwd))
             runtime_root = Path(config["runtime_root"])
             lock_path = _root_lock_path(runtime_root, root)
             held_before = lock_path in _HELD_ROOT_LOCKS
     try:
-        return _retry_impl(
-            run_dir, task_file, config_path=config_path, home=home,
-            discussion_reply=discussion_reply, user_decided=user_decided,
-        )
+        limited = state.get("status") == "blocked" and state.get("blocked_category") == "rate_limit"
+        with _revival_lock(run_dir, action) if limited else nullcontext():
+            return _retry_impl(
+                run_dir, task_file, config_path=config_path, home=home,
+                discussion_reply=discussion_reply, user_decided=user_decided,
+                revival_lock_held=limited,
+            )
     finally:
         if root is not None and runtime_root is not None and lock_path is not None:
             if not held_before and lock_path in _HELD_ROOT_LOCKS:
@@ -2423,7 +3719,7 @@ def _resume_run(
 
 def _retry_impl(
     run_dir: Path, task_file: Path, config_path: Path | None = None, home: Path | None = None,
-    *, discussion_reply: bool = False, user_decided: bool = False,
+    *, discussion_reply: bool = False, user_decided: bool = False, revival_lock_held: bool = False,
 ) -> dict:
     action = "reply" if discussion_reply else "retry"
     if os.environ.get("CROSS_HARNESS_ACTIVE") == "1":
@@ -2438,6 +3734,7 @@ def _retry_impl(
     role_name = state["role"]
     role = dict(config["roles"][role_name])
     discussion_rounds = state.get("discussion_rounds", 0)
+    revival_retry = False
     if discussion_reply:
         if state["status"] != "discussion":
             raise HarnessError("reply refused: run status must be discussion")
@@ -2460,12 +3757,23 @@ def _retry_impl(
         blocked_category = state.get("blocked_category")
         if blocked_category == "executor_reported":
             pass
-        elif blocked_category in {"authentication", "rate_limit"}:
+        elif blocked_category == "authentication":
             raise HarnessError(
                 f"retry refused: {blocked_category} is a safety-policy stop; "
-                "authentication and rate-limit blocks must not be retried"
+                "authentication blocks must not be retried"
             )
-        elif blocked_category in {"dirty_worktree", "missing_isolated_worktree"}:
+        elif blocked_category == "rate_limit":
+            source_root = _run_root(run_dir, Path(state["cwd"]))
+            refusal = _revival_refusal(run_dir, state, config, source_root, lock_held=revival_lock_held)
+            if refusal:
+                raise HarnessError(f"retry refused: rate_limit safety-policy stop: {refusal}")
+            if _completed_summary(run_dir) is None:
+                raise HarnessError("retry refused: usage-limit run is not finalized")
+            revival_retry = True
+            role["harness"] = state.get("harness") or role["harness"]
+            role["model"] = state.get("model", role["model"])
+            role["effort"] = state.get("effort", role["effort"])
+        elif blocked_category in {"dirty_worktree", "missing_isolated_worktree", "work_branch"}:
             raise HarnessError(
                 f"retry refused: {blocked_category} has no reusable result; "
                 "create a new delegate instead"
@@ -2474,7 +3782,10 @@ def _retry_impl(
             raise HarnessError(
                 f"retry refused: blocked run category {blocked_category!r} is not eligible for retry"
             )
-    if not discussion_reply and state["attempts"] > role["retries"]:
+    continuation = discussion_reply or revival_retry
+    if not revival_retry:
+        _guard_harness_reset(config, role["harness"])
+    if not continuation and state["attempts"] > role["retries"]:
         raise HarnessError("normal retry budget exhausted")
     if not task_file.is_file():
         raise HarnessError(f"task file not found: {task_file}")
@@ -2483,7 +3794,7 @@ def _retry_impl(
     task = task_file.read_text(encoding="utf-8")
     if not task.strip():
         raise HarnessError("task file is empty")
-    if discussion_reply:
+    if continuation:
         inherited_checks = _declared_checks(run_dir) if not _task_checks(task) else []
         if inherited_checks:
             checks_text = "\n".join(f"- {check}" for check in inherited_checks)
@@ -2495,6 +3806,7 @@ def _retry_impl(
                     break
             else:
                 task = f"{task}\n\n# Checks\n{checks_text}\n"
+    if discussion_reply:
         header = f"Discussion round {discussion_rounds} of {config['max_discussion_rounds']}."
         if user_decided:
             header += " This decision comes from the user and is final."
@@ -2507,13 +3819,21 @@ def _retry_impl(
         "user_decided": user_decided,
     }
     runtime_root = Path(config["runtime_root"])
-    source_root = _git_root(Path(state["cwd"]))
+    if (run_dir / "DISCARDED").exists():
+        raise HarnessError(f"{action} refused: isolated run was discarded; create a new delegation")
+    source_root = _run_root(run_dir, Path(state["cwd"]))
     effective_policy = _effective_dirty_worktree_policy(config, source_root)
     retry_root = _new_run_dir(runtime_root)
-    if discussion_reply:
+    if continuation:
         atomic_write(retry_root / "task.md", task)
     else:
         shutil.copy2(task_file, retry_root / "task.md")
+    _prepare_commit_settings(config, role_name, source_root, retry_root, run_dir)
+    if revival_retry:
+        atomic_write(retry_root / "revival.json", dump_json({
+            "previous_run": str(run_dir),
+            "consecutive_revivals": state.get("consecutive_revivals", 0) + 1,
+        }))
     execution_root = _prepare_retry_execution(
         config, role_name, role, state["kind"], source_root, retry_root, run_dir,
         runtime_root=runtime_root,
@@ -2523,12 +3843,21 @@ def _retry_impl(
         defaulted_settings=defaulted_settings,
         **discussion,
     )
+    _prepare_work_branch(
+        config, role_name, role, state["kind"], source_root, runtime_root, retry_root,
+        attempts=state["attempts"], thread_id=state["thread_id"],
+        signatures=state.get("signatures", []), defaulted_settings=defaulted_settings,
+        **discussion,
+    )
     root_lock_held = (
         role["write"]
         and not (retry_root / "ISOLATED_WORKTREE").exists()
         and _root_lock_path(runtime_root, source_root) in _HELD_ROOT_LOCKS
     )
-    _write_baseline(retry_root, execution_root)
+    _prepare_baseline(retry_root, role_name, role, state["kind"], execution_root,
+                      attempts=state["attempts"], thread_id=state["thread_id"],
+                      signatures=state.get("signatures", []),
+                      defaulted_settings=defaulted_settings, **discussion)
     try:
         if role["harness"] == "codex":
             verify_codex_config_ownership(paths.home, source_root, execution_root)
@@ -2596,6 +3925,11 @@ def _retry_impl(
             **discussion,
         )
     try:
+        if revival_retry:
+            state["revived"] = True
+            state["revived_by"] = str(retry_root)
+            atomic_write(run_dir / "state.json", dump_json(state))
+            atomic_write(run_dir / "REVIVED", str(retry_root) + "\n")
         exit_code = _invoke_safe(
             command, _executor_task(task, role["harness"]), environment, execution_root, retry_root,
             role["timeout_seconds"],
@@ -2604,25 +3938,26 @@ def _retry_impl(
             _write_claude_final_from_events(retry_root)
         summary = finalize_run(
             retry_root, state["role"], role, state["kind"], execution_root, exit_code,
-            state["attempts"] if discussion_reply else state["attempts"] + 1,
+            state["attempts"] if continuation else state["attempts"] + 1,
             runtime_root=runtime_root, dirty_worktree_policy=effective_policy,
             defaulted_settings=defaulted_settings,
-            thread_id=state["thread_id"] if discussion_reply else None,
+            thread_id=state["thread_id"] if continuation else None,
             **discussion,
         )
     finally:
         _release_parallel_reservation(retry_root)
     new_state = json.loads((retry_root / "state.json").read_text(encoding="utf-8"))
     new_state["signatures"] = [*state.get("signatures", []), *new_state.get("signatures", [])]
-    if discussion_reply:
+    if continuation:
         new_state["escalated"] = state.get("escalated", False)
     identical = summary.get("failure_signature") and new_state["signatures"].count(summary["failure_signature"]) >= 2
-    if not discussion_reply and summary["status"] == "failed" and identical and not state.get("escalated"):
+    if not continuation and summary["status"] == "failed" and identical and not state.get("escalated"):
         new_state["escalated"] = True
         atomic_write(retry_root / "state.json", dump_json(new_state))
         escalation = _escalated_role(role, config)
         escalation_root = _new_run_dir(runtime_root)
         shutil.copy2(task_file, escalation_root / "task.md")
+        _prepare_commit_settings(config, role_name, source_root, escalation_root, retry_root)
         escalation_execution_root = _prepare_retry_execution(
             config, role_name, escalation, state["kind"], source_root, escalation_root, retry_root,
             runtime_root=runtime_root,
@@ -2632,7 +3967,16 @@ def _retry_impl(
             root_lock_held=root_lock_held,
             **discussion,
         )
-        _write_baseline(escalation_root, escalation_execution_root)
+        _prepare_work_branch(
+            config, role_name, escalation, state["kind"], source_root, runtime_root, escalation_root,
+            attempts=new_state["attempts"], thread_id=summary.get("thread_id"),
+            signatures=new_state.get("signatures", []), defaulted_settings=defaulted_settings,
+            **discussion,
+        )
+        _prepare_baseline(escalation_root, role_name, escalation, state["kind"], escalation_execution_root,
+                          attempts=new_state["attempts"], thread_id=summary.get("thread_id"),
+                          signatures=new_state.get("signatures", []),
+                          defaulted_settings=defaulted_settings, **discussion)
         command = _command(
             executor,
             role_name,

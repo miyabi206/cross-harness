@@ -16,7 +16,7 @@ from .inventory import create_backup, inventory
 from .maintenance import cleanup
 from .paths import source_root, user_paths
 from .project import remove as remove_project, setup as setup_project
-from .runner import adopt, delegate, reply, retry, start_detached_delegate, wait_for_run
+from .runner import adopt, commit_run, delegate, discard, dismiss_revival, pending, render_revivals, reply, retry, revival, start_detached_delegate, wait_for_run
 from .selfupdate import render as render_self_update, self_update
 from .taskfile import create_task_file
 from .trust import confirm_codex_hook
@@ -87,6 +87,24 @@ def parser() -> argparse.ArgumentParser:
     adopt_parser.add_argument("--run", required=True, type=Path)
     adopt_parser.add_argument("--config", type=Path)
 
+    discard_parser = commands.add_parser("discard", help="remove a finished isolated run's worktree")
+    discard_parser.add_argument("--run", required=True, type=Path)
+    discard_parser.add_argument("--config", type=Path)
+
+    commit_parser = commands.add_parser("commit", help="commit the recorded changes of a partial root or isolated run")
+    commit_parser.add_argument("--run", required=True, type=Path)
+    commit_parser.add_argument("--config", type=Path)
+
+    pending_parser = commands.add_parser("pending", help="list finished isolated runs awaiting resolution")
+    pending_parser.add_argument("--cwd", type=Path, default=Path.cwd())
+    pending_parser.add_argument("--config", type=Path)
+
+    revival_parser = commands.add_parser("revival", help="list or dismiss delegated usage-limit blocks")
+    revival_parser.add_argument("--cwd", type=Path, default=Path.cwd())
+    revival_parser.add_argument("--dismiss", action="store_true")
+    revival_parser.add_argument("--run", type=Path)
+    revival_parser.add_argument("--config", type=Path)
+
     task_parser = commands.add_parser("task", help="create a credential-screened delegation task file")
     task_commands = task_parser.add_subparsers(dest="task_command", required=True)
     task_create = task_commands.add_parser("create", help="create a task file in the runtime inbox")
@@ -94,6 +112,7 @@ def parser() -> argparse.ArgumentParser:
     task_create.add_argument("--kind", required=True)
     task_create.add_argument("--cwd", required=True, type=Path)
     task_create.add_argument("--goal", required=True)
+    task_create.add_argument("--commit-message")
     task_create.add_argument("--done-when", required=True, action="append")
     task_create.add_argument("--scope", action="append", default=[])
     task_create.add_argument("--constraint", action="append", default=[])
@@ -236,6 +255,27 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "adopt":
             summary = adopt(args.run.resolve(), args.config, home)
             print(f"adopted {len(summary['changed_files'])} file(s) into {summary['root']}")
+        elif args.command == "discard":
+            result = discard(args.run.resolve(), args.config, home)
+            if result.get("integration", {}).get("status") == "integrated":
+                print(f"completed integrated worktree cleanup for {result['root']}")
+            else:
+                print(f"discarded worktree: {result['worktree']}")
+        elif args.command == "commit":
+            summary = commit_run(args.run.resolve(), args.config, home)
+            print(f"committed {summary['commit']['sha']}")
+        elif args.command == "pending":
+            for run in pending(args.cwd.resolve(), args.config, home):
+                print(f"{run['run_dir']}\t{run['status']}\t{run['worktree']}")
+        elif args.command == "revival":
+            if args.dismiss:
+                if args.run is None:
+                    raise HarnessError("revival --dismiss requires --run")
+                dismiss_revival(args.run.resolve())
+            elif args.run is not None:
+                raise HarnessError("revival --run requires --dismiss")
+            else:
+                print(render_revivals(revival(args.cwd.resolve(), args.config, home)), end="")
         elif args.command == "task":
             if args.task_command == "create":
                 path = create_task_file(
@@ -251,6 +291,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.assumption,
                     args.config,
                     home,
+                    commit_message=args.commit_message,
                 )
                 print(path)
         elif args.command == "hook":

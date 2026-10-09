@@ -18,6 +18,7 @@ from .paths import user_paths
 from .project import is_auto_setup_disabled, setup as setup_project
 from .installer import synchronize_claude_agent_roles, synchronize_codex_agent_roles
 from .selfupdate import self_update
+from .runner import pending, render_revivals, revival
 from .taskfile import contains_secret
 
 
@@ -534,6 +535,39 @@ def claude_session_start(home: Path | None = None) -> int:
         cleanup(home=paths.home)
     except Exception as exc:  # hooks must not hide the session for maintenance failure
         warnings.append(f"runtime cleanup warning: {exc}")
+    try:
+        unresolved = pending(Path((data or {}).get("cwd", os.getcwd())), home=paths.home)
+        if unresolved:
+            reminders = [
+                f"Pending isolated run: {run['run_dir']} (status: {run['status']})"
+                for run in unresolved
+            ]
+            reminders.append(
+                "For a committed unit whose integration failed or is pending, remove the stated cause, "
+                f"then use `{paths.executable} adopt --run <run_dir>`. "
+                "For a committed unit whose integration conflicted, delegate that unit again sequentially "
+                "in the root worktree, citing the kept unit commit sha so the executor can read it with "
+                f"`git show <sha>`, then use `{paths.executable} discard --run <run_dir>` for the conflicted run. "
+                f"For a partial unit verified another way, root or isolated, use `{paths.executable} commit --run <run_dir>`. "
+                f"For a failed isolated unit, retry or `{paths.executable} discard --run <run_dir>` before reporting."
+            )
+            warnings.extend(reminders)
+    except Exception:  # pending-run collection must be silent and fail open
+        pass
+    try:
+        limit_blocked = revival(Path((data or {}).get("cwd", os.getcwd())), home=paths.home)
+        if limit_blocked:
+            warnings.append("Delegated usage-limit runs (run, role, reset time, eligibility):\n" + render_revivals(limit_blocked).rstrip())
+            warnings.append(
+                f"Confirm eligibility with `{paths.executable} revival --cwd <repo>`, then "
+                f"continue an eligible run with `{paths.executable} retry --run-dir <run_dir> --task-file <continuation_file>`. "
+                "A not revivable run requires a new delegation of the remaining work, after any known reset; "
+                f"after that work is continued, dismiss the blocked run with `{paths.executable} revival --dismiss --run <run_dir>`. "
+                "If the work was continued another way, use "
+                f"`{paths.executable} revival --dismiss --run <run_dir>`."
+            )
+    except Exception:  # usage-limit reminders must be silent and fail open
+        pass
     state_file = paths.home / ".local/state/cross-harness/session/latest.json"
     if state_file.exists():
         try:

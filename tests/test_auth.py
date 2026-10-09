@@ -31,6 +31,12 @@ class AuthTests(unittest.TestCase):
             env = sanitized_environment(Path("/tmp/home"), {"PYTHONDONTWRITEBYTECODE": "0"})
         self.assertEqual("1", env["PYTHONDONTWRITEBYTECODE"])
 
+    def test_child_environment_forwards_timezone_without_forwarding_credentials(self):
+        with patch.dict("os.environ", {"TZ": "UTC", "VENDOR_API_KEY": "fixture"}, clear=True):
+            env = sanitized_environment(Path("/tmp/home"))
+        self.assertEqual("UTC", env["TZ"])
+        self.assertNotIn("VENDOR_API_KEY", env)
+
     def test_project_provider_override_is_rejected(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

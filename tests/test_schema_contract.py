@@ -32,7 +32,9 @@ class SchemaContractTests(unittest.TestCase):
         properties = self.schema["properties"]
         self.assertEqual(config_module.TOP_KEYS, set(properties))
         self.assertEqual(
-            config_module.TOP_KEYS - {"projects", "mode", "project_auto_setup"},
+            config_module.TOP_KEYS - {
+                "projects", "mode", "project_auto_setup", "auto_commit", "auto_revival", "work_branch_prefix", "protected_branches",
+            },
             set(self.schema["required"]),
         )
 
@@ -65,6 +67,43 @@ class SchemaContractTests(unittest.TestCase):
                 self.assertEqual(
                     bool(config_module.validate(config)), bool(self._validate(config, self.schema)),
                 )
+
+    def test_commit_settings_are_optional_and_schema_defaults_match_config(self):
+        legacy = copy.deepcopy(self.default_config)
+        for key in ("auto_commit", "auto_revival", "work_branch_prefix", "protected_branches"):
+            self.assertNotIn(key, self.schema["required"])
+            self.assertEqual(legacy.pop(key), self.schema["properties"][key]["default"])
+        self.assertEqual([], self._validate(legacy, self.schema))
+        self.assertEqual([], config_module.validate(legacy))
+        self.assertEqual(self.default_config["max_parallel"], self.schema["properties"]["max_parallel"]["default"])
+
+    def test_commit_setting_schema_validation_matches_runtime(self):
+        cases = {
+            "auto_commit": (True, False, 1, "true", [], None),
+            "auto_revival": (True, False, 1, "true", [], {}, None),
+            "protected_branches": ([], ["main"], ["main", "master"], ["release/next"], ["main", "main"], [""], [1], {}, "main", None,
+                                   ["release/*"], ["main?"], ["[main]"], ["main]"], ["main branch"], ["main\t"], ["refs/heads/main"]),
+            "work_branch_prefix": (
+                "cross-harness/", "a/", "_work/", "Team/branch-1.2_/", "a-/", "a.locked/",
+                "", "branch", "/", "/branch/", "branch//", "branch//nested/",
+                ".branch/", "-branch/", "branch/.nested/", "branch/-nested/", "branch./",
+                "branch.lock/", "branch.lock/nested/", "branch/nested.lock/", "branch..name/",
+                "branch/nested..name/", "branch name/", "café/", "branch/\n", "branch@/",
+                "branch\\name/", True, 1, [], None,
+            ),
+        }
+        for key, values in cases.items():
+            for value in values:
+                for project in (False, True) if key != "work_branch_prefix" else (False,):
+                    with self.subTest(key=key, value=value, project=project):
+                        config = copy.deepcopy(self.default_config)
+                        if project:
+                            config["projects"] = {"/tmp/project": {key: value}}
+                        else:
+                            config[key] = value
+                        self.assertEqual(
+                            bool(config_module.validate(config)), bool(self._validate(config, self.schema)),
+                        )
 
     def test_schema_enums_match_config_validation(self):
         definitions = self.schema["$defs"]
@@ -163,6 +202,8 @@ class SchemaContractTests(unittest.TestCase):
                 return errors + [f"{path}: expected string"]
             if len(value) < schema.get("minLength", 0):
                 errors.append(f"{path}: string too short")
+            if "pattern" in schema and not re.search(schema["pattern"], value):
+                errors.append(f"{path}: string does not match pattern")
         elif schema.get("type") == "integer":
             if not isinstance(value, int) or isinstance(value, bool):
                 return errors + [f"{path}: expected integer"]

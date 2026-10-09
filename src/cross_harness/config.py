@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
+import re
 import tomllib
 
 from .errors import ConfigError
@@ -34,6 +35,10 @@ TOP_KEYS = {
     "projects",
     "mode",
     "project_auto_setup",
+    "auto_commit",
+    "auto_revival",
+    "work_branch_prefix",
+    "protected_branches",
 }
 ROLE_KEYS = {
     "harness",
@@ -46,7 +51,10 @@ ROLE_KEYS = {
     "output_limit_chars",
     "delegate_kinds",
 }
-PROJECT_KEYS = {"checks", "delegate_kinds", "dirty_worktree_policy", "mode", "project_auto_setup"}
+PROJECT_KEYS = {
+    "checks", "delegate_kinds", "dirty_worktree_policy", "mode", "project_auto_setup",
+    "auto_commit", "auto_revival", "protected_branches",
+}
 CODEX_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DELEGATE_KINDS = {"exploration", "implementation", "test", "debug", "review", "security_review"}
@@ -132,7 +140,9 @@ def _integer(config: dict, key: str, low: int, high: int, errors: list[str]) -> 
 def validate(config: dict) -> list[str]:
     errors: list[str] = []
     _unknown(set(config), TOP_KEYS, "root", errors)
-    for key in TOP_KEYS - {"projects", "mode", "project_auto_setup"}:
+    for key in TOP_KEYS - {
+        "projects", "mode", "project_auto_setup", "auto_commit", "auto_revival", "work_branch_prefix", "protected_branches",
+    }:
         if key not in config:
             errors.append(f"root: missing key {key!r}")
 
@@ -153,6 +163,14 @@ def validate(config: dict) -> list[str]:
         errors.append("mode: expected 'on' or 'off'")
     if "project_auto_setup" in config and not isinstance(config["project_auto_setup"], bool):
         errors.append("project_auto_setup: expected boolean")
+    if "auto_commit" in config and not isinstance(config["auto_commit"], bool):
+        errors.append("auto_commit: expected boolean")
+    if "auto_revival" in config and not isinstance(config["auto_revival"], bool):
+        errors.append("auto_revival: expected boolean")
+    if "work_branch_prefix" in config and not _work_branch_prefix(config["work_branch_prefix"]):
+        errors.append("work_branch_prefix: expected non-empty slash-terminated prefix with safe branch components")
+    if "protected_branches" in config and not _literal_branches(config["protected_branches"]):
+        errors.append("protected_branches: expected unique string array; entries are literal short branch names")
     if not _string_list(config.get("delegate_kinds")):
         errors.append("delegate_kinds: expected a unique string array")
     elif unknown_kinds := set(config["delegate_kinds"]) - DELEGATE_KINDS:
@@ -233,6 +251,12 @@ def validate(config: dict) -> list[str]:
                 errors.append(f"{location}.mode: expected 'on' or 'off'")
             if "project_auto_setup" in project and not isinstance(project["project_auto_setup"], bool):
                 errors.append(f"{location}.project_auto_setup: expected boolean")
+            if "auto_commit" in project and not isinstance(project["auto_commit"], bool):
+                errors.append(f"{location}.auto_commit: expected boolean")
+            if "auto_revival" in project and not isinstance(project["auto_revival"], bool):
+                errors.append(f"{location}.auto_revival: expected boolean")
+            if "protected_branches" in project and not _literal_branches(project["protected_branches"]):
+                errors.append(f"{location}.protected_branches: expected unique string array; entries are literal short branch names")
     return errors
 
 
@@ -258,10 +282,29 @@ def warnings(config: dict) -> list[str]:
     return messages
 
 
+def _literal_branches(value: object) -> bool:
+    return _string_list(value, allow_empty=True) and all(
+        not name.startswith("refs/")
+        and not any(char in "*?[]" or char.isspace() for char in name)
+        for name in value
+    )
+
+
 def _string_list(value: object, allow_empty: bool = False) -> bool:
     if not isinstance(value, list) or (not value and not allow_empty):
         return False
     return all(isinstance(item, str) and item for item in value) and len(value) == len(set(value))
+
+
+def _work_branch_prefix(value: object) -> bool:
+    if not isinstance(value, str) or not value.endswith("/"):
+        return False
+    return all(
+        re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", component)
+        and not component.endswith((".", ".lock"))
+        and ".." not in component
+        for component in value[:-1].split("/")
+    )
 
 
 def load_config(path: Path | None = None, home: Path | None = None) -> dict:
@@ -297,3 +340,18 @@ def effective_mode(config: dict, cwd: Path) -> str:
     """Return the cwd-specific enforcement mode, defaulting to fail-closed on."""
     mode = project_config(config, cwd).get("mode", config.get("mode", "on"))
     return mode if mode in {"on", "off"} else "on"
+
+
+def effective_auto_commit(config: dict, cwd: Path) -> bool:
+    """Return the closest project's auto-commit setting, falling back to the global value."""
+    return project_config(config, cwd).get("auto_commit", config.get("auto_commit", True))
+
+
+def effective_auto_revival(config: dict, cwd: Path) -> bool:
+    """Return the closest project's auto-revival setting, falling back to the global value."""
+    return project_config(config, cwd).get("auto_revival", config.get("auto_revival", True))
+
+
+def effective_protected_branches(config: dict, cwd: Path) -> list[str]:
+    """Return the closest project's protected branches, falling back to the global value."""
+    return project_config(config, cwd).get("protected_branches", config.get("protected_branches", ["main", "master"]))

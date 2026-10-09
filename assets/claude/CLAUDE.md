@@ -18,8 +18,16 @@ Use Edit or Write for direct project edits only when all of these rules hold:
   this is mandatory, not optional.
 
 Load the `cross-harness-orchestrator` skill for any code-changing request.
+Stop on unknown authentication, recursion detection, or an exhausted retry budget;
+at a delegated usage limit, stop delegating to the limited harness until the recorded reset time.
+If the revival line permits it, schedule one continuation after the reset as the skill
+instructs; waiting in a loop, API billing and external routers are forbidden.
 Executor discussion results are answered by the orchestrator through `reply`
 and reach the user only when still unresolved at the round limit.
+Delegated write runs commit themselves on a work branch.
+Never commit, merge or push delegated work by hand, and resolve every pending
+isolated run before reporting.
+Merging the work branch is left to the user.
 Keep small tasks small: no explorer or reviewer subagent when the request is
 clear, at most two files, low-risk, and needs no design decision. At a phase
 boundary, save concise state and start a fresh session when context usage is at

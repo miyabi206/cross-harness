@@ -37,6 +37,7 @@ def create_task_file(
     assumptions: list[str] | None = None,
     config_path: Path | None = None,
     home: Path | None = None,
+    commit_message: str | None = None,
 ) -> Path:
     paths = user_paths(home)
     config = load_config(config_path, paths.home)
@@ -51,6 +52,10 @@ def create_task_file(
         raise HarnessError(f"working directory not found: {cwd}")
     if not goal.strip():
         raise HarnessError("task goal must not be empty")
+    if commit_message is not None and (
+        not commit_message.strip() or commit_message.splitlines() != [commit_message]
+    ):
+        raise HarnessError("commit message must be one non-empty single line")
     if not 1 <= len(done_when) <= 3 or any(not item.strip() for item in done_when):
         raise HarnessError("task requires one to three non-empty completion conditions")
 
@@ -64,6 +69,7 @@ def create_task_file(
 
     sections: list[tuple[str, list[str]]] = [
         ("Goal", [goal.strip()]),
+        ("Commit message", [commit_message.strip()] if commit_message is not None else []),
         ("Done when", [item.strip() for item in done_when]),
         ("Scope", [item.strip() for item in scope or [] if item.strip()]),
         ("Constraints", [item.strip() for item in constraints or [] if item.strip()]),
@@ -76,7 +82,7 @@ def create_task_file(
         if not values:
             continue
         lines.extend(["", f"# {heading}"])
-        if heading == "Goal":
+        if heading in {"Goal", "Commit message"}:
             lines.append(values[0])
         else:
             lines.extend(f"- {value}" for value in values)

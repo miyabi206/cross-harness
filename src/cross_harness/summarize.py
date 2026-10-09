@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from pathlib import Path
 import hashlib
 import json
@@ -203,14 +204,78 @@ def _is_cross_harness_policy_denial(output: str) -> bool:
     ))
 
 
-def parse_events(path: Path) -> dict:
+_RESET_CLOCK = re.compile(
+    r"\btry\s+again\s+at\s+"
+    r"(?:(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+"
+    r"(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\s+)?"
+    r"(\d{1,2}):(\d{2})\s*(AM|PM)\b", re.IGNORECASE,
+)
+_RESET_DURATION = re.compile(
+    r"\btry\s+again\s+in\s+(less\s+than\s+a\s+minute\b|"
+    r"(?:\d+\s+(?:days?|hours?|minutes?)\b\s*)+)", re.IGNORECASE,
+)
+_RESET_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+
+
+def _codex_rate_limit_reset(text: str, reference_time: datetime) -> str | None:
+    """Extract a local reset time, returning None for unsupported or invalid text."""
+    try:
+        match = _RESET_CLOCK.search(text)
+        if match:
+            month, day, year, hour, minute, meridiem = match.groups()
+            hour, minute = int(hour), int(minute)
+            if not 1 <= hour <= 12 or not 0 <= minute <= 59:
+                return None
+            hour = hour % 12 + (12 if meridiem.lower() == "pm" else 0)
+            if month:
+                reset = datetime(int(year), _RESET_MONTHS.index(month.lower()) + 1, int(day), hour, minute)
+            else:
+                reset = reference_time.replace(hour=hour, minute=minute, second=0, microsecond=0, tzinfo=None)
+                if reset.astimezone().timestamp() < reference_time.timestamp() - 60:
+                    reset += timedelta(days=1)
+                # Codex omits seconds: wait through the entire reported minute.
+                reset += timedelta(minutes=1)
+            return reset.astimezone().isoformat()
+        match = _RESET_DURATION.search(text)
+        if match:
+            duration = match.group(1).lower()
+            # Round the imprecise "less than a minute" up to avoid an early retry.
+            seconds = 60 if duration.startswith("less") else sum(
+                int(amount) * {"day": 86400, "hour": 3600, "minute": 60}[unit.rstrip("s")]
+                for amount, unit in re.findall(r"(\d+)\s+(days?|hours?|minutes?)", duration)
+            )
+            return datetime.fromtimestamp(reference_time.timestamp() + seconds).astimezone().isoformat()
+    except (ValueError, OverflowError, OSError):
+        pass
+    return None
+
+
+def _claude_rate_limit_reset(event: dict) -> str | None:
+    """Read epoch seconds only from rejected limits that do not allow overage."""
+    if event.get("type") != "rate_limit_event" or _claude_blocked_category(event) != "rate_limit":
+        return None
+    value = event["rate_limit_info"].get("resetsAt")
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        return datetime.fromtimestamp(value).astimezone().isoformat()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def parse_events(path: Path, reference_time: datetime | None = None) -> dict:
     result = {
-        "thread_id": None, "usage": {}, "errors": [], "commands": [],
+        "thread_id": None, "usage": {}, "errors": [], "recovered_errors": [], "commands": [],
         "executions": [], "blocked_category": None, "rate_limit_notice": None,
+        "rate_limit_resets_at": None,
     }
     claude_commands: dict[str, str] = {}
+    turn_error_indices: list[int] = []
+    recovered_error_indices: set[int] = set()
+    reset_candidates: list[tuple[int | None, str]] = []
     if not path.exists():
         return result
+    reference_time = (reference_time or datetime.now()).astimezone()
     with path.open(encoding="utf-8", errors="replace") as handle:
         for line in handle:
             try:
@@ -219,14 +284,22 @@ def parse_events(path: Path) -> dict:
                 if FAILURE_WORDS.search(line):
                     result["errors"].append(line.strip())
                 continue
+            if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+                continue
             session_id = event.get("session_id")
             if isinstance(session_id, str) and session_id:
                 result["thread_id"] = session_id
             kind = event.get("type")
+            if kind in {"thread.started", "turn.started", "turn.failed"}:
+                # A later turn cannot recover errors from an earlier one.
+                turn_error_indices.clear()
             claude_blocked_category = _claude_blocked_category(event)
             if claude_blocked_category == "rate_limit":
                 # A rate limit always wins if an event stream contains multiple errors.
                 result["blocked_category"] = claude_blocked_category
+                reset = _claude_rate_limit_reset(event)
+                if reset is not None:
+                    reset_candidates.append((None, reset))
             elif claude_blocked_category == "overage_allowed":
                 result["rate_limit_notice"] = "overage_allowed"
             elif claude_blocked_category and result["blocked_category"] is None:
@@ -235,6 +308,8 @@ def parse_events(path: Path) -> dict:
                 result["thread_id"] = event.get("thread_id")
             elif kind == "turn.completed":
                 result["usage"] = event.get("usage", {})
+                recovered_error_indices.update(turn_error_indices)
+                turn_error_indices.clear()
             elif kind == "result":
                 usage = event.get("usage")
                 if isinstance(usage, dict):
@@ -242,7 +317,14 @@ def parse_events(path: Path) -> dict:
                 if event.get("is_error") is True:
                     result["errors"].append(_event_text(event))
             elif kind in {"turn.failed", "error"}:
-                result["errors"].append(_event_text(event))
+                text = _event_text(event)
+                error_index = len(result["errors"])
+                result["errors"].append(text)
+                if kind == "error":
+                    turn_error_indices.append(error_index)
+                reset = _codex_rate_limit_reset(text, reference_time)
+                if reset is not None:
+                    reset_candidates.append((error_index, reset))
             _parse_claude_tool_events(event, claude_commands, result)
             item = event.get("item")
             # Codex emits an ``item.started`` event before the terminal
@@ -267,7 +349,19 @@ def parse_events(path: Path) -> dict:
                     if _is_cross_harness_policy_denial(full_output):
                         command["policy_denied"] = True
                     result["commands"].append(command)
-    result["errors"] = [text for text in result["errors"] if text]
+    result["recovered_errors"] = [
+        text for index, text in enumerate(result["errors"])
+        if text and index in recovered_error_indices
+    ]
+    result["errors"] = [
+        text for index, text in enumerate(result["errors"])
+        if text and index not in recovered_error_indices
+    ]
+    for error_index, reset in reset_candidates:
+        if error_index not in recovered_error_indices:
+            previous = result["rate_limit_resets_at"]
+            if previous is None or datetime.fromisoformat(reset) > datetime.fromisoformat(previous):
+                result["rate_limit_resets_at"] = reset
     return result
 
 
@@ -461,8 +555,14 @@ def render_summary(summary: dict, limit: int) -> str:
         )
         if not summary.get("discussion_points"):
             discussion_lines.append("- none")
+    revival_lines = []
+    if summary.get("blocked_category") == "rate_limit":
+        revival_lines = [
+            f"rate_limit_resets_at: {summary.get('rate_limit_resets_at') or 'unknown'}",
+            f"revival: {summary.get('revival', 'reset time unknown')}",
+        ]
     prefix = "\n".join([
-        f"status: {summary['status']}", f"run_dir: {summary['run_dir']}", *discussion_lines,
+        f"status: {summary['status']}", f"run_dir: {summary['run_dir']}", *revival_lines, *discussion_lines,
     ]) + "\n"
     checks = summary.get("checks", [])
     if not checks:
@@ -484,6 +584,34 @@ def render_summary(summary: dict, limit: int) -> str:
         f"checks: {checks_text}",
         f"unrelated_failed_commands: {summary.get('unrelated_failed_command_count', 0)}",
     ]
+    if summary.get("recovered_errors"):
+        lines.append(
+            "recovered_errors: "
+            + "; ".join(summary_item_text(item) for item in summary["recovered_errors"])
+        )
+    commit = summary.get("commit")
+    if isinstance(commit, dict):
+        commit_lines = [f"commit: {commit['status']}"]
+        for key in ("sha", "branch", "subject", "paths", "excluded_paths", "reason"):
+            if key in commit:
+                value = commit[key]
+                if isinstance(value, list):
+                    value = ", ".join(summary_item_text(item) for item in value) or "none"
+                commit_lines.append(f"commit_{key}: {summary_item_text(value)}")
+        lines[4:4] = commit_lines
+    integration = summary.get("integration")
+    if isinstance(integration, dict):
+        lines.append(f"integration: {integration['status']}")
+        for key in ("sha", "unit_sha", "branch", "root", "conflicted_paths", "reason"):
+            if key in integration:
+                value = integration[key]
+                if isinstance(value, list):
+                    value = ", ".join(summary_item_text(item) for item in value) or "none"
+                lines.append(f"integration_{key}: {summary_item_text(value)}")
+    if "pending" in summary:
+        lines.append("pending: " + (", ".join(item["run_dir"] for item in summary["pending"]) or "none"))
+    for error in summary.get("cleanup_errors", []):
+        lines.append(f"cleanup_error: {summary_item_text(error)}")
     last_failed_command = summary.get("last_unrelated_failed_command")
     if isinstance(last_failed_command, dict):
         lines.append(
@@ -542,7 +670,7 @@ def render_summary(summary: dict, limit: int) -> str:
             f"({summary.get('summary_bytes', 0)}/{summary['raw_artifact_bytes']} bytes)"
         )
     text = "\n".join(lines) + "\n"
-    if not discussion_lines:
+    if not discussion_lines and not revival_lines:
         text = prefix + text
         prefix = ""
     if len(prefix) + len(text) <= limit:

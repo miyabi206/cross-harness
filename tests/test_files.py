@@ -1,4 +1,6 @@
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import json
 import shlex
 import tempfile
 import unittest
@@ -249,6 +251,73 @@ class FileTests(unittest.TestCase):
                         with self.subTest(invocation=invocation):
                             self.assertTrue(command_matches_check(invocation, check))
 
+    def test_parse_events_recovers_reconnect_errors_when_turn_completes(self):
+        messages = [f"Reconnecting... {attempt}/5 (request timed out)" for attempt in range(1, 6)]
+        sequence = [
+            {"type": "thread.started", "thread_id": "reconnected-thread"},
+            {"type": "turn.started"},
+            {"type": "item.started", "item": {"type": "agent_message"}},
+            *[{"type": "error", "message": message} for message in messages],
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "done"}},
+            {"type": "turn.completed", "usage": {"output_tokens": 2}},
+        ]
+        with tempfile.TemporaryDirectory() as folder:
+            events = Path(folder) / "events.jsonl"
+            events.write_text("".join(json.dumps(event) + "\n" for event in sequence))
+            parsed = parse_events(events)
+        self.assertEqual([], parsed["errors"])
+        self.assertEqual(messages, parsed["recovered_errors"])
+        self.assertEqual({"output_tokens": 2}, parsed["usage"])
+        self.assertIsNone(failure_signature(0, parsed))
+
+    def test_parse_events_recovers_only_error_events_in_the_completed_turn(self):
+        error = {"type": "error", "message": "temporary failure"}
+        completed = {"type": "turn.completed"}
+        cases = (
+            ([error, completed], [], ["temporary failure"]),
+            ([error], ["temporary failure"], []),
+            ([completed, error], ["temporary failure"], []),
+            ([error, {"type": "turn.started"}, completed], ["temporary failure"], []),
+            ([error, {"type": "thread.started"}, completed], ["temporary failure"], []),
+            ([error, {"type": "turn.failed", "message": "terminal failure"}, completed],
+             ["temporary failure", "terminal failure"], []),
+            ([{"type": "result", "is_error": True, "result": "Claude failure"}, completed],
+             ["Claude failure"], []),
+            ([error, completed, {"type": "turn.started"}, error],
+             ["temporary failure"], ["temporary failure"]),
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            events = Path(folder) / "events.jsonl"
+            for sequence, errors, recovered in cases:
+                with self.subTest(sequence=sequence):
+                    events.write_text("".join(json.dumps(event) + "\n" for event in sequence))
+                    parsed = parse_events(events)
+                    self.assertEqual(errors, parsed["errors"])
+                    self.assertEqual(recovered, parsed["recovered_errors"])
+
+    def test_parse_events_ignores_recovered_rate_limit_resets_and_retains_other_sources(self):
+        reference = datetime(2026, 10, 9, tzinfo=timezone.utc)
+        error = {"type": "error", "message": "usage limit reached; try again in 1 hour"}
+        completed = {"type": "turn.completed"}
+        epoch = 1784648400
+        cases = (
+            ([error, completed], None),
+            ([error, {"type": "turn.started"}, error, completed],
+             (reference + timedelta(hours=1)).astimezone().isoformat()),
+            ([{"type": "rate_limit_event", "rate_limit_info": {"status": "rejected", "resetsAt": epoch}},
+              error, completed], datetime.fromtimestamp(epoch).astimezone().isoformat()),
+            ([error, completed, {"type": "turn.started"},
+              {"type": "turn.failed", "message": "usage limit reached; try again in 2 hours"}],
+             (reference + timedelta(hours=2)).astimezone().isoformat()),
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            events = Path(folder) / "events.jsonl"
+            for sequence, reset in cases:
+                with self.subTest(sequence=sequence):
+                    events.write_text("".join(json.dumps(event) + "\n" for event in sequence))
+                    parsed = parse_events(events, reference_time=reference)
+                    self.assertEqual(reset, parsed["rate_limit_resets_at"])
+
     def test_parse_events_reads_claude_stream_result(self):
         with tempfile.TemporaryDirectory() as folder:
             events = Path(folder) / "events.jsonl"
@@ -341,6 +410,125 @@ class FileTests(unittest.TestCase):
             parsed = parse_events(events)
         self.assertIsNone(parsed["blocked_category"])
         self.assertEqual("overage_allowed", parsed["rate_limit_notice"])
+        self.assertIsNone(parsed["rate_limit_resets_at"])
+
+    def test_parse_events_extracts_claude_epoch_reset_in_local_timezone(self):
+        epoch = 1784648400
+        with tempfile.TemporaryDirectory() as folder:
+            events = Path(folder) / "events.jsonl"
+            events.write_text(json.dumps({
+                "type": "rate_limit_event",
+                "rate_limit_info": {"status": "rejected", "resetsAt": epoch},
+            }) + "\n")
+            parsed = parse_events(events)
+        expected = datetime.fromtimestamp(epoch).astimezone()
+        self.assertEqual(expected.isoformat(), parsed["rate_limit_resets_at"])
+        self.assertIsNotNone(datetime.fromisoformat(parsed["rate_limit_resets_at"]).utcoffset())
+
+    def test_parse_events_extracts_codex_clock_and_date_reset_forms(self):
+        reference = datetime(2026, 10, 9, 2, 0).astimezone()
+        cases = (
+            ("try again at 3:01 AM", reference, datetime(2026, 10, 9, 3, 2)),
+            ("TRY AGAIN AT 3:01 am.", reference, datetime(2026, 10, 9, 3, 2)),
+            ("try again at 3:01 AM.", datetime(2026, 10, 9, 4).astimezone(), datetime(2026, 10, 10, 3, 2)),
+            ("try again at 3:01 AM", datetime(2026, 10, 9, 3, 1).astimezone(), datetime(2026, 10, 9, 3, 2)),
+            ("try again at 12:00 AM", reference, datetime(2026, 10, 10, 0, 1)),
+            ("try again at 12:00 PM", reference, datetime(2026, 10, 9, 12, 1)),
+            ("try again at Oct 12th, 2026 9:00 AM", reference, datetime(2026, 10, 12, 9)),
+            ("TRY AGAIN AT oct 12TH, 2026 9:00 am.", reference, datetime(2026, 10, 12, 9)),
+            ("try again at Jan 1st, 2027 12:00 PM.", reference, datetime(2027, 1, 1, 12)),
+            ("try again at Nov 2nd, 2026 7:15 PM", reference, datetime(2026, 11, 2, 19, 15)),
+            ("try again at Dec 3rd, 2026 8:00 AM", reference, datetime(2026, 12, 3, 8)),
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            events = Path(folder) / "events.jsonl"
+            for message, reference, expected in cases:
+                for kind in ("error", "turn.failed"):
+                    for nested in (False, True):
+                        with self.subTest(message=message, kind=kind, nested=nested, reference=reference):
+                            text = "You've hit your usage limit. Upgrade or try again later, or " + message
+                            event = {"type": kind}
+                            event["error" if nested else "message"] = {"message": text} if nested else text
+                            events.write_text(json.dumps(event) + "\n")
+                            parsed = parse_events(events, reference_time=reference)
+                            self.assertEqual(expected.astimezone().isoformat(), parsed["rate_limit_resets_at"])
+
+    def test_parse_events_extracts_codex_duration_reset_forms(self):
+        # Pass UTC to verify reference times are converted to the local timezone.
+        reference = datetime(2026, 10, 9, 2, 0, 17, tzinfo=timezone.utc)
+        cases = (
+            ("try again in 3 hours 2 minutes", timedelta(hours=3, minutes=2)),
+            ("TRY AGAIN IN 3 HOURS 2 MINUTES.", timedelta(hours=3, minutes=2)),
+            ("try again in 2 days 3 hours 2 minutes.", timedelta(days=2, hours=3, minutes=2)),
+            ("try again in 1 day 1 hour 1 minute", timedelta(days=1, hours=1, minutes=1)),
+            ("try again in 1 day", timedelta(days=1)),
+            ("try again in 2 days", timedelta(days=2)),
+            ("try again in 1 hour.", timedelta(hours=1)),
+            ("try again in 3 hours", timedelta(hours=3)),
+            ("try again in 1 minute", timedelta(minutes=1)),
+            ("try again in 2 minutes.", timedelta(minutes=2)),
+            ("try again in less than a minute", timedelta(minutes=1)),
+            ("TRY AGAIN IN LESS THAN A MINUTE.", timedelta(minutes=1)),
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            events = Path(folder) / "events.jsonl"
+            for message, duration in cases:
+                for kind in ("error", "turn.failed"):
+                    with self.subTest(message=message, kind=kind):
+                        events.write_text(json.dumps({"type": kind, "error": {"message": message}}) + "\n")
+                        parsed = parse_events(events, reference_time=reference)
+                        self.assertEqual((reference + duration).astimezone().isoformat(), parsed["rate_limit_resets_at"])
+
+    def test_parse_events_defaults_duration_reference_to_current_time(self):
+        with tempfile.TemporaryDirectory() as folder:
+            events = Path(folder) / "events.jsonl"
+            events.write_text('{"type":"error","message":"try again in 1 minute."}\n')
+            before = datetime.now().astimezone() + timedelta(minutes=1)
+            parsed = parse_events(events)
+            after = datetime.now().astimezone() + timedelta(minutes=1)
+        reset = datetime.fromisoformat(parsed["rate_limit_resets_at"])
+        self.assertLessEqual(before, reset)
+        self.assertLessEqual(reset, after)
+
+    def test_parse_events_leaves_reset_unset_for_unexpected_or_non_limit_events(self):
+        reference = datetime(2026, 10, 9, 2).astimezone()
+        events_to_ignore = [
+            {"type": "error", "message": text} for text in (
+                "Unexpected error", "try again later.", "try again at 13:00 AM",
+                "try again at 0:01 AM", "try again at 3:99 AM", "try again at 3:01 XM",
+                "try again at Oct 32nd, 2026 9:00 AM", "try again at Feb 30th, 2026 9:00 AM",
+                "try again at Oct 12th, 0000 9:00 AM", "try again in three hours",
+                "try again in -1 hour", "try again in " + "9" * 400 + " days",
+                "try again at", "try again in", "", None, [], {},
+            )
+        ] + [
+            {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected", "resetsAt": value}}
+            for value in (None, "not a timestamp", "1784648400", True, [], {}, 10**400, float("nan"), float("inf"))
+        ] + [
+            {"type": "rate_limit_event", "rate_limit_info": {"status": "allowed", "resetsAt": 1784648400}},
+            {"type": "rate_limit_event", "rate_limit_info": None},
+            {"type": "result", "is_error": True, "result": "try again in 1 minute"},
+            {"type": "assistant", "message": "try again at 3:01 AM"},
+            [], None, {"type": []},
+        ]
+        with tempfile.TemporaryDirectory() as folder:
+            events = Path(folder) / "events.jsonl"
+            self.assertIsNone(parse_events(events)["rate_limit_resets_at"])
+            for event in events_to_ignore:
+                with self.subTest(event=event):
+                    events.write_text(json.dumps(event) + "\n")
+                    self.assertIsNone(parse_events(events, reference_time=reference)["rate_limit_resets_at"])
+
+    def test_parse_events_retains_reset_when_later_event_has_no_time(self):
+        with tempfile.TemporaryDirectory() as folder:
+            events = Path(folder) / "events.jsonl"
+            events.write_text(
+                '{"type":"error","message":"try again in 1 hour"}\n'
+                '{"type":"turn.failed","error":{"message":"usage limit exceeded"}}\n'
+            )
+            reference = datetime(2026, 10, 9, tzinfo=timezone.utc)
+            parsed = parse_events(events, reference_time=reference)
+        self.assertEqual((reference + timedelta(hours=1)).astimezone().isoformat(), parsed["rate_limit_resets_at"])
 
     def test_summary_is_bounded_and_points_to_raw_artifacts(self):
         summary = {

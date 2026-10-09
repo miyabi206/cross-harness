@@ -103,6 +103,38 @@ unchanged, and increment `discussion_rounds` without automatic model escalation.
 Summaries and state retain the points and round count. At the configured round
 limit, send the user's decision with `reply --user-decided`.
 
+Delegated usage-limit blocks record `rate_limit_resets_at` and a `revival` line
+in their summaries. Stop delegating to the limited harness until the reset and
+finish work that does not need it. With effective `auto_revival=true` (the
+default), `retry` may continue the run after a known reset time, resuming its
+executor thread without spending the retry budget or escalating. A third
+consecutive revival is refused; any other outcome clears that count.
+Authentication blocks remain non-retryable.
+
+List reminders with `~/.local/bin/cross-harness revival --cwd /absolute/path/repository`;
+each tab-separated row gives the run directory, role, reset time, and `eligible`
+or `waiting until <reset time>`, or `not revivable: <reason>`. The same list
+appears at session start. Not revivable runs require a new delegation of the
+remaining work after any known reset, followed by dismissal of the blocked run.
+If work was continued
+another way, use `~/.local/bin/cross-harness revival --dismiss --run <run_dir>`.
+When the revival line allows it, the orchestrator schedules exactly one one-shot
+continuation two to five minutes after reset using the session's `CronCreate`
+tool with `recurring=false` (loaded through `ToolSearch` when deferred). Its
+prompt names the repository, blocked run and remaining units in order; the
+orchestrator tells the user what is scheduled and when, asks them to keep the
+session open, then ends the turn. On firing, confirm eligibility with `revival`
+and, only for an eligible run, use
+`~/.local/bin/cross-harness retry --run-dir <run_dir> --task-file <continuation_file>`.
+If scheduling is unavailable, the reset is unknown or revival is disabled,
+stop and report the reset time and the eligible retry or new delegation command.
+The account's known future reset blocks delegate, retry and reply on that harness
+across repositories. Waiting in a loop,
+API billing and external routers are forbidden.
+Claude Code itself waits and continues when the orchestrator's own claude.ai
+usage limit resets; this feature covers delegated runs only. Closing the session
+loses its scheduled continuation; the next session's reminder takes over.
+
 ## Watch delegated runs
 
 Follow delegated progress from another terminal with:
@@ -145,6 +177,8 @@ it to another project by pointing these two delegation commands at it:
   --cwd /path/to/repository \
   --goal "Implement the requested change" \
   --done-when "The requested change is complete" \
+  --scope path/to/changed/file \
+  --commit-message "fix: implement the requested change" \
   --check "scripts/test.sh"
 ~/.local/bin/cross-harness delegate \
   --role implementer \
@@ -168,15 +202,50 @@ isolate it, add this project override to
 dirty_worktree_policy = "isolate"
 ```
 
-`isolate` runs the write role in a separate worktree; import its results
-afterward:
+With `auto_commit = true` (the default), a successful write run with a passing
+declared check becomes one unit commit. Before a root write run on a protected
+branch or detached HEAD, the wrapper creates a work branch under
+`work_branch_prefix` (default `cross-harness/`). It never pushes or merges into
+a protected branch; merging the work branch is left to the user.
+
+`isolate` runs the writer in a detached worktree containing tracked files only.
+Successful unit commits integrate automatically into the root work branch.
+The root is the launching worktree, including a linked worktree; other worktrees
+are left untouched.
+The summary's `commit`, `integration`, and `pending` lines show the outcome:
+`integrated` means the commit reached the root, `conflict` means cherry-picking
+conflicted, `failed` records another integration error, and `pending` means
+integration is still outstanding. Integration refuses staged root changes,
+unfinished Git operations, and collisions with dirty or ignored root paths;
+unrelated unstaged changes are preserved. Concurrent units must touch disjoint
+paths, with shared files assigned to one unit or a later sequential unit.
+
+Resolve retained runs with these commands before the next wave or reporting:
 
 ```sh
 ~/.local/bin/cross-harness adopt --run <run_dir>
+~/.local/bin/cross-harness discard --run <run_dir>
+~/.local/bin/cross-harness commit --run <partial_run_dir>
+~/.local/bin/cross-harness pending --cwd /path/to/repository
 ```
 
+For a committed unit whose integration failed or is pending, remove the stated
+cause and use `adopt`. For a committed unit whose integration conflicted,
+delegate that unit again sequentially in the root worktree, citing the kept unit
+commit sha so the executor can read it with `git show <sha>`, then discard the
+conflicted run. For a partial unit verified another way, root or
+isolated, use `commit`; an isolated unit is committed and integrated. For a
+failed isolated unit, retry or discard. `discard` removes an abandoned isolated
+worktree. Adopting or discarding an already integrated unit only completes
+cleanup and preserves the integrated result. Resolved worktrees receive
+`INTEGRATED`, `ADOPTED` (uncommitted file adoption),
+or `DISCARDED` markers. `pending` lists finished isolated runs whose worktrees
+remain; it must be empty before reporting. SessionStart reminds the orchestrator
+of these runs for the current repository.
+
 Project overrides accept only `checks`, `delegate_kinds`,
-`dirty_worktree_policy`, `mode`, and `project_auto_setup`; the most specific matching path wins,
+`dirty_worktree_policy`, `mode`, `project_auto_setup`, `auto_commit`, `auto_revival`, and
+`protected_branches`; the most specific matching path wins,
 `mode = "off"` excludes that repository from enforcement, and models,
 authentication, and sandbox settings cannot be overridden.
 
@@ -226,9 +295,10 @@ because its session-start hook synchronizes
 `~/.claude/agents/cross-harness-*.md`. `orchestrator` is the session itself,
 so its `model` and `effort` settings currently have no effect.
 
-The implementer effort expanded into the orchestrator `SKILL.md` is fixed only
-when `install` runs. Changing the configuration without reinstalling leaves
-the previously installed value in place.
+The implementer effort, global parallel limit, and per-role parallel limits
+expanded into the orchestrator `SKILL.md` are fixed when `install` runs.
+Changing the configuration without reinstalling leaves the installed values
+in place; runtime limits use the current configuration.
 
 Check the configuration with:
 

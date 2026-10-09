@@ -85,6 +85,30 @@ class TaskFileTests(unittest.TestCase):
                 create_task_file("tester", "test", repo, "Run tests", ["done"], home=home)
             self.assertIn("warning: no checks declared for test task", stderr.getvalue())
 
+    def test_commit_message_section_and_validation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder) / "home"
+            repo = Path(folder) / "repo"
+            home.mkdir()
+            repo.mkdir()
+            path = create_task_file(
+                "implementer", "implementation", repo, "Implement", ["done"],
+                checks=["fixture"], home=home, commit_message="  Add the feature  ",
+            )
+            self.assertIn("# Commit message\nAdd the feature\n", path.read_text())
+            for invalid in ("", " ", "first\nsecond", "first\n", "first\rsecond"):
+                with self.subTest(invalid=invalid), self.assertRaisesRegex(HarnessError, "single line"):
+                    create_task_file(
+                        "implementer", "implementation", repo, "Implement", ["done"],
+                        checks=["fixture"], home=home, commit_message=invalid,
+                    )
+            with self.assertRaisesRegex(HarnessError, "credential material"):
+                create_task_file(
+                    "implementer", "implementation", repo, "Implement", ["done"],
+                    checks=["fixture"], home=home,
+                    commit_message="OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz123456",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

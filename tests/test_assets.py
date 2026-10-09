@@ -102,9 +102,82 @@ class AssetTests(unittest.TestCase):
 
     def test_orchestrator_uses_template_for_every_wrapper_action(self):
         skill = (source_root() / "assets/claude/skills/cross-harness-orchestrator/SKILL.md").read_text()
-        for action in ("task create", "delegate", "retry", "reply"):
+        for action in ("task create", "delegate", "retry", "reply", "wait", "adopt", "discard", "commit", "pending", "revival"):
             self.assertIn(f"{{{{CROSS_HARNESS_BIN}}}} {action}", skill)
-        self.assertIsNone(re.search(r"`cross-harness (?:task|delegate|retry|reply)", skill))
+        self.assertIsNone(re.search(r"`cross-harness (?:task|delegate|retry|reply|wait|adopt|discard|commit|pending|revival)", skill))
+
+    def test_usage_limit_safety_scheduler_and_documentation_contract(self):
+        root = source_root()
+        safety = " ".join((root / "assets/shared/safety.md").read_text().split())
+        for phrase in (
+            "Stop on unknown authentication, recursion detection, or an exhausted retry budget",
+            "stop delegating to the limited harness until the recorded reset time",
+            "One scheduled continuation after that time is allowed",
+            "revival line permits it", "Waiting in a loop is forbidden",
+            "Never switch to API billing or an external router",
+        ):
+            self.assertIn(phrase, safety)
+        self.assertNotIn("Stop on unknown authentication, rate limits", safety)
+        charter = " ".join((root / "assets/claude/CLAUDE.md").read_text().split())
+        self.assertIn("stop delegating to the limited harness until the recorded reset time", charter)
+        self.assertIn("schedule one continuation after the reset", charter)
+        self.assertIn("waiting in a loop, API billing and external routers are forbidden", charter)
+        skill = (root / "assets/claude/skills/cross-harness-orchestrator/SKILL.md").read_text()
+        verify = " ".join(skill.split("## Verify", 1)[1].split("## Discuss", 1)[0].split())
+        for phrase in (
+            "do not delegate to that harness again before", "finish work that does not need it",
+            "exactly one one-shot continuation two to five minutes after the reset time",
+            "`CronCreate`", "`recurring` to `false`", "`ToolSearch` when it is deferred",
+            "repository, the blocked run directory, and the remaining units in order",
+            "Tell the user what was scheduled, for when, and that the session must stay open, then end the turn",
+            "When the continuation fires, or a later session shows the reminder, confirm eligibility",
+            "then carry on with the remaining units", "If the work was continued another way",
+            "scheduler tool is unavailable", "reset time is unknown", "revival is disabled",
+            "report the reset time", "command to continue", "third consecutive revival is refused",
+            "Claude Code itself waits and continues", "orchestrator's own claude.ai usage limit resets",
+            "covers delegated runs only", "lost when the session closes", "session-start reminder takes over",
+            "Usage-limit blocked isolated units awaiting revival are the exception",
+            "are excluded from `pending`", "`waiting until <reset time>`", "`not revivable: <reason>`",
+            "Retry is only for eligible runs", "continue the remaining work with a new delegation after any known reset",
+            "then dismiss the blocked run", "Checks carry over", "across all repositories",
+        ):
+            self.assertIn(phrase, verify)
+        for path in ("README.md", "docs/runbook.md", "docs/configuration.md"):
+            text = " ".join((root / path).read_text().split())
+            for phrase in (
+                "CronCreate", "recurring=false", "ToolSearch", "two to five minutes",
+                "Claude Code itself waits and continues", "claude.ai", "delegated runs only",
+                "session", "reminder takes over", "API billing", "external routers",
+            ):
+                with self.subTest(path=path, phrase=phrase):
+                    self.assertIn(phrase, text)
+            self.assertNotIn("rate-limit blocks remain safety-policy stops and cannot be resumed", text)
+
+    def test_orchestrator_unit_workflow_and_resolution_contract(self):
+        skill = (source_root() / "assets/claude/skills/cross-harness-orchestrator/SKILL.md").read_text()
+        normalized = " ".join(skill.split())
+        for phrase in (
+            "each become one commit", "list exact paths in Scope",
+            "must touch disjoint paths", "dependent units run in order",
+            "{{MAX_PARALLEL}}", "{{ROLE_PARALLEL_LIMITS}}",
+            "explorer runs before planning", "failure that survived a retry",
+            "reviewer runs per unit commit", "never while a writer is running",
+            "tracked files only", "name the setup command",
+            "--commit-message", "git show --stat <sha>", "git show <sha>",
+            "Committed unit whose integration failed or is pending: remove the stated cause, then use `{{CROSS_HARNESS_BIN}} adopt --run <run_dir>`",
+            "Committed unit whose integration conflicted: delegate that unit again sequentially in the root worktree, citing the kept unit commit sha so the executor can read it with `git show <sha>`, then use `{{CROSS_HARNESS_BIN}} discard --run <run_dir>` for the conflicted run",
+            "Partial unit verified another way, root or isolated",
+            "Failed isolated unit", "verified another way",
+            "Nobody edits the root worktree while a writer is running",
+            "including direct edits", "everything changed during a root run",
+            "Abandoned isolated run", "pending line must show `none`",
+            "sha and subject", "merging that branch is the only step left",
+            "commit it yourself as one commit", "never leave it uncommitted",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, normalized)
+        self.assertNotIn("sequentially by default", skill)
+        self.assertNotIn("git diff --stat", skill)
 
     def test_all_executor_assets_include_discussion_policy_and_contract(self):
         root = source_root() / "assets"

@@ -1,5 +1,6 @@
 from pathlib import Path
 import copy
+import json
 import tempfile
 import unittest
 
@@ -9,7 +10,10 @@ from cross_harness.config import (
     defaulted_config_paths,
     defaulted_paths,
     default_config,
+    effective_auto_commit,
+    effective_auto_revival,
     effective_mode,
+    effective_protected_branches,
     load_config,
     merge_defaults,
     project_config,
@@ -53,6 +57,15 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(70, config["context_threshold_percent"])
         self.assertEqual("allow_delegated", config["dirty_worktree_policy"])
         self.assertTrue(config["project_auto_setup"])
+        self.assertTrue(config["auto_commit"])
+        self.assertTrue(config["auto_revival"])
+        self.assertEqual("cross-harness/", config["work_branch_prefix"])
+        self.assertEqual(["main", "master"], config["protected_branches"])
+        self.assertEqual(4, config["max_parallel"])
+        self.assertEqual(
+            {name: {"explorer": 3, "implementer": 3, "reviewer": 2}.get(name, 1) for name in config["roles"]},
+            {name: role["max_parallel"] for name, role in config["roles"].items()},
+        )
         default_warnings = "\n".join(warnings(config))
         self.assertIn("roles.explorer.effort: has no effect for the haiku model", default_warnings)
         self.assertIn("roles.tester.effort: has no effect for the haiku model", default_warnings)
@@ -178,6 +191,94 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("project_auto_setup: expected boolean", errors)
         self.assertIn("projects./tmp/project.project_auto_setup: expected boolean", errors)
 
+    def test_auto_revival_defaults_and_closest_project_overrides(self):
+        self.assertTrue(effective_auto_revival({}, Path("/tmp/project")))
+        legacy = default_config()
+        del legacy["auto_revival"]
+        self.assertEqual([], validate(legacy))
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "config.toml"
+            path.write_text('[projects."/tmp/project"]\nauto_revival = false\n')
+            config = load_config(path, Path(folder))
+            self.assertTrue(config["auto_revival"])
+            self.assertFalse(effective_auto_revival(config, Path("/tmp/project/work")))
+            self.assertTrue(effective_auto_revival(config, Path("/tmp/other")))
+            path.write_text(
+                'auto_revival = false\n'
+                '[projects."/tmp/project"]\nauto_revival = true\n'
+                '[projects."/tmp/project/nested"]\nauto_revival = false\n'
+                '[projects."/tmp/project/inherit"]\nchecks = []\n'
+            )
+            config = load_config(path, Path(folder))
+            for cwd, expected in (
+                ("/tmp/other", False), ("/tmp/project/work", True),
+                ("/tmp/project/nested/work", False), ("/tmp/project/inherit/work", False),
+            ):
+                with self.subTest(cwd=cwd):
+                    self.assertEqual(expected, effective_auto_revival(config, Path(cwd)))
+
+    def test_commit_settings_load_and_resolve_closest_project_overrides(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "config.toml"
+            path.write_text(
+                'auto_commit = false\nprotected_branches = ["release"]\n'
+                'work_branch_prefix = "team/work-1_/"\n'
+                '[projects."/tmp/project"]\nauto_commit = true\nprotected_branches = ["main"]\n'
+                '[projects."/tmp/project/nested"]\nauto_commit = false\nprotected_branches = []\n'
+                '[projects."/tmp/project/inherit"]\nchecks = []\n'
+            )
+            config = load_config(path, Path(folder))
+            self.assertEqual("team/work-1_/", config["work_branch_prefix"])
+            for cwd, auto_commit, branches in (
+                ("/tmp/other", False, ["release"]),
+                ("/tmp/project/work", True, ["main"]),
+                ("/tmp/project/nested/work", False, []),
+                ("/tmp/project/inherit/work", False, ["release"]),
+            ):
+                with self.subTest(cwd=cwd):
+                    self.assertEqual(auto_commit, effective_auto_commit(config, Path(cwd)))
+                    self.assertEqual(branches, effective_protected_branches(config, Path(cwd)))
+
+    def test_invalid_commit_settings_raise_path_specific_load_errors(self):
+        values = {
+            "auto_commit": ("1", '"true"', "[]"),
+            "auto_revival": ("1", '"true"', "[]", "{}"),
+            "protected_branches": ('"main"', '["main", "main"]', '[""]', '[1]', '{}') + tuple(
+                json.dumps([name]) for name in ("release/*", "main?", "[main]", "main]", "main branch", "main\t", "refs/heads/main")
+            ),
+            "work_branch_prefix": tuple(json.dumps(value) for value in (
+                "", "branch", "/", "/branch/", "branch//", "branch//nested/",
+                ".branch/", "-branch/", "branch/.nested/", "branch/-nested/",
+                "branch./", "branch.lock/", "branch.lock/nested/", "branch/nested.lock/",
+                "branch..name/", "branch/nested..name/", "branch name/", "café/", "branch/\n",
+                "branch@/", "branch\\name/",
+            )) + ("true", "1", "[]"),
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "config.toml"
+            for key, literals in values.items():
+                locations = ("", '[projects."/tmp/project"]\n') if key != "work_branch_prefix" else ("",)
+                for location in locations:
+                    for literal in literals:
+                        with self.subTest(key=key, location=location, literal=literal):
+                            path.write_text(f"{location}{key} = {literal}\n")
+                            expected_path = f"projects./tmp/project.{key}" if location else key
+                            with self.assertRaises(ConfigError) as raised:
+                                load_config(path, Path(folder))
+                            self.assertIn(f"{expected_path}: expected", str(raised.exception))
+                            if key == "protected_branches":
+                                self.assertIn("entries are literal short branch names", str(raised.exception))
+
+    def test_safe_work_branch_prefixes_and_empty_protected_branches_are_valid(self):
+        for prefix in ("a/", "_work/", "cross-harness/", "Team/branch-1.2_/", "a-/", "a.locked/"):
+            with self.subTest(prefix=prefix):
+                config = default_config()
+                config["work_branch_prefix"] = prefix
+                config["protected_branches"] = []
+                self.assertEqual([], validate(config))
+        config["projects"] = {"/tmp/project": {"work_branch_prefix": "local/"}}
+        self.assertIn("projects./tmp/project: unknown key 'work_branch_prefix'", validate(config))
+
     def test_unknown_efforts_are_warnings_but_empty_efforts_are_errors(self):
         config = copy.deepcopy(default_config())
         config["roles"]["explorer"]["effort"] = "future-effort"
@@ -243,6 +344,9 @@ class ConfigTests(unittest.TestCase):
 
             self.assertEqual(14, loaded["retention_days"])
             self.assertEqual(321, loaded["roles"]["tester"]["timeout_seconds"])
+            for key in ("auto_commit", "auto_revival", "work_branch_prefix", "protected_branches"):
+                self.assertEqual(default_config()[key], loaded[key])
+                self.assertIn(key, defaulted_config_paths(config, home))
             self.assertEqual([], validate(loaded))
             self.assertEqual(contents, config.read_text(encoding="utf-8"))
 
