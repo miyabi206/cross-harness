@@ -212,7 +212,7 @@ remain; it must be empty before reporting. SessionStart reminds the orchestrator
 of these runs for the current repository.
 
 Project overrides accept only `checks`, `delegate_kinds`,
-`dirty_worktree_policy`, `mode`, `project_auto_setup`, `auto_commit`, and
+`dirty_worktree_policy`, `mode`, `project_auto_setup`, `auto_commit`, `auto_revival`, and
 `protected_branches`; the most specific matching path wins,
 `mode = "off"` excludes that repository from enforcement, and models,
 authentication, and sandbox settings cannot be overridden.

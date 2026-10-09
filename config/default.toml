@@ -20,6 +20,8 @@ dirty_worktree_policy = "allow_delegated"
 # Dirty-worktree policies: "stop", "isolate", "allow", or "allow_delegated".
 # Commit each successful write delegation as one commit.
 auto_commit = true
+# When a delegated run is blocked by a usage limit, allow it to be continued after the recorded reset time.
+auto_revival = true
 # Prefix for the branch created when a write delegation starts on a protected branch.
 work_branch_prefix = "cross-harness/"
 # Branches that never receive automatic commits.

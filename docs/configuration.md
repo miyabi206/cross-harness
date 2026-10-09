@@ -19,7 +19,7 @@ remain aligned.
   `danger-full-access`.
 
 `projects."/absolute/path"` may set only `checks`, `delegate_kinds`,
-`dirty_worktree_policy`, `mode`, `project_auto_setup`, `auto_commit`, and
+`dirty_worktree_policy`, `mode`, `project_auto_setup`, `auto_commit`, `auto_revival`, and
 `protected_branches`. It cannot select a
 model, authentication method, or sandbox. The most specific matching project
 path wins.
@@ -36,6 +36,26 @@ globally or in a project override. Do not edit the working tree while a
 delegated write run is executing: a concurrent user edit can be observed as
 that run's delta and recorded as delegated, so this policy depends on that
 operational discipline.
+
+## Usage-limit reset times
+
+`auto_revival` is a boolean defaulting to `true`: when a delegated run is blocked
+by a usage limit, allow it to be continued after the recorded reset time. It may
+be overridden per project; the closest matching project's value wins, falling
+back to the global value if omitted. Set it to `false` to opt out. This unit
+adds the configuration switch and reset-time extraction; automatic continuation
+is added in the next unit.
+
+`parse_events` exposes `rate_limit_resets_at` as an ISO 8601 timestamp in the
+local timezone with a UTC offset, or `None` if no time can be derived. Rejected
+Claude rate-limit events supply epoch seconds in `resetsAt`; events allowing
+overage in use are ignored. Codex `error` and `turn.failed` messages may say
+`try again at 3:01 AM`, `try again at Oct 12th, 2026 9:00 AM`, or
+`try again in 3 hours 2 minutes` (also days or a single unit). Matching ignores
+case and accepts a trailing period. A clock time without a date means its next
+local occurrence after the reference time; `parse_events` accepts a
+`reference_time` datetime, defaulting to the current time. `in less than a
+minute` uses a conservative one-minute delay.
 
 ## Automatic commits and work branches
 

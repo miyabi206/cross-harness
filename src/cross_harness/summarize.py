@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from pathlib import Path
 import hashlib
 import json
@@ -203,14 +204,73 @@ def _is_cross_harness_policy_denial(output: str) -> bool:
     ))
 
 
-def parse_events(path: Path) -> dict:
+_RESET_CLOCK = re.compile(
+    r"\btry\s+again\s+at\s+"
+    r"(?:(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+"
+    r"(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\s+)?"
+    r"(\d{1,2}):(\d{2})\s*(AM|PM)\b", re.IGNORECASE,
+)
+_RESET_DURATION = re.compile(
+    r"\btry\s+again\s+in\s+(less\s+than\s+a\s+minute\b|"
+    r"(?:\d+\s+(?:days?|hours?|minutes?)\b\s*)+)", re.IGNORECASE,
+)
+_RESET_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+
+
+def _codex_rate_limit_reset(text: str, reference_time: datetime) -> str | None:
+    """Extract a local reset time, returning None for unsupported or invalid text."""
+    try:
+        match = _RESET_CLOCK.search(text)
+        if match:
+            month, day, year, hour, minute, meridiem = match.groups()
+            hour, minute = int(hour), int(minute)
+            if not 1 <= hour <= 12 or not 0 <= minute <= 59:
+                return None
+            hour = hour % 12 + (12 if meridiem.lower() == "pm" else 0)
+            if month:
+                reset = datetime(int(year), _RESET_MONTHS.index(month.lower()) + 1, int(day), hour, minute)
+            else:
+                reset = reference_time.replace(hour=hour, minute=minute, second=0, microsecond=0, tzinfo=None)
+                if reset.astimezone().timestamp() <= reference_time.timestamp():
+                    reset += timedelta(days=1)
+            return reset.astimezone().isoformat()
+        match = _RESET_DURATION.search(text)
+        if match:
+            duration = match.group(1).lower()
+            # Round the imprecise "less than a minute" up to avoid an early retry.
+            seconds = 60 if duration.startswith("less") else sum(
+                int(amount) * {"day": 86400, "hour": 3600, "minute": 60}[unit.rstrip("s")]
+                for amount, unit in re.findall(r"(\d+)\s+(days?|hours?|minutes?)", duration)
+            )
+            return datetime.fromtimestamp(reference_time.timestamp() + seconds).astimezone().isoformat()
+    except (ValueError, OverflowError, OSError):
+        pass
+    return None
+
+
+def _claude_rate_limit_reset(event: dict) -> str | None:
+    """Read epoch seconds only from rejected limits that do not allow overage."""
+    if event.get("type") != "rate_limit_event" or _claude_blocked_category(event) != "rate_limit":
+        return None
+    value = event["rate_limit_info"].get("resetsAt")
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        return datetime.fromtimestamp(value).astimezone().isoformat()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def parse_events(path: Path, reference_time: datetime | None = None) -> dict:
     result = {
         "thread_id": None, "usage": {}, "errors": [], "commands": [],
         "executions": [], "blocked_category": None, "rate_limit_notice": None,
+        "rate_limit_resets_at": None,
     }
     claude_commands: dict[str, str] = {}
     if not path.exists():
         return result
+    reference_time = (reference_time or datetime.now()).astimezone()
     with path.open(encoding="utf-8", errors="replace") as handle:
         for line in handle:
             try:
@@ -218,6 +278,8 @@ def parse_events(path: Path) -> dict:
             except json.JSONDecodeError:
                 if FAILURE_WORDS.search(line):
                     result["errors"].append(line.strip())
+                continue
+            if not isinstance(event, dict) or not isinstance(event.get("type"), str):
                 continue
             session_id = event.get("session_id")
             if isinstance(session_id, str) and session_id:
@@ -227,6 +289,9 @@ def parse_events(path: Path) -> dict:
             if claude_blocked_category == "rate_limit":
                 # A rate limit always wins if an event stream contains multiple errors.
                 result["blocked_category"] = claude_blocked_category
+                reset = _claude_rate_limit_reset(event)
+                if reset is not None:
+                    result["rate_limit_resets_at"] = reset
             elif claude_blocked_category == "overage_allowed":
                 result["rate_limit_notice"] = "overage_allowed"
             elif claude_blocked_category and result["blocked_category"] is None:
@@ -242,7 +307,11 @@ def parse_events(path: Path) -> dict:
                 if event.get("is_error") is True:
                     result["errors"].append(_event_text(event))
             elif kind in {"turn.failed", "error"}:
-                result["errors"].append(_event_text(event))
+                text = _event_text(event)
+                result["errors"].append(text)
+                reset = _codex_rate_limit_reset(text, reference_time)
+                if reset is not None:
+                    result["rate_limit_resets_at"] = reset
             _parse_claude_tool_events(event, claude_commands, result)
             item = event.get("item")
             # Codex emits an ``item.started`` event before the terminal

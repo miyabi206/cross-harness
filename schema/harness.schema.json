@@ -26,6 +26,11 @@
       "default": true,
       "description": "Commit each successful write delegation as one commit. May be overridden per project; runtime handling is added in a later unit."
     },
+    "auto_revival": {
+      "type": "boolean",
+      "default": true,
+      "description": "Allow a delegation blocked by a usage limit to continue after the recorded reset time. May be overridden per project; runtime handling is added in a later unit."
+    },
     "work_branch_prefix": {
       "type": "string",
       "minLength": 1,
@@ -147,6 +152,7 @@
         "mode": {"enum": ["on", "off"]},
         "project_auto_setup": {"type": "boolean"},
         "auto_commit": {"type": "boolean", "description": "Override global auto_commit for the closest matching project."},
+        "auto_revival": {"type": "boolean", "description": "Override global auto_revival for the closest matching project."},
         "protected_branches": {"$ref": "#/$defs/uniqueStrings", "description": "Override global protected_branches for the closest matching project; an empty array is allowed."}
       }
     }

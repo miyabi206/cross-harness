@@ -33,7 +33,7 @@ class SchemaContractTests(unittest.TestCase):
         self.assertEqual(config_module.TOP_KEYS, set(properties))
         self.assertEqual(
             config_module.TOP_KEYS - {
-                "projects", "mode", "project_auto_setup", "auto_commit", "work_branch_prefix", "protected_branches",
+                "projects", "mode", "project_auto_setup", "auto_commit", "auto_revival", "work_branch_prefix", "protected_branches",
             },
             set(self.schema["required"]),
         )
@@ -70,7 +70,7 @@ class SchemaContractTests(unittest.TestCase):
 
     def test_commit_settings_are_optional_and_schema_defaults_match_config(self):
         legacy = copy.deepcopy(self.default_config)
-        for key in ("auto_commit", "work_branch_prefix", "protected_branches"):
+        for key in ("auto_commit", "auto_revival", "work_branch_prefix", "protected_branches"):
             self.assertNotIn(key, self.schema["required"])
             self.assertEqual(legacy.pop(key), self.schema["properties"][key]["default"])
         self.assertEqual([], self._validate(legacy, self.schema))
@@ -80,6 +80,7 @@ class SchemaContractTests(unittest.TestCase):
     def test_commit_setting_schema_validation_matches_runtime(self):
         cases = {
             "auto_commit": (True, False, 1, "true", [], None),
+            "auto_revival": (True, False, 1, "true", [], {}, None),
             "protected_branches": ([], ["main"], ["main", "master"], ["release/next"], ["main", "main"], [""], [1], {}, "main", None,
                                    ["release/*"], ["main?"], ["[main]"], ["main]"], ["main branch"], ["main\t"], ["refs/heads/main"]),
             "work_branch_prefix": (

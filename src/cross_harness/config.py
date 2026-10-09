@@ -36,6 +36,7 @@ TOP_KEYS = {
     "mode",
     "project_auto_setup",
     "auto_commit",
+    "auto_revival",
     "work_branch_prefix",
     "protected_branches",
 }
@@ -52,7 +53,7 @@ ROLE_KEYS = {
 }
 PROJECT_KEYS = {
     "checks", "delegate_kinds", "dirty_worktree_policy", "mode", "project_auto_setup",
-    "auto_commit", "protected_branches",
+    "auto_commit", "auto_revival", "protected_branches",
 }
 CODEX_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -140,7 +141,7 @@ def validate(config: dict) -> list[str]:
     errors: list[str] = []
     _unknown(set(config), TOP_KEYS, "root", errors)
     for key in TOP_KEYS - {
-        "projects", "mode", "project_auto_setup", "auto_commit", "work_branch_prefix", "protected_branches",
+        "projects", "mode", "project_auto_setup", "auto_commit", "auto_revival", "work_branch_prefix", "protected_branches",
     }:
         if key not in config:
             errors.append(f"root: missing key {key!r}")
@@ -164,6 +165,8 @@ def validate(config: dict) -> list[str]:
         errors.append("project_auto_setup: expected boolean")
     if "auto_commit" in config and not isinstance(config["auto_commit"], bool):
         errors.append("auto_commit: expected boolean")
+    if "auto_revival" in config and not isinstance(config["auto_revival"], bool):
+        errors.append("auto_revival: expected boolean")
     if "work_branch_prefix" in config and not _work_branch_prefix(config["work_branch_prefix"]):
         errors.append("work_branch_prefix: expected non-empty slash-terminated prefix with safe branch components")
     if "protected_branches" in config and not _literal_branches(config["protected_branches"]):
@@ -250,6 +253,8 @@ def validate(config: dict) -> list[str]:
                 errors.append(f"{location}.project_auto_setup: expected boolean")
             if "auto_commit" in project and not isinstance(project["auto_commit"], bool):
                 errors.append(f"{location}.auto_commit: expected boolean")
+            if "auto_revival" in project and not isinstance(project["auto_revival"], bool):
+                errors.append(f"{location}.auto_revival: expected boolean")
             if "protected_branches" in project and not _literal_branches(project["protected_branches"]):
                 errors.append(f"{location}.protected_branches: expected unique string array; entries are literal short branch names")
     return errors
@@ -340,6 +345,11 @@ def effective_mode(config: dict, cwd: Path) -> str:
 def effective_auto_commit(config: dict, cwd: Path) -> bool:
     """Return the closest project's auto-commit setting, falling back to the global value."""
     return project_config(config, cwd).get("auto_commit", config.get("auto_commit", True))
+
+
+def effective_auto_revival(config: dict, cwd: Path) -> bool:
+    """Return the closest project's auto-revival setting, falling back to the global value."""
+    return project_config(config, cwd).get("auto_revival", config.get("auto_revival", True))
 
 
 def effective_protected_branches(config: dict, cwd: Path) -> list[str]:

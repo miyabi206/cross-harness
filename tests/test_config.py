@@ -11,6 +11,7 @@ from cross_harness.config import (
     defaulted_paths,
     default_config,
     effective_auto_commit,
+    effective_auto_revival,
     effective_mode,
     effective_protected_branches,
     load_config,
@@ -57,6 +58,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual("allow_delegated", config["dirty_worktree_policy"])
         self.assertTrue(config["project_auto_setup"])
         self.assertTrue(config["auto_commit"])
+        self.assertTrue(config["auto_revival"])
         self.assertEqual("cross-harness/", config["work_branch_prefix"])
         self.assertEqual(["main", "master"], config["protected_branches"])
         self.assertEqual(4, config["max_parallel"])
@@ -189,6 +191,32 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("project_auto_setup: expected boolean", errors)
         self.assertIn("projects./tmp/project.project_auto_setup: expected boolean", errors)
 
+    def test_auto_revival_defaults_and_closest_project_overrides(self):
+        self.assertTrue(effective_auto_revival({}, Path("/tmp/project")))
+        legacy = default_config()
+        del legacy["auto_revival"]
+        self.assertEqual([], validate(legacy))
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "config.toml"
+            path.write_text('[projects."/tmp/project"]\nauto_revival = false\n')
+            config = load_config(path, Path(folder))
+            self.assertTrue(config["auto_revival"])
+            self.assertFalse(effective_auto_revival(config, Path("/tmp/project/work")))
+            self.assertTrue(effective_auto_revival(config, Path("/tmp/other")))
+            path.write_text(
+                'auto_revival = false\n'
+                '[projects."/tmp/project"]\nauto_revival = true\n'
+                '[projects."/tmp/project/nested"]\nauto_revival = false\n'
+                '[projects."/tmp/project/inherit"]\nchecks = []\n'
+            )
+            config = load_config(path, Path(folder))
+            for cwd, expected in (
+                ("/tmp/other", False), ("/tmp/project/work", True),
+                ("/tmp/project/nested/work", False), ("/tmp/project/inherit/work", False),
+            ):
+                with self.subTest(cwd=cwd):
+                    self.assertEqual(expected, effective_auto_revival(config, Path(cwd)))
+
     def test_commit_settings_load_and_resolve_closest_project_overrides(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "config.toml"
@@ -214,6 +242,7 @@ class ConfigTests(unittest.TestCase):
     def test_invalid_commit_settings_raise_path_specific_load_errors(self):
         values = {
             "auto_commit": ("1", '"true"', "[]"),
+            "auto_revival": ("1", '"true"', "[]", "{}"),
             "protected_branches": ('"main"', '["main", "main"]', '[""]', '[1]', '{}') + tuple(
                 json.dumps([name]) for name in ("release/*", "main?", "[main]", "main]", "main branch", "main\t", "refs/heads/main")
             ),
@@ -315,7 +344,7 @@ class ConfigTests(unittest.TestCase):
 
             self.assertEqual(14, loaded["retention_days"])
             self.assertEqual(321, loaded["roles"]["tester"]["timeout_seconds"])
-            for key in ("auto_commit", "work_branch_prefix", "protected_branches"):
+            for key in ("auto_commit", "auto_revival", "work_branch_prefix", "protected_branches"):
                 self.assertEqual(default_config()[key], loaded[key])
                 self.assertIn(key, defaulted_config_paths(config, home))
             self.assertEqual([], validate(loaded))
